@@ -146,7 +146,7 @@ YYYY-MM-DD_HH-MM-SS_<product>-<id>_<descriptors>.h5
 ```
 
 - **Datetime prefix**: acquisition timestamp for chronological `ls` sorting
-- **Product type**: `recon`, `listmode`, `sinogram`, `sim`, `transform`, `calibration`, `spectrum`, `roi`
+- **Product type**: `recon`, `listmode`, `sinogram`, `sim`, `transform`, `calibration`, `spectrum`, `roi`, `device_data`
 - **ID**: first 8 hex chars of the full SHA-256 identity hash (for filename brevity)
 - **Descriptors**: freeform, human-readable labels separated by underscores (modality, method, body region, etc.)
 
@@ -157,6 +157,7 @@ Examples:
 2024-07-24_19-06-10_listmode-def67890_pet_coinc.h5
 2024-07-24_19-23-16_listmode-abc12345_pet_singles_bed1.h5
 2024-07-24_19-30-00_spectrum-44556677_pet_lifetime_pals.h5
+2024-07-24_19-06-10_device-ab12cd34_pet_blood_input.h5
 2024-07-24_19-06-10_spectrum-88990011_pet_energy_coinc_matrix.h5
 2024-07-24_19-06-10_roi-aabb1122_pet_tumor_contours.h5
 2024-07-24_19-06-10_roi-ccdd3344_pet_organs_totalseg.h5
@@ -181,7 +182,7 @@ Every `fd5` file carries these attributes on the root group, plus the `study/`, 
 |-----------|------|-------------|
 | `_schema` | str (JSON) | JSON Schema document describing this file's structure |
 | `_schema_version` | int | fd5 schema version (monotonically increasing) |
-| `product` | str | Product type: `"recon"`, `"listmode"`, `"sinogram"`, `"sim"`, `"transform"`, `"calibration"`, `"spectrum"`, `"roi"` |
+| `product` | str | Product type: `"recon"`, `"listmode"`, `"sinogram"`, `"sim"`, `"transform"`, `"calibration"`, `"spectrum"`, `"roi"`, `"device_data"` |
 | `id` | str | Persistent unique identifier, algorithm-prefixed SHA-256 of identity inputs (e.g., `"sha256:a1b2c3d4..."`) |
 | `id_inputs` | str | Documents what was hashed to produce `id` (e.g., `"product + vendor + vendor_id + timestamp"`) |
 | `name` | str | Human-readable name |
@@ -268,6 +269,13 @@ metadata/
         attrs: {_type: "q_clear", _version: 1,
                 beta: 350, iterations: 25, tof: true, psf: true,
                 description: "Penalized-likelihood reconstruction (GE Q.Clear)"}
+        references/                                 # optional: NXcite pattern
+            method_paper/
+                attrs: {doi: "10.1088/0031-9155/60/10/3777",
+                        description: "Original Q.Clear penalized-likelihood algorithm paper"}
+            validation/
+                attrs: {doi: "10.2967/jnumed.117.200071",
+                        description: "Clinical validation of Q.Clear vs OSEM"}
     corrections/
         attenuation/
             attrs: {_type: "ct_based", _version: 1,
@@ -353,11 +361,23 @@ extra/
     ge_specific/
         attrs: {recon_software: "PetRecon 4.2.1",
                 description: "GE-specific reconstruction software metadata"}
-    notes/
-        attrs: {operator: "Dr. Smith",
-                comment: "Patient moved during bed position 3",
-                description: "Operator notes recorded during acquisition"}
+    notes/                                          # optional: NXnote pattern for binary attachments
+        operator_screenshot/
+            attrs: {author: "Dr. Smith",
+                    date: "2024-07-24T19:30:00+02:00",
+                    type: "image/png",              # MIME type
+                    description: "Screenshot of scanner console showing motion artifact"}
+            data                    # dataset: binary (opaque bytes)
+        protocol_pdf/
+            attrs: {author: "Lab Manager",
+                    date: "2024-07-24",
+                    type: "application/pdf",
+                    file_name: "DOGPLET_protocol_v3.pdf",
+                    description: "Scan protocol document"}
+            data                    # dataset: binary
 ```
+
+The `notes/` sub-group follows the NeXus NXnote pattern for attaching freeform binary content (photos, PDFs, screenshots) with MIME typing. Optional, never required. Each attachment has a `data` dataset containing the binary payload and metadata attributes including MIME type, authorship, and description.
 
 ### Reserved conventions
 
@@ -378,6 +398,49 @@ extra/
 | `id_inputs` | Documents what was hashed to produce `id` (root only) | Active |
 | `content_hash` | Algorithm-prefixed SHA-256 of file content at write time | Active |
 
+
+### `study/` group -- study context and FAIR metadata
+
+Study-level metadata describing the research context, funding, and legal framework. Appears in every data product file (inherited or repeated for convenience).
+
+```
+study/
+    attrs: {type: "clinical" | "research" | "phantom",
+            license: "CC-BY-4.0",                    # SPDX identifier or URL (RO-Crate required)
+            license_url: "https://creativecommons.org/licenses/by/4.0/",  # optional
+            description: "Study type and context"}
+    creators/                                        # optional: RO-Crate author field
+        creator_0/
+            attrs: {name: "Jane Doe",
+                    affiliation: "ETH Zurich",
+                    orcid: "https://orcid.org/0000-0002-1234-5678",  # optional
+                    role: "principal_investigator",                    # optional: pi, data_collection, analysis
+                    description: "Study creator"}
+        creator_1/
+            attrs: {name: "John Smith",
+                    affiliation: "University Hospital Zurich",
+                    role: "data_collection",
+                    description: "Study creator"}
+```
+
+**FAIR compliance:** The `license` and `creators/` fields are required for RO-Crate export. `license` must be an SPDX identifier (e.g., `"CC-BY-4.0"`, `"CC0-1.0"`) or URL. `creators/` enables Schema.org `Person` entity mapping with affiliation and ORCID support.
+
+### `subject/` group -- subject demographics
+
+Subject-level metadata (patient/specimen demographics, species, age, sex). Appears once per dataset, referenced from all data products via a link.
+
+```
+subject/
+    attrs: {id: "anonymized_id" | "patient_12345",
+            species: "human" | "dog" | "mouse" | "phantom",
+            age: 42.5, age__units: "years",          # optional for human subjects (privacy)
+            sex: "M" | "F" | "other",                # optional
+            birth_date: "1959-03-15",                # optional (privacy-sensitive)
+            weight: 75.0, weight__units: "kg",       # optional
+            description: "Subject demographics"}
+```
+
+**Privacy:** Exact birth dates and ages should be omitted or generalized for de-identified datasets. The `id` can be a true anonymized ID or a de-identified proxy.
 
 ## Product Schemas
 
@@ -475,6 +538,23 @@ The volume dimensionality depends on the reconstruction:
 │   sagittal                        # float32, (T, Z, Y)
 │       attrs: {projection_type: "mip", axis: 2, description: "Per-frame sagittal MIPs"}
 │
+├── device_data/                       # optional: embedded device streams (NXlog pattern)
+│   attrs: {description: "Device signals recorded during this acquisition"}
+│   ecg/
+│       attrs: {_type: "ecg", _version: 1,
+│               model: "GE CardioLab",
+│               measurement: "voltage",
+│               run_control: true,
+│               sampling_rate: 500, sampling_rate__units: "Hz",
+│               description: "ECG trace for cardiac gating"}
+│       signal              # dataset: float64 (N,)
+│           attrs: {units: "mV", unitSI: 0.001}
+│       time                # dataset: float64 (N,)
+│           attrs: {units: "s", start: "2024-07-24T19:06:10+02:00"}
+│       average_value, minimum_value, maximum_value, duration (optional summary stats)
+│       cue_timestamp_zero  # optional: coarse timestamps (e.g. every 60s)
+│       cue_index           # optional: index into time/signal at each cue
+│
 ├── sources/                        # provenance DAG
 ├── provenance/
 │   original_files                  # compound dataset: (path, sha256, size_bytes)
@@ -553,6 +633,23 @@ Detector-level event streams (singles, coincidences, time markers).
 │   events_3p     (N,) compound
 │   coin_2p       (N,) compound
 │   coin_3p       (N,) compound
+│
+├── device_data/                       # optional: embedded device streams (NXlog pattern)
+│   attrs: {description: "Device signals recorded during this acquisition"}
+│   ecg/
+│       attrs: {_type: "ecg", _version: 1,
+│               model: "GE CardioLab",
+│               measurement: "voltage",
+│               run_control: true,
+│               sampling_rate: 500, sampling_rate__units: "Hz",
+│               description: "ECG trace for cardiac gating"}
+│       signal              # dataset: float64 (N,)
+│           attrs: {units: "mV", unitSI: 0.001}
+│       time                # dataset: float64 (N,)
+│           attrs: {units: "s", start: "2024-07-24T19:06:10+02:00"}
+│       average_value, minimum_value, maximum_value, duration (optional summary stats)
+│       cue_timestamp_zero  # optional: coarse timestamps (e.g. every 60s)
+│       cue_index           # optional: index into time/signal at each cue
 │
 ├── sources/
 ├── provenance/
@@ -1065,6 +1162,65 @@ A single ROI file can contain all three: a `mask` for fast voxel-level operation
 New methods (e.g., `interactive_watershed`, `diffusion_model`, `foundation_model`) just add a new `_type` value. No schema change, no re-export of existing ROIs.
 
 
+### `device_data` -- Device Signals and Acquisition Logs
+
+Time-series data from acquisition devices: ECG monitors, motion trackers, infusion pumps, blood samplers, environmental sensors. Covers both **embedded** device data (small, tightly-coupled, stored inside `listmode` or `recon` files) and **standalone** device data products (large or shared streams with independent identity).
+
+```
+<file>.h5
+├── attrs: (common)
+│   product: "device_data"
+│   device_type: str                  # high-level category (see table)
+│   device_model: str                 # e.g. "Anzai AZ-733V", "Syringe Pump SP101"
+│   recording_start: str              # ISO 8601
+│   recording_duration: float
+│   recording_duration__units: "s"
+│
+├── metadata/
+│   device/
+│       attrs: {_type: "blood_sampler" | "motion_tracker" | "infusion_pump"
+│                      | "physiological_monitor" | "environmental_sensor",
+│               _version: 1, description: "..."}
+│
+├── channels/                          # one sub-group per signal channel (NXlog pattern)
+│   <channel_name>/
+│       signal              # dataset: float64 (N,)
+│           attrs: {units, unitSI, description}
+│       time                # dataset: float64 (N,)
+│           attrs: {units: "s", start: str}
+│       attrs: {_type, _version, model, measurement, run_control,
+│               sampling_rate, sampling_rate__units, description}
+│       average_value       # optional: float
+│       minimum_value       # optional: float
+│       maximum_value       # optional: float
+│       duration            # optional: float
+│           attrs: {units: "s"}
+│       cue_timestamp_zero  # optional: coarse timestamps for random access
+│       cue_index           # optional: indices into time/signal
+│
+├── sources/                           # links to acquisition this device data belongs to
+├── provenance/
+│   original_files                    # compound dataset: (path, sha256, size_bytes)
+│   ingest/
+│       attrs: {tool, tool_version, timestamp, description}
+└── extra/
+```
+
+**Device types:**
+
+- `blood_sampler` -- arterial/venous blood sampling for kinetic input functions
+- `motion_tracker` -- external motion tracking (optical, electromagnetic)
+- `infusion_pump` -- contrast/tracer infusion profiles
+- `physiological_monitor` -- ECG, respiratory, SpO2, blood pressure, core temperature
+- `environmental_sensor` -- room temperature, humidity, detector temperature, air quality
+
+**NXlog/NXsensor pattern**: Each channel follows the NeXus NXlog convention (time + signal arrays, summary statistics, optional cue index for random access into long series) enriched with NXsensor metadata fields (`model`, `measurement` enum, `run_control` boolean indicating whether acquisition was synchronized to this signal).
+
+**Embedding vs. standalone rule**:
+- **Embed** device data that is (1) specific to this one product, (2) small (< ~10 MB), and (3) needed to interpret the product (e.g., ECG for gating, detector temperature for QC)
+- **Link** device data that is (1) large, (2) shared across products, or (3) has independent provenance (e.g., blood sampling curve, external motion tracking that spans multiple bed positions)
+
+
 ## Derived Outputs
 
 The `fd5` package can generate human-readable companion files from the HDF5 data. These are **derived, not canonical**. Delete them and regenerate at any time.
@@ -1128,6 +1284,53 @@ subjects:
     subjectScheme: "Radiotracer"
 ```
 
+### ro-crate-metadata.json
+
+A JSON-LD file conforming to the RO-Crate 1.2 specification, describing the dataset as a Research Object. Generated by `fd5.rocrate.generate()` from the manifest, HDF5 metadata, and study/creators information.
+
+The generator maps fd5 vocabulary to Schema.org terms:
+
+- `study/license` → `license`
+- `study/creators/` → `author` (as `Person` entities with `affiliation` and `@id` from ORCID)
+- `id` → `identifier` (as `PropertyValue` with `propertyID: "sha256"`)
+- `timestamp` → `dateCreated` per file
+- `provenance/ingest/` → `CreateAction` with `SoftwareApplication` instrument
+- `sources/` DAG → `isBasedOn` references between data entities
+- Each `.h5` file → `File` (MediaObject) with `encodingFormat: "application/x-hdf5"`
+
+Example snippet:
+
+```json
+{
+  "@context": "https://w3id.org/ro/crate/1.2/context",
+  "@graph": [
+    {
+      "@id": "ro-crate-metadata.json",
+      "@type": "CreativeWork",
+      "about": {"@id": "./"},
+      "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}
+    },
+    {
+      "@id": "./",
+      "@type": "Dataset",
+      "name": "DOGPLET DD01",
+      "license": "CC-BY-4.0",
+      "author": [
+        {
+          "@type": "Person",
+          "name": "Jane Doe",
+          "affiliation": "ETH Zurich",
+          "@id": "https://orcid.org/0000-0002-1234-5678"
+        }
+      ],
+      "hasPart": [
+        {"@id": "2024-07-24_19-06-10_recon-2a3ac438_pet_qclear_wb.h5"}
+      ]
+    }
+  ]
+}
+```
+
 ### Schema dump
 
 The embedded `_schema` attribute can be extracted to a standalone JSON Schema file for documentation or validation tooling:
@@ -1162,11 +1365,86 @@ fd5 schema-dump data/2024-07-24_19-06-10_recon-2a3ac438_pet_qclear_wb.h5 > schem
 The boundary is clean: the ingest pipeline (in a separate package) produces `fd5` files. From that point forward, `fd5` handles everything.
 
 
+## Design Discussion: Device Data, NeXus Patterns, and Cloud Compatibility
+
+### Device data placement: embedding vs. linking
+
+Device data from acquisition systems (ECG monitors, motion trackers, infusion pumps, environmental sensors) can be managed in three ways, each with trade-offs:
+
+**Option A: Always embed.** Store all device data directly inside the `listmode` or `recon` file as a `device_data/` group. Advantages: self-contained files with no external links, full provenance captured with the acquisition. Disadvantages: bloats files (if device data is large or sampled at high rates), prevents sharing a single device stream across multiple products (e.g., one arterial input function used in multiple kinetic models), and couples independent data streams into single files.
+
+**Option B: Always separate.** Create standalone `device_data` product files for all device streams, similar to how ROIs are separate from reconstructions. Advantages: clean separation of concerns, enables sharing data across products via `sources/` links, and keeps individual files smaller. Disadvantages: file proliferation ("too many files"), broken links if a device file moves, and ambiguity about whether a device stream is "part of this acquisition" or "shared infrastructure."
+
+**Option C: Hybrid (chosen).** Embed device data that is (1) specific to this one product, (2) small (<~10 MB), and (3) needed to interpret the product (e.g., cardiac gating signal, detector temperature for QC). For large or shared streams (e.g., arterial input functions, external motion tracking spanning multiple bed positions), create standalone `device_data` products and link them via `sources/`. This combines the benefits of self-containment (small, coupled data) and reusability (large, shared data).
+
+**Rationale:** fd5 files are write-once archives. Once a reconstruction is finalized, its device context (gating, temperatures) is frozen. But acquisition devices (blood samplers, motion trackers) often record continuously during long scans or produce data shared across multiple reconstructions. The hybrid model accommodates both patterns without forcing a compromise.
+
+### NeXus base class adoption
+
+A systematic review of NeXus base classes identified several patterns worth adopting into fd5:
+
+**Adopted:**
+- **NXcollection** → `extra/` group for unvalidated, vendor-specific, or experimental data
+- **NXdata** → Default visualization chain (implicitly followed via dataset naming conventions)
+- **NXlog** → Device data channels with time + signal arrays, summary statistics, and cue indices for random access
+- **NXsensor** → Device metadata fields (model, measurement type, run_control) on each channel
+- **NXcite** → Literature references (`references/` sub-group under metadata describing algorithms/methods)
+- **NXnote** → Binary attachments in `extra/notes/` (screenshots, PDFs) with MIME typing and authorship
+
+**Not adopted and why:**
+- **NXinstrument, NXsource, NXdetector** → Redundant with fd5's simpler `metadata/acquisition/` and `metadata/corrections/` structure
+- **NXtransformations** → Axis alignment is handled by explicit `affine` attributes on volume datasets
+- **NXmonitor** → Not applicable to fd5's write-once model; monitoring is a runtime concern during acquisition
+- **NXenvironment** → Subsumed by `device_data/environmental_sensor`
+- **NXsubentry, NXuser, NXparameters, NXgeometry** → Either too hierarchical for fd5's flat product model or domain-specific to specific NeXus facilities
+
+The adoption is pragmatic: fd5 borrows patterns that reduce ambiguity (NXlog/NXsensor for device data) and enable FAIR practices (NXcite for method references, NXnote for supplementary materials), while keeping the overall schema lean.
+
+### RO-Crate and FAIR readiness
+
+fd5 can export to RO-Crate 1.2 JSON-LD with minimal additions to the schema. Two fields were added to the `study/` group:
+
+- **`license`**: SPDX identifier or URL (e.g., `"CC-BY-4.0"`, `"CC0-1.0"`). Required by RO-Crate on the Root Data Entity.
+- **`creators/`**: Sub-group with author metadata (name, affiliation, ORCID, role). Enables Schema.org `Person` entity mapping.
+
+With these fields, `fd5.rocrate.generate()` produces a conformant `ro-crate-metadata.json` that maps fd5 vocabulary to Schema.org terms:
+- Study license → RO-Crate license
+- Study creators → RO-Crate author (Person entities)
+- File IDs → identifier (PropertyValue with propertyID: sha256)
+- Provenance ingest records → CreateAction with instrument
+- Sources DAG → isBasedOn references
+
+This enables discovery by major FAIR registries (FAIRshare, DataCite, Zenodo) without requiring fd5 files to be converted to other formats. The RO-Crate is a derived output, like `manifest.toml` and `datacite.yml` -- regenerable at any time from the HDF5 metadata.
+
+### HDF5 cloud compatibility for fd5
+
+The comparison with Zarr v3 and OME-Zarr (NGFF) sometimes frames HDF5 as "not cloud-native." This requires clarification: **fd5 on HDF5 is cloud-compatible for its intended use case. It is not cloud-optimized for tile-streaming workloads, but that is not the target.**
+
+**Why HDF5 works for fd5 in the cloud:**
+
+- **ros3 VFD**: HDF5's read-only S3 driver uses HTTP range requests to fetch data incrementally. A single-slice read from a chunked volume (`(1, Y, X)` chunks) requires exactly one range request per chunk -- functionally identical to Zarr.
+- **Chunking strategy**: fd5's `(1, Y, X)` or `(1, 1, Y, X)` chunking is designed for slice-wise or frame-wise access. Loading one reconstructed slice requires one range request. Loading all slices requires N range requests (same as Zarr).
+- **Product sizes**: Typical fd5 products (100 MB -- 1 GB, hundreds to thousands of chunks) are well within HDF5's efficient range on cloud object stores. The superblock and B-tree metadata fit in a single range request.
+- **Pyramid levels**: Multiscale pyramids (8x downsampled = 600 KB per level) provide instant previews without touching the full volume.
+- **Metadata discovery**: `h5dump -A` over ros3 fetches only superblock + attributes (no data). The derived outputs (`manifest.toml`, `datacite.yml`, `ro-crate-metadata.json`) serve as lightweight indices.
+- **Semantic atomicity**: Medical image volumes are semantically atomic -- the typical access pattern is full-volume load plus metadata, not tile-by-tile CDN caching.
+
+**Where Zarr genuinely wins (and why it doesn't matter for fd5):**
+
+| Advantage | Relevance to fd5 |
+|-----------|------------------|
+| Parallel writes (N workers writing N chunks simultaneously) | Not applicable; fd5 is write-once |
+| No library dependency for chunk reads | Irrelevant; libhdf5 and h5py are universal in scientific Python |
+| JSON metadata without library | Nice but `h5dump -A` and derived outputs serve the same purpose |
+| Trivial per-chunk CDN caching | Not applicable; medical imaging doesn't serve tiles to browsers |
+
+**Conclusion:** fd5 on HDF5 is cloud-compatible for its use case. The discovery and metadata layer is provided by manifest, datacite, and RO-Crate outputs. Where Zarr genuinely excels (massively parallel writes, browser-friendly tile access) is outside fd5's design scope.
+
 ## Comparison with Existing Formats
 
 | Format | Strengths | Gaps that fd5 addresses |
 |--------|-----------|------------------------|
-| **NeXus/HDF5** | Mature, `@units`, `default` chain, `NXcollection` | Tied to neutron/X-ray domain; no per-product files; complex class hierarchy |
+| **NeXus/HDF5** | Mature, `@units`, `default` chain, `NXcollection`, `NXlog`/`NXsensor` for device data, `NXcite` for references, `NXnote` for attachments | Tied to neutron/X-ray domain; fd5 adopts NeXus patterns selectively for medical imaging and includes all needed device/method/attachment conventions |
 | **OpenPMD** | `unitSI`, mesh/particle duality | Focused on particle-in-cell simulations; no medical imaging conventions |
 | **BIDS** | Self-describing filenames, metadata inheritance, sidecar JSON | Tied to neuroimaging (MRI/EEG); no PET listmode; filenames encode too much |
 | **NIfTI** | Simple, widely supported for volumes | No metadata beyond affine; no provenance; no non-volume data |
@@ -1175,6 +1453,7 @@ The boundary is clean: the ingest pipeline (in a separate package) produces `fd5
 | **ROOT/TTree** | Excellent for event data, schema evolution | C++ ecosystem; poor Python ergonomics; no self-describing metadata conventions |
 | **Zarr v3** | Cloud-native chunked storage, parallel I/O, per-chunk independence | Storage engine only; no metadata conventions, no provenance, no schema embedding |
 | **OME-Zarr (NGFF)** | Multiscale pyramids, cloud-optimized bioimaging, growing tool ecosystem | Microscopy-focused; no event data, spectra, or calibration; no embedded schema; no provenance DAG; no per-product identity |
+| **RO-Crate** | Standard for packaging research objects, Schema.org JSON-LD, FAIR compatible, increasingly supported by repositories | Not a storage format; no domain-specific schemas; fd5 generates RO-Crate as derived output for metadata discovery |
 
 `fd5` takes the best ideas from each:
 - `@units` + `@unitSI` from NeXus and OpenPMD
@@ -1187,6 +1466,11 @@ The boundary is clean: the ingest pipeline (in a separate package) produces `fd5
 - Multiscale resolution pyramids inspired by OME-Zarr NGFF (adapted to HDF5's single-file model)
 - Per-chunk content hashing inspired by Zarr's per-chunk integrity model (rolled up into a Merkle tree)
 - Content hashing from scientific reproducibility best practices
+- Device data channels with time + signal arrays from NeXus `NXlog` pattern
+- Device metadata (model, measurement, run_control) from NeXus `NXsensor`
+- Literature references in `references/` groups from NeXus `NXcite`
+- Binary attachments with MIME typing in `extra/notes/` from NeXus `NXnote`
+- RO-Crate JSON-LD for FAIR discovery (Schema.org vocabulary mapping)
 
 
 ## FAIR Compliance Summary
@@ -1197,10 +1481,10 @@ The boundary is clean: the ingest pipeline (in a separate package) produces `fd5
 | **F2**: Rich metadata | `metadata/` group tree, `description` on every group/dataset |
 | **F3**: Metadata includes identifier | `id` is a root attribute in every file |
 | **F4**: Registered in searchable resource | `manifest.toml` as local index; `datacite.yml` for catalog registration |
-| **A1**: Retrievable by identifier | Direct file access; manifest maps id to file path |
+| **A1**: Retrievable by identifier | Direct file access; manifest maps id to file path; RO-Crate JSON-LD for linked data discovery |
 | **A1.1**: Open, free protocol | HDF5 = open standard; h5py = open source |
-| **A2**: Metadata accessible even if data unavailable | Manifest contains all metadata; `h5dump -A` extracts attrs without data |
-| **I1**: Formal, shared knowledge representation | JSON Schema embedded; `@units`/`@unitSI`; vocabulary references |
+| **A2**: Metadata accessible even if data unavailable | Manifest contains all metadata; `h5dump -A` extracts attrs without data; RO-Crate JSON available without HDF5 read |
+| **I1**: Formal, shared knowledge representation | JSON Schema embedded; `@units`/`@unitSI`; vocabulary references; RO-Crate JSON-LD using Schema.org |
 | **I2**: FAIR vocabularies | DICOM Modality codes, SNOMED CT, RadLex (human-readable, not hex) |
 | **I3**: Qualified references | `sources/` with typed roles (`emission`, `attenuation`, `mu_map`) |
 | **R1**: Rich, plurality of attributes | Three metadata layers: flat root attrs, structured `metadata/` groups, raw DICOM header in `provenance/` |
@@ -1291,6 +1575,7 @@ The `id` is a SHA-256 hash of identity inputs, prefixed with `"sha256:"`. The id
 | `calibration` | `scanner_uuid + calibration_type + valid_from` | Same scanner + type + time = same calibration |
 | `spectrum` | `source_id + method_type + creation_timestamp` | Derived from specific data + method |
 | `roi` | `reference_image_id + method_type + creation_timestamp` | Drawn on specific image at specific time |
+| `device_data` | `timestamp + device_model + scanner_uuid` | Same device recording at same time on same scanner |
 
 **Serialization format:** concatenate the input fields with `\0` (null byte) separator, encode as UTF-8, compute SHA-256. The `id_inputs` attr stores a human-readable description: `"timestamp + scanner_uuid + vendor_series_id"`.
 
