@@ -383,7 +383,7 @@ extra/
 
 ### `recon` -- Reconstruction
 
-A 3D, 4D, or 5D image volume with precomputed projections. Covers static images, dynamic (multi-frame) time series, gated (cardiac/respiratory) reconstructions, parametric maps, dose maps, and attenuation maps.
+A 3D, 4D, or 5D image volume with a multiscale resolution pyramid and precomputed projections. Covers static images, dynamic (multi-frame) time series, gated (cardiac/respiratory) reconstructions, parametric maps, dose maps, and attenuation maps.
 
 The volume dimensionality depends on the reconstruction:
 
@@ -438,6 +438,28 @@ The volume dimensionality depends on the reconstruction:
 │       trigger_times               # dataset: float64 (N_triggers,)
 │           attrs: {units: "s", description: "Detected trigger timestamps"}
 │
+├── pyramid/                        # multiscale resolution pyramid (inspired by OME-Zarr NGFF)
+│   attrs: {
+│       n_levels: int,              # number of downsampled levels (excluding full-res volume)
+│       scale_factors: list[int],   # e.g. [2, 4, 8] -- each relative to full-res volume
+│       method: str,                # "local_mean" | "stride" | "gaussian" | "area"
+│       description: "Multiscale pyramid for progressive-resolution access"
+│   }
+│   level_1/                        # 2x downsampled
+│       volume                      # dataset: same dtype as root volume, shape / 2
+│           attrs: {
+│               affine: float64[4,4],
+│               scale_factor: 2,
+│               voxel_size__units: "mm",
+│               description: "2x downsampled volume"
+│           }
+│   level_2/                        # 4x downsampled
+│       volume                      # dataset: shape / 4
+│           attrs: {scale_factor: 4, ...}
+│   level_3/                        # 8x downsampled (thumbnail-scale)
+│       volume                      # dataset: shape / 8
+│           attrs: {scale_factor: 8, ...}
+│
 ├── mip_coronal                     # float32, (Z, X) -- MIP of summed/static volume
 │   attrs: {projection_type: "mip", axis: 1,
 │           z_extent__units: "mm", x_extent__units: "mm",
@@ -478,6 +500,23 @@ The volume dimensionality depends on the reconstruction:
 | 5D `(G,T,Z,Y,X)` | `(1, 1, 1, Y, X)` | Same pattern, one leading dim at a time |
 
 Compression: gzip level 4 throughout.
+
+**Multiscale pyramid** (inspired by OME-Zarr NGFF):
+
+The `pyramid/` group stores successively downsampled copies of the full-resolution `volume`, enabling progressive-resolution access without loading the entire dataset. This is the same core idea behind OME-Zarr's multiscale image pyramids, adapted to HDF5's single-file model.
+
+Each pyramid level halves the spatial dimensions relative to the previous level. The `scale_factors` root attribute lists the factor relative to the full-resolution volume (e.g., `[2, 4, 8]`). The downsampling `method` attribute records how the levels were computed (e.g., `"local_mean"` for anti-aliased averaging, `"stride"` for simple subsampling). Each level carries its own `affine` matrix reflecting the coarser voxel spacing.
+
+| Level | Typical shape (for 512x512x300 volume) | Typical size | Use case |
+|-------|----------------------------------------|-------------|----------|
+| Full-res (`volume`) | `(300, 512, 512)` | 300 MB | Full analysis, ROI statistics |
+| `level_1` (2x) | `(150, 256, 256)` | 37 MB | Interactive slice browsing |
+| `level_2` (4x) | `(75, 128, 128)` | 4.7 MB | Quick 3D overview |
+| `level_3` (8x) | `(38, 64, 64)` | 600 KB | Thumbnail, dataset gallery |
+
+Pyramid levels are **derived artifacts** -- they can always be regenerated from the full-resolution volume. They are optional but strongly recommended for `recon` products. For dynamic (4D+) data, pyramid levels are computed per-frame or on the summed volume, depending on the use case; the `dimension_order` attribute on each level's volume clarifies the layout.
+
+Pyramid chunking follows the same slice-based strategy as the full-resolution volume: `(1, Y_level, X_level)` for 3D levels. Lower levels are small enough that a single chunk per slice is efficient.
 
 **Dynamic PET specifics:**
 
@@ -1134,6 +1173,8 @@ The boundary is clean: the ingest pipeline (in a separate package) produces `fd5
 | **DICOM RT-STRUCT** | Clinical standard for contours, integrated with treatment planning | Contour-only (no masks), tied to DICOM ecosystem, no AI model provenance, no geometric VOIs |
 | **DICOM** | Comprehensive tags, universal in clinical imaging | Verbose, inconsistent across vendors, poor for non-image data, no precomputed artifacts |
 | **ROOT/TTree** | Excellent for event data, schema evolution | C++ ecosystem; poor Python ergonomics; no self-describing metadata conventions |
+| **Zarr v3** | Cloud-native chunked storage, parallel I/O, per-chunk independence | Storage engine only; no metadata conventions, no provenance, no schema embedding |
+| **OME-Zarr (NGFF)** | Multiscale pyramids, cloud-optimized bioimaging, growing tool ecosystem | Microscopy-focused; no event data, spectra, or calibration; no embedded schema; no provenance DAG; no per-product identity |
 
 `fd5` takes the best ideas from each:
 - `@units` + `@unitSI` from NeXus and OpenPMD
@@ -1143,6 +1184,8 @@ The boundary is clean: the ingest pipeline (in a separate package) produces `fd5
 - `_type`/`_version` extensibility inspired by NeXus `NXentry` typing and ROOT schema evolution
 - ISO 8601 with timezone from NeXus best practices
 - `_errors` suffix convention from NeXus
+- Multiscale resolution pyramids inspired by OME-Zarr NGFF (adapted to HDF5's single-file model)
+- Per-chunk content hashing inspired by Zarr's per-chunk integrity model (rolled up into a Merkle tree)
 - Content hashing from scientific reproducibility best practices
 
 
@@ -1255,9 +1298,45 @@ The `id` is a SHA-256 hash of identity inputs, prefixed with `"sha256:"`. The id
 
 **Filenames use the first 8 hex chars** of the hash (after the `"sha256:"` prefix). Collision risk at 8 chars (32 bits) is negligible for datasets with < 10,000 products.
 
-### `content_hash` computation -- Merkle tree
+### `content_hash` computation -- Merkle tree with per-chunk hashing
 
-The `content_hash` is a deterministic hash of the file's content, independent of HDF5 internal layout. Computed as a Merkle tree:
+The `content_hash` is a deterministic hash of the file's content, independent of HDF5 internal layout. It is computed bottom-up: individual HDF5 chunks are hashed first, chunk hashes roll up into per-dataset hashes, and dataset hashes roll up into the file-level Merkle root.
+
+This two-level design (inspired by Zarr's per-chunk integrity model) enables both **full-file verification** and **partial integrity checks** on individual datasets or even individual chunks -- critical for large volumes where re-hashing the entire file is expensive.
+
+#### Per-chunk hashing
+
+Every chunked dataset carries an optional companion dataset `<name>_chunk_hashes` that stores one SHA-256 hash per HDF5 chunk:
+
+```
+volume                              # dataset: float32 (300, 512, 512), chunks (1, 512, 512)
+volume_chunk_hashes                 # dataset: bytes (300,) -- one SHA-256 per chunk
+    attrs: {
+        algorithm: "sha256",
+        chunk_shape: [1, 512, 512],
+        description: "Per-chunk content hashes for partial integrity verification"
+    }
+```
+
+Each chunk hash is computed as `sha256(chunk_data.tobytes())` where `chunk_data` is the decompressed, row-major byte content of that chunk. Edge chunks (at dataset boundaries where the chunk extends beyond the data) are hashed on the **actual data only** (not zero-padded to full chunk size).
+
+The chunk hash dataset is a 1D array with one entry per chunk, indexed in row-major chunk order (C order over the chunk grid). For a 3D dataset with chunk grid shape `(N_z, N_y, N_x)`, chunk `(i, j, k)` maps to index `i * N_y * N_x + j * N_x + k`.
+
+#### Dataset hash (from chunk hashes)
+
+The `dataset_hash` is computed from the ordered concatenation of all chunk hashes, not from the raw data bytes. This means the dataset hash can be computed from the chunk hash table without re-reading the data:
+
+```
+dataset_hash(d) = sha256(
+    chunk_hash_0 + chunk_hash_1 + ... + chunk_hash_N
+)
+```
+
+For non-chunked datasets (scalars, small arrays stored contiguously), the dataset hash falls back to `sha256(d[...].tobytes())`.
+
+#### File-level Merkle tree
+
+The file-level `content_hash` is the Merkle root computed from dataset hashes and attribute hashes:
 
 ```
 content_hash = sha256(root_group_hash)
@@ -1271,27 +1350,54 @@ group_hash(g) = sha256(
 
 sorted_attrs_hash(g) = sha256(
     for each key in sorted(g.attrs.keys()):
-        if key == "content_hash": skip     # exclude self-reference
+        if key in ("content_hash", *_chunk_hashes keys): skip
         sha256(key.encode() + serialize(g.attrs[key]))
 )
-
-dataset_hash(d) = sha256(d[...].tobytes())  # raw bytes, row-major order
 ```
 
-**Properties:**
+The `_chunk_hashes` companion datasets are **excluded from the Merkle tree** (they are derived from the data, not independent content). This avoids circular dependencies and ensures the `content_hash` is identical whether or not chunk hashes are present.
+
+#### Properties
+
 - **Deterministic**: same data + same attrs = same hash, regardless of HDF5 internal layout, chunk boundaries, or compression settings
 - **Exclude `content_hash` attr**: the hash doesn't include itself (circular dependency)
-- **Row-major byte order**: `dataset[...].tobytes()` produces the same bytes regardless of how the data was chunked or compressed on disk
+- **Exclude `_chunk_hashes` datasets**: derived integrity data, not independent content
+- **Row-major byte order**: `chunk_data.tobytes()` produces the same bytes regardless of on-disk compression
 - **Sorted keys**: both attrs and child groups are iterated in sorted order for determinism
+- **Composable**: the file-level hash can be recomputed from per-dataset hashes without touching the raw data; per-dataset hashes can be recomputed from per-chunk hashes without reading the full dataset
 
-**Write-time workflow:**
-1. Write the entire file (all datasets, all attrs, all groups) **except** `content_hash`
+#### Verification at three levels
+
+| Level | What it checks | Cost | Use case |
+|-------|---------------|------|----------|
+| **File-level** (`content_hash`) | Entire file integrity | Read all data + all attrs | Archival verification, transfer validation |
+| **Dataset-level** (`dataset_hash` from chunk table) | Single dataset integrity | Read chunk hash table only | Quick check after partial access |
+| **Chunk-level** (`_chunk_hashes`) | Individual chunk integrity | Read one chunk | Diagnose corruption, verify partial downloads |
+
+Partial verification workflow: to check whether `volume` is intact without reading the full file, read `volume_chunk_hashes`, re-hash each chunk of `volume`, compare. To check a single slice (chunk), re-hash just that chunk and compare against the corresponding entry in the hash table.
+
+#### Write-time workflow
+
+1. Write the entire file (all datasets, all attrs, all groups) **except** `content_hash` and `_chunk_hashes`
 2. Close and reopen in `"r+"` mode (ensures all data is flushed)
-3. Compute the Merkle tree hash
-4. Write the `content_hash` attr
-5. Close
+3. For each chunked dataset: compute per-chunk hashes, write the `_chunk_hashes` companion dataset
+4. Compute the Merkle tree (using chunk hashes for dataset hashes, skipping `_chunk_hashes` datasets)
+5. Write the `content_hash` root attr
+6. Close
 
-**Verification:** reopen, compute hash again (skipping `content_hash` attr), compare with stored value.
+**Full verification:** reopen, recompute chunk hashes from data, recompute Merkle tree, compare with stored `content_hash`.
+
+**Fast verification:** reopen, recompute Merkle tree from stored `_chunk_hashes` tables (no data reads), compare with stored `content_hash`. This verifies the hash chain is intact but does not re-verify data against chunk hashes.
+
+#### When to include chunk hashes
+
+Per-chunk hashing is **optional**. The file-level `content_hash` is always required. Chunk hashes are recommended for:
+
+- Large datasets (> 100 MB) where full re-hashing is expensive
+- Products that may be accessed over high-latency storage (network mounts, future cloud access)
+- Long-term archival where partial corruption detection is valuable
+
+Small datasets (metadata groups, MIPs, small calibration tables) do not benefit from chunk hashing -- the overhead of the companion dataset exceeds the verification benefit.
 
 ### Required vs. optional fields
 
@@ -1313,7 +1419,7 @@ dataset_hash(d) = sha256(d[...].tobytes())  # raw bytes, row-major order
 
 | Product | Required groups/datasets | Optional |
 |---|---|---|
-| `recon` | `volume`, `metadata/`, `provenance/` | `mip_coronal`, `mip_sagittal`, `mips_per_frame/`, `frames/` (required if 4D+), `sources/`, `extra/` |
+| `recon` | `volume`, `metadata/`, `provenance/` | `pyramid/`, `mip_coronal`, `mip_sagittal`, `mips_per_frame/`, `frames/` (required if 4D+), `sources/`, `extra/` |
 | `listmode` | At least one of `raw_data/` or `proc_data/`, `metadata/`, `provenance/` | `sources/`, `extra/` |
 | `sinogram` | `sinogram` (dataset), `metadata/`, `provenance/` | Correction datasets, `sources/`, `extra/` |
 | `sim` | `metadata/simulation/`, `provenance/` | `events/`, `ground_truth/`, `sources/`, `extra/` |
