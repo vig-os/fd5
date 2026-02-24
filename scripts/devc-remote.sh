@@ -6,14 +6,19 @@
 # Handles SSH connectivity, pre-flight checks, container state detection,
 # and compose lifecycle. URI construction delegated to Python helper.
 #
+# When no :<path> is given, derives the remote path from the local repo name
+# (~/repo-name). If the repo doesn't exist on the remote, clones it. If
+# .devcontainer/ is missing, runs init-workspace via the container image.
+#
 # USAGE:
-#   ./scripts/devc-remote.sh <ssh-host>[:<remote-path>]
+#   ./scripts/devc-remote.sh [--repo <url>] <ssh-host>[:<remote-path>]
 #   ./scripts/devc-remote.sh --help
 #
 # Examples:
 #   ./scripts/devc-remote.sh myserver
 #   ./scripts/devc-remote.sh user@host:/opt/projects/myrepo
 #   ./scripts/devc-remote.sh myserver:/home/user/repo
+#   ./scripts/devc-remote.sh --repo git@github.com:org/repo.git myserver
 #
 # Part of #70. See issue #152 for design.
 ###############################################################################
@@ -61,12 +66,22 @@ show_help() {
 
 parse_args() {
     SSH_HOST=""
-    REMOTE_PATH="~"
+    REMOTE_PATH=""
+    REPO_URL=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --help|-h)
                 show_help
+                ;;
+            --repo)
+                shift
+                REPO_URL="${1:-}"
+                if [[ -z "$REPO_URL" ]]; then
+                    log_error "--repo requires a URL argument"
+                    exit 1
+                fi
+                shift
                 ;;
             -*)
                 log_error "Unknown option: $1"
@@ -84,8 +99,6 @@ parse_args() {
                     REMOTE_PATH="${BASH_REMATCH[2]}"
                 else
                     SSH_HOST="$1"
-                    # Default to ~ (expanded by remote shell) if no path specified
-                    REMOTE_PATH="~"
                 fi
                 shift
                 ;;
@@ -96,6 +109,25 @@ parse_args() {
         log_error "Missing required argument: <ssh-host>[:<remote-path>]"
         echo "Use --help for usage information"
         exit 1
+    fi
+
+    # Auto-derive REMOTE_PATH from local repo name when not explicitly given
+    if [[ -z "$REMOTE_PATH" ]]; then
+        local local_repo_name
+        local_repo_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "")
+        if [[ -n "$local_repo_name" ]]; then
+            # Tilde is intentional; expanded by the remote shell
+            # shellcheck disable=SC2088
+            REMOTE_PATH="~/${local_repo_name}"
+        else
+            log_error "No remote path given and not inside a git repository."
+            exit 1
+        fi
+    fi
+
+    # Auto-derive REPO_URL from local git remote when not explicitly given
+    if [[ -z "$REPO_URL" ]]; then
+        REPO_URL=$(git remote get-url origin 2>/dev/null || echo "")
     fi
 }
 
@@ -137,6 +169,11 @@ if (command -v podman &>/dev/null && podman compose version &>/dev/null) || \
 else
     echo "COMPOSE_AVAILABLE=0"
 fi
+if command -v git &>/dev/null; then
+    echo "GIT_AVAILABLE=1"
+else
+    echo "GIT_AVAILABLE=0"
+fi
 if [ -d "$REPO_PATH" ]; then
     echo "REPO_PATH_EXISTS=1"
 else
@@ -162,6 +199,7 @@ REMOTEEOF
         case "${BASH_REMATCH[1]}" in
             RUNTIME) RUNTIME="${BASH_REMATCH[2]}" ;;
             COMPOSE_AVAILABLE) COMPOSE_AVAILABLE="${BASH_REMATCH[2]}" ;;
+            GIT_AVAILABLE) GIT_AVAILABLE="${BASH_REMATCH[2]}" ;;
             REPO_PATH_EXISTS) REPO_PATH_EXISTS="${BASH_REMATCH[2]}" ;;
             DEVCONTAINER_EXISTS) DEVCONTAINER_EXISTS="${BASH_REMATCH[2]}" ;;
             DISK_AVAILABLE_GB) DISK_AVAILABLE_GB="${BASH_REMATCH[2]}" ;;
@@ -169,6 +207,7 @@ REMOTEEOF
         esac
     done <<< "$preflight_output"
 
+    # Hard errors: runtime and compose are always required
     if [[ -z "${RUNTIME:-}" ]]; then
         log_error "No container runtime found on $SSH_HOST. Install podman or docker."
         exit 1
@@ -182,20 +221,58 @@ REMOTEEOF
         log_error "Compose not available on $SSH_HOST. Install docker-compose or podman-compose."
         exit 1
     fi
-    if [[ "${REPO_PATH_EXISTS:-0}" != "1" ]]; then
-        log_error "Repository not found at $REMOTE_PATH on $SSH_HOST."
-        exit 1
-    fi
-    if [[ "${DEVCONTAINER_EXISTS:-0}" != "1" ]]; then
-        log_error "No .devcontainer/ found in $REMOTE_PATH. Is this a devcontainer-enabled project?"
-        exit 1
-    fi
+
+    # Soft checks: repo and devcontainer are handled by clone/init steps
     if [[ "${DISK_AVAILABLE_GB:-0}" -lt 2 ]] 2>/dev/null; then
         log_warning "Low disk space on $SSH_HOST (${DISK_AVAILABLE_GB:-0}GB). At least 2GB recommended."
     fi
     if [[ "${OS_TYPE:-}" == "macos" ]]; then
         log_warning "Remote host is macOS. Devcontainer support may be limited."
     fi
+}
+
+remote_clone_if_needed() {
+    [[ "${REPO_PATH_EXISTS:-0}" == "1" ]] && return 0
+
+    if [[ -z "$REPO_URL" ]]; then
+        log_error "Repository not found at $REMOTE_PATH on $SSH_HOST and no repo URL available."
+        log_error "Provide a path (host:path) or use --repo <url>."
+        exit 1
+    fi
+    if [[ "${GIT_AVAILABLE:-0}" != "1" ]]; then
+        log_error "git not found on $SSH_HOST. Install git to enable auto-clone."
+        exit 1
+    fi
+
+    log_info "Cloning $REPO_URL to $REMOTE_PATH on $SSH_HOST..."
+    # shellcheck disable=SC2029
+    if ! ssh "$SSH_HOST" "git clone '$REPO_URL' '$REMOTE_PATH'"; then
+        log_error "git clone failed on $SSH_HOST."
+        exit 1
+    fi
+    log_success "Repository cloned to $REMOTE_PATH"
+    REPO_PATH_EXISTS=1
+}
+
+remote_init_if_needed() {
+    [[ "${DEVCONTAINER_EXISTS:-0}" == "1" ]] && return 0
+
+    local project_name
+    project_name=$(basename "$REMOTE_PATH" | tr '[:upper:]' '[:lower:]' | sed 's/[ -]/_/g; s/[^a-z0-9_]/_/g')
+
+    log_info "No .devcontainer/ found. Running init-workspace for '$project_name'..."
+    # shellcheck disable=SC2029
+    if ! ssh "$SSH_HOST" "$RUNTIME run --rm \
+        -e SHORT_NAME='$project_name' \
+        -e ORG_NAME='vigOS' \
+        -v '$REMOTE_PATH:/workspace' \
+        ghcr.io/vig-os/devcontainer:latest \
+        /root/assets/init-workspace.sh --no-prompts --force"; then
+        log_error "init-workspace failed on $SSH_HOST."
+        exit 1
+    fi
+    log_success "Workspace initialized"
+    DEVCONTAINER_EXISTS=1
 }
 
 remote_compose_up() {
@@ -212,7 +289,7 @@ remote_compose_up() {
         # shellcheck disable=SC2029
         if ! ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD up -d"; then
             log_error "Failed to start devcontainer on $SSH_HOST."
-            log_error "Debug with: ssh $SSH_HOST 'cd $REMOTE_PATH && $COMPOSE_CMD logs'"
+            log_error "Run 'ssh $SSH_HOST \"cd $REMOTE_PATH && $COMPOSE_CMD logs\"' for details."
             exit 1
         fi
         sleep 2
@@ -232,12 +309,18 @@ open_editor() {
     container_workspace="${container_workspace:-/workspace}"
 
     # Build URI using Python helper
-    uri=$(python3 "$SCRIPT_DIR/devc_remote_uri.py" \
+    if ! uri=$(python3 "$SCRIPT_DIR/devc_remote_uri.py" \
         "$REMOTE_PATH" \
         "$SSH_HOST" \
-        "$container_workspace")
+        "$container_workspace"); then
+        log_error "Failed to build editor URI. Is devc_remote_uri.py present in $SCRIPT_DIR?"
+        exit 1
+    fi
 
-    "$EDITOR_CLI" --folder-uri "$uri"
+    if ! "$EDITOR_CLI" --folder-uri "$uri"; then
+        log_error "Failed to open $EDITOR_CLI. URI: $uri"
+        exit 1
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -259,6 +342,8 @@ main() {
     remote_preflight
     log_success "Pre-flight OK (runtime: $RUNTIME)"
 
+    remote_clone_if_needed
+    remote_init_if_needed
     remote_compose_up
     open_editor
 
