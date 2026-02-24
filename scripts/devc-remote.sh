@@ -329,13 +329,25 @@ open_editor() {
 
 main() {
     parse_args "$@"
+
+    log_info "Detecting local editor CLI..."
     detect_editor_cli
+    log_success "Using $EDITOR_CLI"
+
+    log_info "Checking SSH connectivity to $SSH_HOST..."
     check_ssh
+    log_success "SSH connection OK"
+
+    log_info "Running pre-flight checks on $SSH_HOST..."
     remote_preflight
+    log_success "Pre-flight OK (runtime: $RUNTIME)"
+
     remote_clone_if_needed
     remote_init_if_needed
     remote_compose_up
     open_editor
+
+    log_success "Done — opened $EDITOR_CLI for $SSH_HOST:$REMOTE_PATH"
 }
 
 main "$@"
