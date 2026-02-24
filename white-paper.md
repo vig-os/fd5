@@ -2,37 +2,45 @@
 
 ## Abstract
 
-`fd5` is a self-describing, FAIR-principled data format for scientific data products built on HDF5. It defines conventions for storing volumetric images, event-based data, simulation outputs, and arbitrary scientific measurements alongside their full metadata, provenance, and schema -- all inside a single HDF5 file per data product.
+`fd5` is a self-describing, FAIR-principled data format for scientific data products built on HDF5. It defines conventions for storing N-dimensional arrays, tabular event data, time series, histograms, and arbitrary scientific measurements alongside their full metadata, provenance, and schema -- all inside a single, immutable HDF5 file per data product.
 
-The HDF5 file is the **single source of truth**. Every other representation (TOML manifests, YAML metadata exports, datacite records) is a derived, human-readable dump that can be regenerated from the HDF5 at any time.
+The format is designed for **write-once, read-many (SWMR)** workloads: a data product is created once by an ingest or processing pipeline, sealed with a content hash, and never modified. This immutability guarantee simplifies caching, integrity verification, provenance tracking, and concurrent read access.
 
-`fd5` is format-agnostic on the input side. It does not parse DICOMs, ROOT files, MIDAS streams, or vendor-specific scanner output. Those are upstream concerns handled by domain-specific ingest pipelines. `fd5` defines what the clean, canonical data product looks like once it exists.
+The HDF5 file is the **single source of truth**. Every other representation (TOML manifests, YAML metadata exports, datacite records, RO-Crate JSON-LD) is a derived, human-readable dump that can be regenerated from the HDF5 at any time.
+
+`fd5` is **domain-agnostic by design**. The core format -- schema conventions, provenance DAG, units, hashing, metadata structure -- applies to any domain that produces immutable data products: medical imaging, detector physics, genomics, remote sensing, materials science, or machine-generated datasets from automated pipelines and AI systems. Domain-specific **product schemas** (which groups and datasets a particular product type requires) are layered on top of the core. This white paper defines the core conventions and provides the first set of product schemas from fd5's initial use case in medical imaging and nuclear physics.
+
+`fd5` is format-agnostic on the input side. It does not parse DICOMs, ROOT files, FASTQ streams, or vendor-specific instrument output. Those are upstream concerns handled by domain-specific ingest pipelines. `fd5` defines what the clean, canonical data product looks like once it exists.
 
 
 ## Motivation
 
 ### The problem
 
-Scientific data -- especially in medical imaging, nuclear physics, and detector R&D -- typically starts as vendor-specific scanner output: DICOMs with thousands of inconsistent tags, proprietary listmode formats, INI configuration files, ad-hoc HDF5 layouts, and scattered metadata in spreadsheets and lab notebooks.
+Scientific data -- whether from medical imaging, particle detectors, sequencing instruments, automated lab equipment, or computational pipelines -- typically starts as vendor-specific output: DICOMs with thousands of inconsistent tags, proprietary binary formats, ad-hoc CSV/HDF5 layouts, and scattered metadata in spreadsheets, lab notebooks, and emails.
 
 Working with this data involves:
 - **Fragile caching layers** (JSON/pickle manifests that corrupt, go stale, or can't serialize domain types)
-- **Repeated parsing overhead** (re-reading DICOM headers every time, re-computing derived quantities)
-- **Scattered metadata** (acquisition parameters in DICOMs, bed positions in INI files, tracer info in separate TOML protocols, operator notes in emails)
-- **No precomputed artifacts** (every visualization requires loading full volumes)
+- **Repeated parsing overhead** (re-reading headers every time, re-computing derived quantities)
+- **Scattered metadata** (acquisition parameters in one format, instrument settings in another, protocol details in a third, operator notes in emails)
+- **No precomputed artifacts** (every visualization or summary requires loading full datasets)
 - **No machine-readable schema** (new collaborators, AI agents, and automated pipelines must reverse-engineer the data structure)
-- **No provenance chain** (which raw data produced this reconstruction? which CT was used for attenuation correction?)
+- **No provenance chain** (which raw data produced this result? which calibration was applied? which pipeline version?)
+- **Mutable state** (files modified in place, no integrity guarantee, no way to detect corruption or tampering)
+
+These problems are universal. They appear wherever raw instrument output is transformed into analysis-ready data products -- in hospitals, synchrotrons, sequencing cores, simulation clusters, and AI training pipelines alike.
 
 ### The solution
 
-Treat scanner output as archival "junk" -- keep it, hash it, link to it, but never work with it directly. Instead, ingest it once into a clean, self-describing format where:
+Treat raw instrument output as archival source material -- keep it, hash it, link to it, but never work with it directly. Instead, ingest it once into a clean, self-describing, **immutable** format where:
 
-1. One file = one data product (a reconstruction, a listmode acquisition, a simulation)
+1. One file = one data product (a reconstructed image, an event table, a processed spectrum, a variant call set)
 2. All metadata lives inside the file, structured as nested groups with attributes
 3. The schema is embedded in the file itself, not in external documentation
-4. Precomputed artifacts (projections, thumbnails) are stored alongside the data
+4. Precomputed artifacts (projections, thumbnails, summaries) are stored alongside the data
 5. Provenance links trace every product back to its sources
-6. Any tool -- from `h5dump` to an LLM -- can understand the file without domain-specific code
+6. The file is sealed with a content hash at write time and never modified
+7. Any tool -- from `h5dump` to an LLM -- can understand the file without domain-specific code
 
 
 ## Design Principles
@@ -47,7 +55,7 @@ The HDF5 file contains everything: data, metadata, schema, provenance, precomput
 |-----------|----------------|
 | **Findable** | Persistent identifier (`id`) as root attribute. Rich, structured metadata. Human-readable filenames with timestamps. |
 | **Accessible** | HDF5 is an open, standardized format supported by every scientific computing platform. No proprietary dependencies. |
-| **Interoperable** | `@units` and `@unitSI` on every numerical field (NeXus/OpenPMD conventions). ISO 8601 timestamps with timezone. Standard vocabulary references for modalities and anatomy. |
+| **Interoperable** | `@units` and `@unitSI` on every numerical field (NeXus/OpenPMD conventions). ISO 8601 timestamps with timezone. Standard vocabulary references via `_vocabulary`/`_code` attributes. |
 | **Reusable** | Full provenance chain. Schema version embedded. `_type`/`_version` for forward-compatible extensibility. License and attribution metadata. |
 
 ### 3. AI-retrievable (FAIR for AI)
@@ -66,20 +74,23 @@ No domain-specific code required. An `h5dump -A` (attributes only) produces a co
 
 ### 4. One file per data product
 
-A single acquisition (e.g., a whole-body PET scan) may produce multiple data products with fundamentally different structures:
+A single experiment, acquisition, or pipeline run may produce multiple data products with fundamentally different structures. Each gets its own file. This keeps files manageable, allows independent access, and matches the natural unit of scientific work ("I want the reconstruction" not "I want byte range 4.2--5.1 GB of the monolithic run file").
 
-| Product type | Data structure | Typical size | Access pattern |
-|-------------|---------------|-------------|----------------|
-| `recon` | 3D/4D voxel grid | 100 MB -- 1 GB | Slice reads, MIP preview |
-| `listmode` | Event tables (compound datasets) | 100 MB -- 10 GB | Sequential scan, time windowing |
-| `sinogram` | 3D projection array | 100 MB -- 1 GB | Full read |
-| `sim` | Event tables + ground truth volumes | Variable | Analysis-specific |
-| `transform` | 4x4 matrix or displacement field | 1 KB -- 1 GB | Resampling, ROI propagation |
-| `calibration` | Gain maps, curves, lookup tables | 1 KB -- 100 MB | Referenced by recon/listmode |
-| `spectrum` | ND histograms with bin edges + fits | 1 KB -- 100 MB | Full read, fitting, visualization |
-| `roi` | Label masks, contours, geometric shapes | 1 KB -- 100 MB | Region lookup, statistics |
+The concept of a "product type" is extensible. fd5 defines a core set of structural archetypes that cover common scientific data patterns:
 
-Each gets its own file. This keeps files manageable, allows independent access, and matches the natural unit of scientific work ("I want the Q.Clear reconstruction" not "I want byte range 4.2--5.1 GB of the monolithic scan file").
+| Structural archetype | Data structure | Examples across domains |
+|---------------------|---------------|----------------------|
+| N-dimensional array | Regular grid (3D, 4D, 5D) | Volumetric images, simulation fields, satellite rasters |
+| Event table | Compound dataset, sequential rows | Detector events, sequencing reads, particle tracks |
+| Projection / sinogram | AND array in transform coordinates | Projection data, Radon transforms, k-space |
+| Histogram / spectrum | AND bins with axes and fit results | Energy spectra, lifetime distributions, expression matrices |
+| Spatial transform | Matrix or displacement field | Image registrations, coordinate transforms |
+| Calibration | Curves, maps, lookup tables | Gain maps, normalization tables, reference standards |
+| Region of interest | Label masks, contours, geometric shapes | Segmentations, annotations, genomic intervals |
+| Time series | Signal + time arrays | Device streams, sensor logs, physiological monitors |
+| Simulation | Events + ground truth | Monte Carlo output, synthetic benchmarks |
+
+Domain-specific **product schemas** map onto these archetypes. The first set of product schemas (defined later in this document) comes from medical imaging and nuclear physics: `recon`, `listmode`, `sinogram`, `spectrum`, `transform`, `calibration`, `roi`, `sim`, `device_data`. Other domains define their own product types using the same core conventions.
 
 ### 5. Groups are nested dicts
 
@@ -88,10 +99,10 @@ HDF5 groups with attributes provide native nested-dictionary storage. No JSON se
 ### 6. `_type` + `_version` for forward-compatible extensibility
 
 Any group that could have multiple implementations carries:
-- `_type` (str): what kind of thing this is (e.g., `"q_clear"`, `"osem"`, `"dlir"`, `"gate"`)
+- `_type` (str): what kind of thing this is (e.g., `"q_clear"`, `"osem"`, `"bwa_mem2"`, `"random_forest"`)
 - `_version` (int): which generation of that type's schema
 
-A new reconstruction algorithm, correction method, or simulation code just uses a new `_type` value with its own attributes. **No schema change. No re-ingest of existing data.** Old readers encountering an unknown `_type` gracefully skip or display just the type string. `_version` handles breaking changes within a type; readers log warnings for unknown versions but still read what they can.
+A new algorithm, method, or pipeline step just uses a new `_type` value with its own attributes. **No schema change. No re-ingest of existing data.** Old readers encountering an unknown `_type` gracefully skip or display just the type string. `_version` handles breaking changes within a type; readers log warnings for unknown versions but still read what they can.
 
 ### 7. `@units` + `@unitSI` on every numerical field
 
@@ -101,6 +112,17 @@ Inspired by NeXus and OpenPMD:
 
 Field names are bare (`z_min`, `duration`, `activity`) -- they do not embed units. This prevents the `z_min_mm` vs `z_min_m` vs `z_min_cm` naming chaos and enables automated unit conversion: `value_si = value * unitSI`.
 
+**For attributes with physical units,** use a sub-group pattern that provides structural integrity:
+
+```
+z_min/
+    attrs: {value: -450.2, units: "mm", unitSI: 0.001}
+```
+
+This ensures that deleting the group deletes everything (no orphaned `_units` attributes), enables programmatic enumeration (every sub-group with `value`+`units`+`unitSI` is a physical quantity), and eliminates suffix-stripping heuristics.
+
+**For datasets with physical units,** follow the NeXus convention: `units` and `unitSI` are attributes on the dataset itself.
+
 ### 8. Additive-only schema evolution
 
 New schema versions only add attributes and groups. They never remove or rename existing ones. A v2 reader can always read a v1 file. A v1 reader encountering v2 data reads what it knows and ignores the rest.
@@ -108,6 +130,16 @@ New schema versions only add attributes and groups. They never remove or rename 
 ### 9. Embedded schema definition
 
 The root of every `fd5` file carries a `_schema` attribute containing a JSON Schema document describing the file's structure. This is not for validation during normal use (though it can be) -- it's for **self-description**. An AI agent or unfamiliar tool reads `_schema` and knows exactly what groups and attributes to expect, their types, and their semantics.
+
+**Storage rationale:**
+
+The `_schema` is stored as a JSON string attribute (not as a group tree) for **single-read self-description**. One `h5py.File(f).attrs["_schema"]` call returns the complete schema without traversing the group tree. This is the fastest possible path for an AI agent or unfamiliar tool to understand the file structure.
+
+- **Why not a group tree?** Storing the schema as a group tree (mirroring the actual data structure) would be redundant -- the actual data *is* the structural schema. Reconstructing the schema from a tree would require full traversal, defeating the purpose of fast introspection.
+
+- **Why not binary format?** A binary-encoded format (MessagePack, CBOR, Protocol Buffers) could reduce size, but would sacrifice the property that `h5dump -A` produces human-readable output. The JSON `_schema` attribute is visible in any HDF5 viewer and in command-line dumps. For self-documentation, human readability trumps storage efficiency.
+
+- **Read-optimized, write-once**: The JSON string is intentionally a read-optimized format. It's written once during file creation and read many times during discovery, validation, and AI-assisted analysis. The schema size (typically <10 KB) is negligible compared to data payloads (MB to GB).
 
 ### 10. ISO 8601 with explicit timezone
 
@@ -123,7 +155,7 @@ Provenance lives in metadata, not in filenames. Filenames describe identity ("wh
 
 Every `fd5` file carries two distinct hashes:
 
-- **`id`** (root attr): SHA-256 of identity inputs (`product + vendor + vendor_id + timestamp`), prefixed with algorithm: `"sha256:a1b2c3..."`. This is the **persistent identity** -- stable across re-ingests, schema upgrades, and recompression. The companion `id_inputs` attr documents exactly what was hashed. Filenames use the first 8 hex chars for brevity.
+- **`id`** (root attr): SHA-256 of identity inputs (product-type-specific; e.g., `product + source + timestamp`), prefixed with algorithm: `"sha256:a1b2c3..."`. This is the **persistent identity** -- stable across re-ingests, schema upgrades, and recompression. The companion `id_inputs` attr documents exactly what was hashed. Filenames use the first 8 hex chars for brevity.
 - **`content_hash`** (root attr): SHA-256 of the file's data content (excluding the hash attr itself), computed at write time: `"sha256:d4e5f6..."`. This is the **integrity seal** -- changes if anything in the file changes.
 
 Additionally:
@@ -138,6 +170,20 @@ This enables:
 
 All hashes use the `"algorithm:hex"` prefix convention (currently always `"sha256:"`) so the algorithm is self-documenting and upgradeable.
 
+### 13. Immutability and write-once semantics
+
+fd5 files are **write-once, read-many (SWMR)**. Once a file is created and sealed with its `content_hash`, it is never modified. There is no `fd5.open_for_edit()`. This is a deliberate architectural choice, not a limitation:
+
+- **Integrity**: the `content_hash` Merkle tree is valid for the lifetime of the file. No re-hashing after edits.
+- **Provenance**: downstream products reference source products by `id` and `content_hash`. If a source file were modified, the entire provenance chain would be invalidated.
+- **Concurrency**: multiple readers can access the file simultaneously without locks. HDF5's SWMR mode is supported natively.
+- **Caching**: any cache keyed on `content_hash` is valid forever. No cache invalidation logic needed.
+- **Reproducibility**: the same inputs to the same pipeline always produce files with the same `content_hash`.
+
+If data needs to be corrected or reprocessed, the pipeline produces a **new** fd5 file with a new `id` and `content_hash`. The old file remains unchanged. Version history is tracked through the provenance DAG (`sources/`), not through in-place mutation.
+
+This model is natural for data products generated by automated pipelines, AI inference systems, and instrument ingest processes -- all of which produce immutable outputs. It is the same model used by content-addressed storage systems (Git, IPFS, Zarr) and append-only databases.
+
 
 ## File Naming Convention
 
@@ -145,38 +191,44 @@ All hashes use the `"algorithm:hex"` prefix convention (currently always `"sha25
 YYYY-MM-DD_HH-MM-SS_<product>-<id>_<descriptors>.h5
 ```
 
-- **Datetime prefix**: acquisition timestamp for chronological `ls` sorting
-- **Product type**: `recon`, `listmode`, `sinogram`, `sim`, `transform`, `calibration`, `spectrum`, `roi`, `device_data`
+- **Datetime prefix**: creation/acquisition timestamp for chronological `ls` sorting
+- **Product type**: domain-defined (e.g., `recon`, `listmode`, `spectrum`, `alignment`, `variants`, `features`)
 - **ID**: first 8 hex chars of the full SHA-256 identity hash (for filename brevity)
-- **Descriptors**: freeform, human-readable labels separated by underscores (modality, method, body region, etc.)
+- **Descriptors**: freeform, human-readable labels separated by underscores (domain, method, subset, etc.)
 
-Examples:
+Examples (medical imaging):
+
 ```
 2024-07-24_18-14-00_recon-87f032f6_ct_thorax_dlir.h5
 2024-07-24_19-06-10_recon-2a3ac438_pet_qclear_wb.h5
 2024-07-24_19-06-10_listmode-def67890_pet_coinc.h5
-2024-07-24_19-23-16_listmode-abc12345_pet_singles_bed1.h5
 2024-07-24_19-30-00_spectrum-44556677_pet_lifetime_pals.h5
-2024-07-24_19-06-10_device-ab12cd34_pet_blood_input.h5
-2024-07-24_19-06-10_spectrum-88990011_pet_energy_coinc_matrix.h5
 2024-07-24_19-06-10_roi-aabb1122_pet_tumor_contours.h5
-2024-07-24_19-06-10_roi-ccdd3344_pet_organs_totalseg.h5
-roi-eeff5566_phantom_nema_spheres.h5
 sim-xyz99999_pet_nema_gate.h5
 ```
 
-Simulations lack acquisition timestamps and omit the datetime prefix.
+Examples (other domains):
+
+```
+2025-03-15_09-22-00_alignment-c4f2a1b8_wgs_sample01_bwamem2.h5
+2025-03-15_10-45-00_variants-e7d3b902_wgs_sample01_deepvariant.h5
+2025-06-01_12-00-00_features-a1b2c3d4_satellite_band4_ndvi.h5
+2025-06-01_14-30-00_spectrum-f9e8d7c6_xrf_sample_cu_ka.h5
+calibration-11223344_detector_energy_hpge.h5
+```
+
+Products without a natural timestamp (simulations, synthetic data, reference datasets) omit the datetime prefix.
 
 The filename is **convenience, not identity**. The `<id>` in the filename is the first 8 hex characters of the full `id` hash (e.g., `sha256:2a3ac438e7f1...` becomes `2a3ac438` in the filename). The real identity is the full `id` attribute inside the HDF5 file. Renaming a file breaks nothing. The `fd5` package sets file `mtime` to the acquisition timestamp during creation, so file managers sort chronologically even without parsing the name.
 
-Descriptors are freeform -- not BIDS-style `key-value` pairs. They exist for `ls` and `grep`, not for machine parsing. Machine-readable metadata lives inside the HDF5.
+Descriptors are freeform -- not BIDS-style `key-value` pairs. They exist for `ls` and `grep`, not for machine parsing. Machine-readable metadata lives inside the HDF5. Domains are free to establish naming conventions for their descriptors (e.g., `_wgs_` for whole-genome sequencing, `_pet_` for PET imaging) without changing the fd5 core.
 
 
 ## HDF5 Schema
 
 ### Root attributes (common to all products)
 
-Every `fd5` file carries these attributes on the root group, plus the `study/`, `subject/` (or `phantom/`) groups for self-containment:
+Every `fd5` file carries these attributes on the root group. The `study/` and `subject/` (or domain-equivalent context) groups provide self-containment:
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -187,11 +239,7 @@ Every `fd5` file carries these attributes on the root group, plus the `study/`, 
 | `id_inputs` | str | Documents what was hashed to produce `id` (e.g., `"product + vendor + vendor_id + timestamp"`) |
 | `name` | str | Human-readable name |
 | `description` | str | Natural-language description of this data product |
-| `scan_type` | str | Modality: `"ct"`, `"pet"`, `"mri"` |
-| `scan_type_vocabulary` | str | Vocabulary system, e.g. `"DICOM Modality (0008,0060)"` (optional) |
-| `scan_type_code` | str | Standard code in that vocabulary, e.g. `"PT"`, `"CT"` (optional) |
-| `vendor` | str | Scanner vendor (optional for non-scanner products) |
-| `vendor_id` | str | Vendor-assigned series/acquisition ID (optional for non-scanner products) |
+| `domain` | str | Scientific domain (optional): `"medical_imaging"`, `"nuclear_physics"`, `"genomics"`, `"remote_sensing"`, etc. |
 | `timestamp` | str | ISO 8601 with timezone |
 | `content_hash` | str | Algorithm-prefixed SHA-256 of file content at write time (e.g., `"sha256:d4e5f6..."`) |
 | `default` | str | Path to the "best" dataset for visualization |
@@ -213,34 +261,57 @@ Plus product-specific root attributes (see product schemas below).
 
 An `h5dump -A` of the file produces a complete human- and machine-readable manifest without any fd5-specific tooling.
 
+**Description requirements:**
+- **Required** on the root group and all first-level groups (`metadata/`, `provenance/`, `sources/`, etc.)
+- **Recommended** on all deeper groups and datasets
+
+**Quality enforcement:** The fd5 SDK integrates a lightweight validator at write time to reject boilerplate descriptions that merely restate the group name (e.g., `"Metadata"` for `metadata/`, `"Reconstruction parameters"` for `metadata/reconstruction/`). The validator can be a simple heuristic (string similarity check) or a small local LLM (e.g., quantized models via llama.cpp, mlx, or transformers) that scores description informativeness. This is an SDK concern, not a format concern -- the `description` attribute is always a plain string, and validation happens only during creation.
+
 ### Units convention
 
-Every attribute or dataset with physical meaning carries two companion attributes:
+Every numerical attribute or dataset with physical meaning carries units information. The pattern differs for attributes vs. datasets:
+
+**For attributes:** use a sub-group pattern where the physical quantity becomes a group with `value`, `units`, and `unitSI` attributes:
 
 ```
-z_min = -450.2
-z_min__units = "mm"
-z_min__unitSI = 0.001
+z_min/
+    attrs: {value: -450.2, units: "mm", unitSI: 0.001}
+duration/
+    attrs: {value: 367.0, units: "s", unitSI: 1.0}
 ```
 
-The double-underscore `__units` / `__unitSI` suffix convention avoids collisions with HDF5 attribute namespaces and makes units unambiguously associated with their parent field. (When the field is a dataset rather than an attribute, `units` and `unitSI` are attributes on the dataset itself, following the NeXus convention.)
+This provides structural integrity (delete the group, delete everything) and programmatic enumeration (every sub-group with these three attributes is a physical quantity).
+
+**For datasets:** follow the NeXus convention where `units` and `unitSI` are attributes on the dataset itself:
+
+```
+volume                              # dataset: float32 (Z, Y, X)
+    attrs: {units: "Bq/mL", unitSI: 1000.0, ...}
+```
 
 ### Vocabulary references
 
-Domain-specific string fields (modalities, anatomical regions, procedure types) carry optional vocabulary attributes:
+Domain-specific string fields carry optional vocabulary attributes that link the human-readable value to a standard terminology:
 
 ```
+# Medical imaging example:
 scan_type = "pet"
 scan_type_vocabulary = "DICOM Modality"
 scan_type_code = "PT"
+
+# Genomics example:
+variant_type = "SNV"
+variant_type_vocabulary = "Sequence Ontology"
+variant_type_code = "SO:0001483"
 ```
 
-These use **human-readable standard names** -- not hex tag IDs or obscure numeric codes. The vocabulary name itself is enough for lookup. Common vocabularies:
-- **DICOM Modality** for imaging modalities (`CT`, `PT`, `MR`, `NM`)
-- **SNOMED CT** for anatomical regions (by name, not by numeric code)
-- **RadLex** for imaging procedures and findings
+These use **human-readable standard names** -- not hex tag IDs or obscure numeric codes. The vocabulary name itself is enough for lookup. Each domain uses its own standard vocabularies:
+- **Medical imaging**: DICOM Modality (`CT`, `PT`, `MR`), SNOMED CT (anatomical regions), RadLex (procedures)
+- **Genomics**: SO (Sequence Ontology), HGNC (gene names), OMIM (diseases)
+- **Materials science**: CIF (crystallographic terms), MatOnto
+- **General**: SI units, ISO standards
 
-Vocabulary attributes are optional and additive. Their absence doesn't break anything.
+Vocabulary attributes are optional and additive. Their absence doesn't break anything. Domains are free to define additional vocabulary references without changing the fd5 core.
 
 ### `metadata/` group -- structured metadata
 
@@ -257,14 +328,17 @@ metadata/
     tracer/
         attrs: {name: "FDG",
                 injection_time: "18:30:00+02:00",
-                injection_activity: 350.0, injection_activity__units: "MBq",
-                half_life: 6586.2, half_life__units: "s",
                 description: "Radiotracer administration details"}
+        injection_activity/
+            attrs: {value: 350.0, units: "MBq", unitSI: 1e6}
+        half_life/
+            attrs: {value: 6586.2, units: "s", unitSI: 1.0}
     acquisition/
         attrs: {n_beds: 4, mode: "3D",
                 frame_durations: [120.0, 120.0, 120.0, 120.0],
-                frame_durations__units: "s",
                 description: "Data acquisition parameters"}
+        frame_durations/
+            attrs: {value: [120.0, 120.0, 120.0, 120.0], units: "s", unitSI: 1.0}
     reconstruction/
         attrs: {_type: "q_clear", _version: 1,
                 beta: 350, iterations: 25, tof: true, psf: true,
@@ -292,19 +366,23 @@ Example for a CT reconstruction:
 metadata/
     attrs: {_type: "ct", _version: 1}
     acquisition/
-        attrs: {kvp: 120, kvp__units: "kV",
-                mas: 250, mas__units: "mAs",
-                pitch: 0.984,
-                rotation_time: 0.5, rotation_time__units: "s",
+        attrs: {pitch: 0.984,
                 description: "CT acquisition parameters"}
+        kvp/
+            attrs: {value: 120, units: "kV", unitSI: 1000.0}
+        mas/
+            attrs: {value: 250, units: "mAs", unitSI: 1.0}
+        rotation_time/
+            attrs: {value: 0.5, units: "s", unitSI: 1.0}
     reconstruction/
         attrs: {_type: "dlir", _version: 1,
                 strength: "medium", kernel: "STANDARD",
                 description: "Deep learning image reconstruction"}
     dose/
-        attrs: {ctdi_vol: 12.5, ctdi_vol__units: "mGy",
-                dlp: 450.0, dlp__units: "mGy*cm",
-                description: "Radiation dose metrics"}
+        ctdi_vol/
+            attrs: {value: 12.5, units: "mGy", unitSI: 0.001}
+        dlp/
+            attrs: {value: 450.0, units: "mGy*cm", unitSI: 0.01}
 ```
 
 New metadata sub-groups (e.g., `contrast/`, `respiratory_gating/`, `cardiac_gating/`) are added as needed. Unknown groups are ignored by readers that don't understand them.
@@ -334,7 +412,23 @@ sources/
         --> h5py.ExternalLink("../2024-07-24_18-25-00_recon-21d255e7_ct_ctac.h5", "/")
 ```
 
-The external links provide transparent HDF5 access to source data (when available). The `content_hash` enables integrity verification even if the source file has moved. The `role` attribute documents the semantic relationship.
+**Resolution semantics:**
+
+- The **`id` hash is the primary resolution key**, not the relative file path. The `file` attribute is a convenience hint that may become stale if files are moved or reorganized.
+- The external link provides transparent HDF5 access to source data *when the file is at the hinted location*. If the link is broken (file moved), resolution falls back to the `id`.
+- The `content_hash` enables integrity verification after resolution, decoupling "find the file" from "verify the file."
+
+**File location management is out of scope** for the fd5 format. It is the responsibility of dataset management tools:
+- **DataLad**: version-controlled datasets with content-addressable storage
+- **Local metadata table**: Polars/DuckDB table mapping `id` → `path` for the current dataset
+- **Vector DB**: LanceDB or similar for fast hash-based lookup across large collections
+
+**Resolution layer:** The fd5 SDK provides a `resolve(id) -> Path` hook that dataset managers can implement. The default implementation:
+1. Check if the external link works (file exists at hinted path)
+2. If not, search the manifest (`manifest.toml`) for a product with matching `id`
+3. If not found, raise `SourceNotFoundError` with the `id` for the user to handle
+
+External tools (DataLad, custom registries) can override this hook to provide richer resolution (e.g., automatic git-annex retrieval, remote registry queries).
 
 Source groups can themselves be queried recursively to reconstruct the full provenance tree.
 
@@ -379,6 +473,31 @@ extra/
 
 The `notes/` sub-group follows the NeXus NXnote pattern for attaching freeform binary content (photos, PDFs, screenshots) with MIME typing. Optional, never required. Each attachment has a `data` dataset containing the binary payload and metadata attributes including MIME type, authorship, and description.
 
+**Size guidelines and preference hierarchy:**
+
+The capability to embed binary attachments exists for cases where a blob is truly inseparable from the data product. However, **metadata catalogs (RO-Crate, DataLad, institutional repositories) are the preferred mechanism** for associating supplementary materials.
+
+| Size | Recommendation |
+|------|---------------|
+| **< 1 MB** | Embed freely (screenshots, small config files, operator notes) |
+| **1-10 MB** | Embed **only if** the content is inseparable from this specific data product (e.g., a scanner console screenshot showing a specific artifact visible in this acquisition) |
+| **> 10 MB** | **Strongly prefer external references** via RO-Crate, DataLad, DOI, or institutional repository. Store a reference (URL, DOI, hash) in `extra/notes/` instead of the binary payload |
+
+**Example external reference:**
+
+```
+extra/
+    notes/
+        protocol_reference/
+            attrs: {type: "application/pdf",
+                    url: "https://doi.org/10.5281/zenodo.1234567",
+                    file_name: "DOGPLET_protocol_v3.pdf",
+                    sha256: "abc123...",
+                    description: "Scan protocol document (externally hosted)"}
+```
+
+Embedding large binaries violates the "one product, manageable size" principle and makes files harder to transfer, archive, and process.
+
 ### Reserved conventions
 
 | Convention | Meaning | Status |
@@ -387,8 +506,6 @@ The `notes/` sub-group follows the NeXus NXnote pattern for attaching freeform b
 | `_version` | Schema version for a `_type` | Active |
 | `_schema` | Embedded JSON Schema (root only) | Active |
 | `_schema_version` | fd5 format version (root only) | Active |
-| `__units` | Unit string suffix on an attribute | Active |
-| `__unitSI` | SI conversion factor suffix on an attribute | Active |
 | `_errors` | Uncertainty dataset with same shape as parent | Active (used in `spectrum/counts_errors`) |
 | `_vocabulary` | Vocabulary system name suffix | Active |
 | `_code` | Standard code suffix in named vocabulary | Active |
@@ -398,14 +515,16 @@ The `notes/` sub-group follows the NeXus NXnote pattern for attaching freeform b
 | `id_inputs` | Documents what was hashed to produce `id` (root only) | Active |
 | `content_hash` | Algorithm-prefixed SHA-256 of file content at write time | Active |
 
+**Units convention:** Physical quantities stored as attributes use a sub-group pattern: `<name>/` with `attrs: {value, units, unitSI}`. Physical quantities stored as datasets carry `units` and `unitSI` as attributes on the dataset (NeXus convention).
+
 
 ### `study/` group -- study context and FAIR metadata
 
-Study-level metadata describing the research context, funding, and legal framework. Appears in every data product file (inherited or repeated for convenience).
+Study-level metadata describing the research context, funding, and legal framework. This group is **domain-agnostic** and appears in every data product file (inherited or repeated for convenience).
 
 ```
 study/
-    attrs: {type: "clinical" | "research" | "phantom",
+    attrs: {type: str,                               # domain-defined: "clinical", "research", "calibration", "synthetic", etc.
             license: "CC-BY-4.0",                    # SPDX identifier or URL (RO-Crate required)
             license_url: "https://creativecommons.org/licenses/by/4.0/",  # optional
             description: "Study type and context"}
@@ -425,24 +544,55 @@ study/
 
 **FAIR compliance:** The `license` and `creators/` fields are required for RO-Crate export. `license` must be an SPDX identifier (e.g., `"CC-BY-4.0"`, `"CC0-1.0"`) or URL. `creators/` enables Schema.org `Person` entity mapping with affiliation and ORCID support.
 
-### `subject/` group -- subject demographics
+### Context groups -- domain-specific metadata
 
-Subject-level metadata (patient/specimen demographics, species, age, sex). Appears once per dataset, referenced from all data products via a link.
+Beyond `study/`, each domain defines context groups relevant to its data. These are optional at the fd5 core level but may be required by a domain schema. Examples:
+
+**Medical imaging** (`subject/`, `phantom/`):
 
 ```
 subject/
     attrs: {id: "anonymized_id" | "patient_12345",
             species: "human" | "dog" | "mouse" | "phantom",
-            age: 42.5, age__units: "years",          # optional for human subjects (privacy)
             sex: "M" | "F" | "other",                # optional
             birth_date: "1959-03-15",                # optional (privacy-sensitive)
-            weight: 75.0, weight__units: "kg",       # optional
             description: "Subject demographics"}
+    age/                                             # optional for human subjects (privacy)
+        attrs: {value: 42.5, units: "years", unitSI: 31557600.0}
+    weight/                                          # optional
+        attrs: {value: 75.0, units: "kg", unitSI: 1.0}
 ```
 
-**Privacy:** Exact birth dates and ages should be omitted or generalized for de-identified datasets. The `id` can be a true anonymized ID or a de-identified proxy.
+**Genomics** (`sample/`, `library/`):
+
+```
+sample/
+    attrs: {sample_id: "TCGA-AB-1234",
+            organism: "Homo sapiens",
+            tissue: "liver",
+            tissue_vocabulary: "UBERON",
+            tissue_code: "UBERON:0002107",
+            description: "Biological sample metadata"}
+```
+
+**Privacy:** For all domains, sensitive fields (birth dates, patient IDs, GPS coordinates) should be omitted or generalized in de-identified datasets. The fd5 core does not enforce privacy policy -- that is the responsibility of the domain schema and the ingest pipeline.
 
 ## Product Schemas
+
+The product schemas below define the required and optional groups and datasets for each product type. They are **the first set of schemas**, developed for fd5's initial use case in medical imaging and nuclear/positron physics.
+
+New domains add new product schemas by following the same conventions: root attributes, `metadata/` group with `_type`/`_version`, `sources/` provenance DAG, `provenance/` original file tracking, and `extra/` for unvalidated data. The core fd5 machinery (hashing, schema embedding, manifest generation, RO-Crate export) works identically regardless of the product type.
+
+**Defining new product schemas** requires only:
+1. Choose a `product` string (e.g., `"alignment"`, `"expression_matrix"`, `"feature_set"`)
+2. Define required datasets and their structure (compound tables, AND arrays, etc.)
+3. Define required `metadata/` sub-groups with `_type`/`_version`
+4. Define `id_inputs` for identity hashing
+5. Register the schema as a JSON Schema document
+
+No changes to the fd5 core library are needed.
+
+---
 
 ### `recon` -- Reconstruction
 
@@ -460,7 +610,13 @@ The volume dimensionality depends on the reconstruction:
 
 ```
 <file>.h5
-├── attrs: (common) + {z_min, z_max, duration, n_slices}
+├── attrs: (common) + {n_slices}
+├── z_min/
+│   attrs: {value: -850.0, units: "mm", unitSI: 0.001}
+├── z_max/
+│   attrs: {value: -12.5, units: "mm", unitSI: 0.001}
+├── duration/
+│   attrs: {value: 367.0, units: "s", unitSI: 1.0}
 │
 ├── metadata/                       # structured acquisition + reconstruction params
 │   # (see detailed PET/CT metadata examples in the metadata section above)
@@ -469,7 +625,6 @@ The volume dimensionality depends on the reconstruction:
 │   attrs: {
 │       affine: float64[4,4],       # spatial affine (always 3D: maps voxel to mm)
 │       reference_frame: str,
-│       voxel_size__units: "mm",
 │       dimension_order: str,       # e.g. "TZYX", "GZYX", "GTZYX", "ZYX"
 │       description: str
 │   }
@@ -496,12 +651,13 @@ The volume dimensionality depends on the reconstruction:
 │               description: "Phase within physiological cycle per gate bin"}
 │   gate_trigger/                   # optional: the raw gating signal
 │       signal                      # dataset: float64 (N_samples,) -- raw ECG/bellows/etc.
-│           attrs: {sampling_rate__units: "Hz",
-│                   description: "Raw physiological gating signal"}
+│           attrs: {description: "Raw physiological gating signal"}
+│       sampling_rate/
+│           attrs: {value: 500.0, units: "Hz", unitSI: 1.0}
 │       trigger_times               # dataset: float64 (N_triggers,)
-│           attrs: {units: "s", description: "Detected trigger timestamps"}
+│           attrs: {units: "s", unitSI: 1.0, description: "Detected trigger timestamps"}
 │
-├── pyramid/                        # multiscale resolution pyramid (inspired by OME-Zarr NGFF)
+├── pyramid/                        # multiscale resolution pyramid (inspired by SOME-Zarr NGFF)
 │   attrs: {
 │       n_levels: int,              # number of downsampled levels (excluding full-res volume)
 │       scale_factors: list[int],   # e.g. [2, 4, 8] -- each relative to full-res volume
@@ -513,7 +669,6 @@ The volume dimensionality depends on the reconstruction:
 │           attrs: {
 │               affine: float64[4,4],
 │               scale_factor: 2,
-│               voxel_size__units: "mm",
 │               description: "2x downsampled volume"
 │           }
 │   level_2/                        # 4x downsampled
@@ -525,11 +680,9 @@ The volume dimensionality depends on the reconstruction:
 │
 ├── mip_coronal                     # float32, (Z, X) -- MIP of summed/static volume
 │   attrs: {projection_type: "mip", axis: 1,
-│           z_extent__units: "mm", x_extent__units: "mm",
 │           description: "Coronal MIP (summed over all frames if dynamic)"}
 ├── mip_sagittal                    # float32, (Z, Y)
 │   attrs: {projection_type: "mip", axis: 2,
-│           z_extent__units: "mm", y_extent__units: "mm",
 │           description: "Sagittal MIP (summed over all frames if dynamic)"}
 │
 ├── mips_per_frame/                 # optional: per-frame MIPs for dynamic data
@@ -545,12 +698,13 @@ The volume dimensionality depends on the reconstruction:
 │               model: "GE CardioLab",
 │               measurement: "voltage",
 │               run_control: true,
-│               sampling_rate: 500, sampling_rate__units: "Hz",
 │               description: "ECG trace for cardiac gating"}
+│       sampling_rate/
+│           attrs: {value: 500, units: "Hz", unitSI: 1.0}
 │       signal              # dataset: float64 (N,)
 │           attrs: {units: "mV", unitSI: 0.001}
 │       time                # dataset: float64 (N,)
-│           attrs: {units: "s", start: "2024-07-24T19:06:10+02:00"}
+│           attrs: {units: "s", unitSI: 1.0, start: "2024-07-24T19:06:10+02:00"}
 │       average_value, minimum_value, maximum_value, duration (optional summary stats)
 │       cue_timestamp_zero  # optional: coarse timestamps (e.g. every 60s)
 │       cue_index           # optional: index into time/signal at each cue
@@ -581,9 +735,9 @@ The volume dimensionality depends on the reconstruction:
 
 Compression: gzip level 4 throughout.
 
-**Multiscale pyramid** (inspired by OME-Zarr NGFF):
+**Multiscale pyramid** (inspired by SOME-Zarr NGFF):
 
-The `pyramid/` group stores successively downsampled copies of the full-resolution `volume`, enabling progressive-resolution access without loading the entire dataset. This is the same core idea behind OME-Zarr's multiscale image pyramids, adapted to HDF5's single-file model.
+The `pyramid/` group stores successively downsampled copies of the full-resolution `volume`, enabling progressive-resolution access without loading the entire dataset. This is the same core idea behind SOME-Zarr's multiscale image pyramids, adapted to HDF5's single-file model.
 
 Each pyramid level halves the spatial dimensions relative to the previous level. The `scale_factors` root attribute lists the factor relative to the full-resolution volume (e.g., `[2, 4, 8]`). The downsampling `method` attribute records how the levels were computed (e.g., `"local_mean"` for anti-aliased averaging, `"stride"` for simple subsampling). Each level carries its own `affine` matrix reflecting the coarser voxel spacing.
 
@@ -641,12 +795,13 @@ Detector-level event streams (singles, coincidences, time markers).
 │               model: "GE CardioLab",
 │               measurement: "voltage",
 │               run_control: true,
-│               sampling_rate: 500, sampling_rate__units: "Hz",
 │               description: "ECG trace for cardiac gating"}
+│       sampling_rate/
+│           attrs: {value: 500, units: "Hz", unitSI: 1.0}
 │       signal              # dataset: float64 (N,)
 │           attrs: {units: "mV", unitSI: 0.001}
 │       time                # dataset: float64 (N,)
-│           attrs: {units: "s", start: "2024-07-24T19:06:10+02:00"}
+│           attrs: {units: "s", unitSI: 1.0, start: "2024-07-24T19:06:10+02:00"}
 │       average_value, minimum_value, maximum_value, duration (optional summary stats)
 │       cue_timestamp_zero  # optional: coarse timestamps (e.g. every 60s)
 │       cue_index           # optional: index into time/signal at each cue
@@ -673,8 +828,12 @@ Projection-space data (sinograms, michelogram, raw projections) before image rec
 │
 ├── metadata/
 │   acquisition/
-│       attrs: {n_rings, n_crystals_per_ring, ring_spacing__units: "mm",
-│               crystal_pitch__units: "mm", description: "Scanner geometry"}
+│       attrs: {n_rings: int, n_crystals_per_ring: int,
+│               description: "Scanner geometry"}
+│       ring_spacing/
+│           attrs: {value: float, units: "mm", unitSI: 0.001}
+│       crystal_pitch/
+│           attrs: {value: float, units: "mm", unitSI: 0.001}
 │   corrections_applied/
 │       attrs: {normalization: bool, attenuation: bool, scatter: bool,
 │               randoms: bool, dead_time: bool, decay: bool,
@@ -752,18 +911,20 @@ The result of co-registering two images: a spatial transformation that maps coor
 │   │   # --- _type: "deformable" ---
 │   │   attrs: {optimizer: "LBFGS", metric: "cross_correlation",
 │   │           regularization: "bending_energy", regularization_weight: 1.0,
-│   │           grid_spacing: [4.0, 4.0, 4.0], grid_spacing__units: "mm",
 │   │           n_levels: 3}
+│   │   grid_spacing/
+│   │       attrs: {value: [4.0, 4.0, 4.0], units: "mm", unitSI: 0.001}
 │   │
 │   │   # --- _type: "manual_landmark" ---
 │   │   attrs: {n_landmarks: 12, operator: "Dr. Smith"}
 │   │
 │   quality/
 │       attrs: {metric_value: float,    # final metric value
-│               tre: float, tre__units: "mm",   # target registration error (if landmarks available)
 │               jacobian_min: float,    # minimum Jacobian determinant (deformable only)
 │               jacobian_max: float,    # negative = folding
 │               description: "Registration quality metrics"}
+│       tre/                            # target registration error (if landmarks available)
+│           attrs: {value: float, units: "mm", unitSI: 0.001}
 │
 ├── matrix                              # dataset: float64 (4, 4) -- for rigid/affine
 │   attrs: {description: "4x4 affine transformation matrix (homogeneous coordinates)",
@@ -773,7 +934,6 @@ The result of co-registering two images: a spatial transformation that maps coor
 ├── displacement_field                  # dataset: float32 (Z, Y, X, 3) -- for deformable
 │   attrs: {affine: float64[4,4],       # defines the grid in physical space
 │           reference_frame: str,
-│           voxel_size__units: "mm",
 │           component_order: ["z", "y", "x"],  # or ["x", "y", "z"]
 │           description: "Dense displacement vector field in mm"}
 │
@@ -852,20 +1012,24 @@ Calibration products are structurally diverse (1D curves, 2D maps, lookup tables
 │   │
 │   │   # --- _type: "normalization" ---
 │   │   attrs: {method: "component_based",
-│   │           n_crystals_axial: 36, n_crystals_transaxial: 672,
-│   │           acquisition_duration: 14400.0, acquisition_duration__units: "s"}
+│   │           n_crystals_axial: 36, n_crystals_transaxial: 672}
+│   │   acquisition_duration/
+│   │       attrs: {value: 14400.0, units: "s", unitSI: 1.0}
 │   │
 │   │   # --- _type: "cross_calibration" ---
 │   │   attrs: {reference_instrument: "dose_calibrator",
 │   │           reference_model: "Capintec CRC-55tR",
 │   │           calibration_factor: 1.023, calibration_factor_error: 0.008,
-│   │           phantom: "uniform_cylinder",
-│   │           activity: 45.0, activity__units: "MBq"}
+│   │           phantom: "uniform_cylinder"}
+│   │   activity/
+│   │       attrs: {value: 45.0, units: "MBq", unitSI: 1e6}
 │   │
 │   conditions/
-│       attrs: {temperature: 22.0, temperature__units: "degC",
-│               humidity: 45.0, humidity__units: "%",
-│               description: "Environmental conditions during calibration"}
+│       temperature/
+│           attrs: {value: 22.0, units: "degC", unitSI: 1.0}
+│       humidity/
+│           attrs: {value: 45.0, units: "%", unitSI: 0.01}
+│       attrs: {description: "Environmental conditions during calibration"}
 │
 ├── data/                               # calibration datasets -- structure depends on _type
 │   │
@@ -942,37 +1106,48 @@ Spectra are fundamentally different from volumes (regular spatial grids) and eve
 │   │           description: "..."}
 │   │
 │   │   # --- _type: "lifetime" (PALS) ---
-│   │   attrs: {time_resolution: 0.180, time_resolution__units: "ns",
-│   │           start_signal: "22Na 1274 keV",
-│   │           stop_signal: "annihilation 511 keV",
-│   │           source_activity: 25.0, source_activity__units: "kBq"}
+│   │   attrs: {start_signal: "22Na 1274 keV",
+│   │           stop_signal: "annihilation 511 keV"}
+│   │   time_resolution/
+│   │       attrs: {value: 0.180, units: "ns", unitSI: 1e-9}
+│   │   source_activity/
+│   │       attrs: {value: 25.0, units: "kBq", unitSI: 1e3}
 │   │
 │   │   # --- _type: "energy" ---
-│   │   attrs: {detector: "HPGe", energy_range: [0, 1500],
-│   │           energy_range__units: "keV", live_time: 3600.0,
-│   │           live_time__units: "s"}
+│   │   attrs: {detector: "HPGe", energy_range: [0, 1500]}
+│   │   energy_range/
+│   │       attrs: {value: [0, 1500], units: "keV", unitSI: 1.602e-16}
+│   │   live_time/
+│   │       attrs: {value: 3600.0, units: "s", unitSI: 1.0}
 │   │
 │   │   # --- _type: "doppler" ---
-│   │   attrs: {line_energy: 511.0, line_energy__units: "keV",
-│   │           s_parameter: 0.487, w_parameter: 0.012}
+│   │   attrs: {s_parameter: 0.487, w_parameter: 0.012}
+│   │   line_energy/
+│   │       attrs: {value: 511.0, units: "keV", unitSI: 1.602e-16}
 │   │
 │   │   # --- _type: "coincidence_matrix" ---
-│   │   attrs: {detector_1: "HPGe_left", detector_2: "HPGe_right",
-│   │           coincidence_window: 10.0, coincidence_window__units: "ns"}
+│   │   attrs: {detector_1: "HPGe_left", detector_2: "HPGe_right"}
+│   │   coincidence_window/
+│   │       attrs: {value: 10.0, units: "ns", unitSI: 1e-9}
 │   │
 │   │   # --- _type: "angular" (ACAR) ---
-│   │   attrs: {geometry: "1D" | "2D",
-│   │           angular_range: [-30, 30], angular_range__units: "mrad"}
+│   │   attrs: {geometry: "1D" | "2D"}
+│   │   angular_range/
+│   │       attrs: {value: [-30, 30], units: "mrad", unitSI: 0.001}
 │   │
 │   acquisition/
-│       attrs: {total_counts: int, live_time__units: "s", real_time__units: "s",
+│       attrs: {total_counts: int,
 │               dead_time_fraction: float,
 │               description: "Acquisition statistics"}
+│       live_time/
+│           attrs: {value: float, units: "s", unitSI: 1.0}
+│       real_time/
+│           attrs: {value: float, units: "s", unitSI: 1.0}
 │
 ├── counts                              # dataset: the histogram itself
 │   │                                   # 1D: shape (N_bins,)
 │   │                                   # 2D: shape (N_bins_ax0, N_bins_ax1)
-│   │                                   # ND: shape (N_bins_ax0, ..., N_bins_axN)
+│   │                                   # AND: shape (N_bins_ax0, ..., N_bins_axN)
 │   attrs: {description: "Binned counts (or rates, or normalized intensity)"}
 │
 ├── counts_errors                       # dataset: same shape as counts (Poisson or propagated)
@@ -1010,16 +1185,19 @@ Spectra are fundamentally different from volumes (regular spatial grids) and eve
 │           attrs: {label: "free positron",
 │                   # parameters depend on _type:
 │                   # multi_exponential:
-│                   lifetime: 0.382, lifetime__units: "ns",
-│                   lifetime_error: 0.005, lifetime_error__units: "ns",
 │                   intensity: 0.72, intensity_error: 0.02,
 │                   description: "Free positron annihilation component"}
+│           lifetime/
+│               attrs: {value: 0.382, units: "ns", unitSI: 1e-9}
+│           lifetime_error/
+│               attrs: {value: 0.005, units: "ns", unitSI: 1e-9}
 │           curve                       # dataset: this component's contribution
 │       component_1/
 │           attrs: {label: "positronium",
-│                   lifetime: 1.85, lifetime__units: "ns",
 │                   intensity: 0.28,
 │                   description: "Ortho-positronium component"}
+│           lifetime/
+│               attrs: {value: 1.85, units: "ns", unitSI: 1e-9}
 │           curve
 │   parameters/                         # raw parameter table for programmatic access
 │       attrs: {names: ["tau_1", "I_1", "tau_2", "I_2", "bg"],
@@ -1091,7 +1269,6 @@ The `sources/reference_image` link records which image the ROIs were *defined on
 ├── mask                                # integer label volume, same grid as reference image
 │   attrs: {affine: float64[4,4],
 │           reference_frame: str,
-│           voxel_size__units: "mm",
 │           description: "Label mask where each integer maps to a named region"}
 │
 ├── regions/                            # one sub-group per named region
@@ -1104,23 +1281,30 @@ The `sources/reference_image` link records which image the ROIs were *defined on
 │               anatomy_vocabulary: str, # e.g. "SNOMED CT"
 │               anatomy_code: str}      # e.g. "10200004"
 │       statistics/                     # optional, computed at creation or later
-│           attrs: {volume: float, volume__units: "mL",
-│                   mean: float, mean__units: "...",
-│                   max: float, max__units: "...",
-│                   std: float, std__units: "...",
-│                   n_voxels: int,
+│           attrs: {n_voxels: int,
 │                   computed_on: str,   # id of image used for statistics
 │                   description: "ROI statistics"}
+│           volume/
+│               attrs: {value: float, units: "mL", unitSI: 1e-6}
+│           mean/
+│               attrs: {value: float, units: str, unitSI: float}
+│           max/
+│               attrs: {value: float, units: str, unitSI: float}
+│           std/
+│               attrs: {value: float, units: str, unitSI: float}
 │
 ├── geometry/                           # alternative/complement to mask: parametric shapes
 │   <shape_name>/
 │       attrs: {shape: "sphere" | "cylinder" | "box" | "ellipsoid",
-│               center: [x, y, z], center__units: "mm",
-│               # shape-specific:
-│               radius: float, radius__units: "mm",        # sphere
-│               dimensions: [w, h, d], dimensions__units: "mm",  # box
 │               label_value: int,
 │               description: str}
+│       center/
+│           attrs: {value: [x, y, z], units: "mm", unitSI: 0.001}
+│       # shape-specific:
+│       radius/                             # sphere
+│           attrs: {value: float, units: "mm", unitSI: 0.001}
+│       dimensions/                         # box
+│           attrs: {value: [w, h, d], units: "mm", unitSI: 0.001}
 │
 ├── contours/                           # alternative: per-slice contour vertices
 │   attrs: {description: "Per-slice contour coordinates (RT-STRUCT compatible)"}
@@ -1173,8 +1357,9 @@ Time-series data from acquisition devices: ECG monitors, motion trackers, infusi
 │   device_type: str                  # high-level category (see table)
 │   device_model: str                 # e.g. "Anzai AZ-733V", "Syringe Pump SP101"
 │   recording_start: str              # ISO 8601
-│   recording_duration: float
-│   recording_duration__units: "s"
+│
+├── recording_duration/
+│   attrs: {value: float, units: "s", unitSI: 1.0}
 │
 ├── metadata/
 │   device/
@@ -1184,17 +1369,18 @@ Time-series data from acquisition devices: ECG monitors, motion trackers, infusi
 │
 ├── channels/                          # one sub-group per signal channel (NXlog pattern)
 │   <channel_name>/
+│       attrs: {_type, _version, model, measurement, run_control, description}
+│       sampling_rate/
+│           attrs: {value: float, units: "Hz", unitSI: 1.0}
 │       signal              # dataset: float64 (N,)
 │           attrs: {units, unitSI, description}
 │       time                # dataset: float64 (N,)
-│           attrs: {units: "s", start: str}
-│       attrs: {_type, _version, model, measurement, run_control,
-│               sampling_rate, sampling_rate__units, description}
+│           attrs: {units: "s", unitSI: 1.0, start: str}
 │       average_value       # optional: float
 │       minimum_value       # optional: float
 │       maximum_value       # optional: float
-│       duration            # optional: float
-│           attrs: {units: "s"}
+│       duration/           # optional
+│           attrs: {value: float, units: "s", unitSI: 1.0}
 │       cue_timestamp_zero  # optional: coarse timestamps for random access
 │       cue_index           # optional: indices into time/signal
 │
@@ -1342,30 +1528,37 @@ fd5 schema-dump data/2024-07-24_19-06-10_recon-2a3ac438_pet_qclear_wb.h5 > schem
 
 ## Scope and Non-Goals
 
-`fd5` defines **what a clean data product looks like**. It does not define how to get there.
+`fd5` defines **what a clean, immutable data product looks like**. It does not define how to get there.
 
-**In scope:**
-- HDF5 schema conventions and attribute patterns
-- Reading and writing `fd5`-compliant HDF5 files
+**In scope (the fd5 core):**
+- HDF5 schema conventions and attribute patterns (units, types, versions, descriptions)
+- Write-once file creation with streaming hash computation
+- Content hashing (Merkle tree) and integrity verification
+- Provenance DAG conventions (`sources/`, `provenance/`)
+- Schema embedding and validation (JSON Schema)
+- `h5_to_dict` / `dict_to_h5` round-trip helpers
 - TOML manifest generation and parsing
-- Datacite metadata generation
-- Content hashing and integrity verification
-- Schema embedding and validation
-- `h5_to_dict` / `dict_to_h5` helpers
+- Datacite metadata and RO-Crate JSON-LD generation
 - Filename generation
+- Product schema registration and discovery
 
-**Out of scope (handled by domain-specific packages):**
-- DICOM parsing and grouping
-- Vendor-specific scanner output formats
-- Listmode data processing
-- Image reconstruction
+**In scope (domain schema packages):**
+- Domain-specific product schemas (e.g., `fd5-imaging` for `recon`/`listmode`/`sinogram`, `fd5-genomics` for `alignment`/`variants`/`expression`)
+- Domain-specific vocabulary references
+- Domain-specific `id_inputs` conventions
+
+**Out of scope (handled by domain-specific ingest/processing packages):**
+- Parsing vendor-specific or instrument-specific formats (DICOM, FASTQ, vendor binaries)
+- Data processing and analysis (reconstruction, alignment, variant calling)
 - Ingest pipeline orchestration
-- Dataset discovery from raw scanner directories
+- Dataset discovery from raw instrument directories
 
-The boundary is clean: the ingest pipeline (in a separate package) produces `fd5` files. From that point forward, `fd5` handles everything.
+The boundary is clean: a domain-specific ingest or processing pipeline produces `fd5` files. From that point forward, the fd5 core handles everything -- regardless of domain.
+
+**Ingest coupling:** While ingest pipelines are out of scope for the fd5 package, **the fd5 product schema is effectively the ingest contract**. The schema defines exactly which source fields become metadata attributes, how datasets are structured, what units convention to follow, and what provenance to record. Ingest pipelines are written *against* the fd5 schema. This coupling is intentional and healthy -- it means the schema drives the ingest design, not the other way around. A well-defined fd5 product schema is a specification that multiple ingest implementations can target, regardless of the upstream format.
 
 
-## Design Discussion: Device Data, NeXus Patterns, and Cloud Compatibility
+## Design Discussion
 
 ### Device data placement: embedding vs. linking
 
@@ -1418,42 +1611,73 @@ This enables discovery by major FAIR registries (FAIRshare, DataCite, Zenodo) wi
 
 ### HDF5 cloud compatibility for fd5
 
-The comparison with Zarr v3 and OME-Zarr (NGFF) sometimes frames HDF5 as "not cloud-native." This requires clarification: **fd5 on HDF5 is cloud-compatible for its intended use case. It is not cloud-optimized for tile-streaming workloads, but that is not the target.**
+fd5 is designed for **local-first and batch-cloud** workflows. It is not cloud-optimized for interactive tile streaming, and that is intentional.
 
-**Why HDF5 works for fd5 in the cloud:**
+**Design rationale:**
 
-- **ros3 VFD**: HDF5's read-only S3 driver uses HTTP range requests to fetch data incrementally. A single-slice read from a chunked volume (`(1, Y, X)` chunks) requires exactly one range request per chunk -- functionally identical to Zarr.
-- **Chunking strategy**: fd5's `(1, Y, X)` or `(1, 1, Y, X)` chunking is designed for slice-wise or frame-wise access. Loading one reconstructed slice requires one range request. Loading all slices requires N range requests (same as Zarr).
-- **Product sizes**: Typical fd5 products (100 MB -- 1 GB, hundreds to thousands of chunks) are well within HDF5's efficient range on cloud object stores. The superblock and B-tree metadata fit in a single range request.
-- **Pyramid levels**: Multiscale pyramids (8x downsampled = 600 KB per level) provide instant previews without touching the full volume.
-- **Metadata discovery**: `h5dump -A` over ros3 fetches only superblock + attributes (no data). The derived outputs (`manifest.toml`, `datacite.yml`, `ro-crate-metadata.json`) serve as lightweight indices.
-- **Semantic atomicity**: Medical image volumes are semantically atomic -- the typical access pattern is full-volume load plus metadata, not tile-by-tile CDN caching.
+- **Semantic atomicity**: fd5 products (reconstructions, listmode data, spectra) are semantically atomic -- the typical access pattern is full-volume load plus metadata, not tile-by-tile streaming. You *want* one coherent file per product, not thousands of chunk files scattered across an object store.
 
-**Where Zarr genuinely wins (and why it doesn't matter for fd5):**
+- **Sequential reads**: Scientific workflows are dominated by sequential, row-based reads: load a volume slice-by-slice, scan an event table, iterate over spectral bins. fd5's chunking strategy (e.g., `(1, Y, X)` for slice-wise access, row-based chunks for tables) is optimized for this write-once, sequential-read pattern.
 
-| Advantage | Relevance to fd5 |
-|-----------|------------------|
-| Parallel writes (N workers writing N chunks simultaneously) | Not applicable; fd5 is write-once |
-| No library dependency for chunk reads | Irrelevant; libhdf5 and h5py are universal in scientific Python |
-| JSON metadata without library | Nice but `h5dump -A` and derived outputs serve the same purpose |
-| Trivial per-chunk CDN caching | Not applicable; medical imaging doesn't serve tiles to browsers |
+- **Two-step schema discovery**: The `_schema` attribute enables efficient metadata-first workflows: (1) read `_schema` (one range request, lightweight), (2) decide which datasets to fetch, (3) read targeted datasets. This is fast and explicit.
 
-**Conclusion:** fd5 on HDF5 is cloud-compatible for its use case. The discovery and metadata layer is provided by manifest, datacite, and RO-Crate outputs. Where Zarr genuinely excels (massively parallel writes, browser-friendly tile access) is outside fd5's design scope.
+- **Derived outputs for discovery**: The manifest (`manifest.toml`), datacite metadata (`datacite.yml`), and RO-Crate (`ro-crate-metadata.json`) provide zero-latency discovery for cloud/catalog scenarios. These are the lightweight index layer; the HDF5 files are the data layer.
+
+**HDF5 over cloud storage:**
+
+HDF5's ros3 VFD supports HTTP range requests, enabling incremental reads from S3. A single-slice read from a chunked volume requires one range request per chunk. For fd5's typical product sizes (100 MB -- 1 GB, hundreds to thousands of chunks), this is efficient for batch workflows (download-then-process, parallel job submission).
+
+**Honest limitation:** HDF5's B-tree metadata traversal requires multiple sequential range requests before locating a chunk. Over high-latency connections, this adds latency compared to Zarr's deterministic chunk addressing. For fd5's use case (batch processing, local NFS, POSIX filesystems), this trade-off is acceptable. The semantic atomicity and single-file simplicity outweigh the latency cost.
+
+**Where Zarr excels:** Zarr's strengths (massively parallel writes across N workers, browser-friendly tile serving, trivial per-chunk CDN caching) are outside fd5's design goals. fd5 is write-once, batch-oriented, and designed for scientific workflows, not interactive web visualization.
+
+### Relationship to RDF and the Semantic Web
+
+A natural question is why fd5 uses embedded JSON Schema and flat vocabulary references rather than RDF triples and OWL ontologies for its metadata layer.
+
+**The short answer:** fd5 and RDF operate at different layers. fd5 is a data-product format (Layer 1: files containing data + metadata). RDF is a knowledge-representation framework (Layer 3: a graph of statements linking entities across datasets, institutions, and domains). They are complementary, not competing.
+
+```
+Layer 3:  Knowledge graph / federation    ← RDF, SPARQL, OWL ontologies
+Layer 2:  Dataset-level metadata index    ← RO-Crate JSON-LD (fd5 exports this)
+Layer 1:  Data product (file-level)       ← fd5 / HDF5
+Layer 0:  Raw instrument output           ← DICOM, FASTQ, vendor formats
+```
+
+**Why fd5 does not use RDF internally:**
+
+1. **Self-containment.** An fd5 file must be fully understandable offline, on a laptop, with no network and no triplestore. Embedding RDF triples inside HDF5 attributes adds complexity (turtle/JSON-LD serialization, namespace resolution, ontology imports) without improving the core use case: a scientist or AI agent reading `h5dump -A` to understand the file.
+
+2. **Audience.** fd5's primary users are scientists and automated pipelines -- not semantic web developers. JSON Schema, `description` strings, and `__units` attributes are immediately comprehensible. OWL class hierarchies and SPARQL are not.
+
+3. **Write-once integrity.** fd5's Merkle-tree `content_hash` covers data and metadata together in a single sealed file. RDF triplestores are mutable graphs with no inherent content-addressed integrity.
+
+4. **Complexity budget.** The simplest metadata representation that supports AI-readability, FAIR compliance, and domain extensibility is the right one. fd5's conventions (`_type`/`_version`, `_vocabulary`/`_code`, `description`, `__units`/`__unitSI`) achieve this without the overhead of a full semantic web stack.
+
+**How fd5 bridges to the RDF world:**
+
+- The `ro-crate-metadata.json` derived output is JSON-LD -- a valid RDF serialization. It maps fd5 vocabulary to Schema.org terms (`Person`, `Dataset`, `CreateAction`, `isBasedOn`).
+- Vocabulary references (`_vocabulary` / `_code` attributes) use human-readable names from standard terminologies that have well-known URI mappings in BioPortal and other ontology registries.
+- A triplestore can ingest the RO-Crate JSON-LD from a collection of fd5 datasets to build a federated, SPARQL-queryable knowledge graph -- without fd5 itself needing to speak RDF natively.
+- The `sources/` provenance DAG maps naturally to PROV-O (`wasDerivedFrom`, `wasGeneratedBy`) in the RO-Crate export.
+
+The design philosophy is: **store data and metadata together in a simple, self-describing binary format (HDF5); export metadata to the Linked Data ecosystem as a derived representation (RO-Crate JSON-LD).** This keeps the file format accessible to domain scientists and automated pipelines while enabling full FAIR discoverability for semantic web infrastructure.
+
 
 ## Comparison with Existing Formats
 
 | Format | Strengths | Gaps that fd5 addresses |
 |--------|-----------|------------------------|
-| **NeXus/HDF5** | Mature, `@units`, `default` chain, `NXcollection`, `NXlog`/`NXsensor` for device data, `NXcite` for references, `NXnote` for attachments | Tied to neutron/X-ray domain; fd5 adopts NeXus patterns selectively for medical imaging and includes all needed device/method/attachment conventions |
-| **OpenPMD** | `unitSI`, mesh/particle duality | Focused on particle-in-cell simulations; no medical imaging conventions |
-| **BIDS** | Self-describing filenames, metadata inheritance, sidecar JSON | Tied to neuroimaging (MRI/EEG); no PET listmode; filenames encode too much |
+| **NeXus/HDF5** | Mature, `@units`, `default` chain, `NXcollection`, `NXlog`/`NXsensor` for device data, `NXcite` for references, `NXnote` for attachments | Tied to neutron/X-ray facility domain; fd5 adopts NeXus patterns selectively as domain-agnostic conventions |
+| **OpenPMD** | `unitSI`, mesh/particle duality | Focused on particle-in-cell simulations; no general-purpose product schema extensibility |
+| **BIDS** | Self-describing filenames, metadata inheritance, sidecar JSON | Tied to neuroimaging (MRI/EEG); filenames encode too much; no write-once integrity |
 | **NIfTI** | Simple, widely supported for volumes | No metadata beyond affine; no provenance; no non-volume data |
-| **DICOM RT-STRUCT** | Clinical standard for contours, integrated with treatment planning | Contour-only (no masks), tied to DICOM ecosystem, no AI model provenance, no geometric VOIs |
-| **DICOM** | Comprehensive tags, universal in clinical imaging | Verbose, inconsistent across vendors, poor for non-image data, no precomputed artifacts |
+| **DICOM** | Comprehensive tags, universal in clinical imaging | Verbose, inconsistent across vendors, poor for non-image data, mutable, no content hashing |
 | **ROOT/TTree** | Excellent for event data, schema evolution | C++ ecosystem; poor Python ergonomics; no self-describing metadata conventions |
-| **Zarr v3** | Cloud-native chunked storage, parallel I/O, per-chunk independence | Storage engine only; no metadata conventions, no provenance, no schema embedding |
-| **OME-Zarr (NGFF)** | Multiscale pyramids, cloud-optimized bioimaging, growing tool ecosystem | Microscopy-focused; no event data, spectra, or calibration; no embedded schema; no provenance DAG; no per-product identity |
-| **RO-Crate** | Standard for packaging research objects, Schema.org JSON-LD, FAIR compatible, increasingly supported by repositories | Not a storage format; no domain-specific schemas; fd5 generates RO-Crate as derived output for metadata discovery |
+| **Zarr v3** | Cloud-native chunked storage, parallel I/O, per-chunk independence | Storage engine only; no metadata conventions, no provenance, no schema embedding, no immutability guarantee |
+| **SOME-Zarr (NGFF)** | Multiscale pyramids, cloud-optimized bioimaging, growing tool ecosystem | Microscopy-focused; no event data, spectra, or calibration; no embedded schema; no provenance DAG; no per-product identity |
+| **RO-Crate** | Standard for packaging research objects, Schema.org JSON-LD, FAIR compatible, increasingly supported by repositories | Not a data storage format; no domain-specific schemas; fd5 generates RO-Crate as derived output for metadata discovery |
+| **RDF / Linked Data** | Web-scale semantic interoperability, ontology-driven reasoning (OWL), federated SPARQL queries across institutions, native language of FAIR registries | Not a data storage format -- stores statements *about* data, not the data itself; requires triplestore infrastructure; no self-contained offline files; no integrity hashing; high complexity barrier for domain scientists |
 
 `fd5` takes the best ideas from each:
 - `@units` + `@unitSI` from NeXus and OpenPMD
@@ -1463,14 +1687,15 @@ The comparison with Zarr v3 and OME-Zarr (NGFF) sometimes frames HDF5 as "not cl
 - `_type`/`_version` extensibility inspired by NeXus `NXentry` typing and ROOT schema evolution
 - ISO 8601 with timezone from NeXus best practices
 - `_errors` suffix convention from NeXus
-- Multiscale resolution pyramids inspired by OME-Zarr NGFF (adapted to HDF5's single-file model)
+- Multiscale resolution pyramids inspired by SOME-Zarr NGFF (adapted to HDF5's single-file model)
 - Per-chunk content hashing inspired by Zarr's per-chunk integrity model (rolled up into a Merkle tree)
 - Content hashing from scientific reproducibility best practices
 - Device data channels with time + signal arrays from NeXus `NXlog` pattern
 - Device metadata (model, measurement, run_control) from NeXus `NXsensor`
 - Literature references in `references/` groups from NeXus `NXcite`
 - Binary attachments with MIME typing in `extra/notes/` from NeXus `NXnote`
-- RO-Crate JSON-LD for FAIR discovery (Schema.org vocabulary mapping)
+- RO-Crate JSON-LD as the bridge to the RDF/Linked Data ecosystem (fd5 files are self-contained HDF5; their metadata is discoverable as RDF via derived RO-Crate export)
+- Write-once immutability from content-addressed storage systems (Git, IPFS)
 
 
 ## FAIR Compliance Summary
@@ -1485,12 +1710,12 @@ The comparison with Zarr v3 and OME-Zarr (NGFF) sometimes frames HDF5 as "not cl
 | **A1.1**: Open, free protocol | HDF5 = open standard; h5py = open source |
 | **A2**: Metadata accessible even if data unavailable | Manifest contains all metadata; `h5dump -A` extracts attrs without data; RO-Crate JSON available without HDF5 read |
 | **I1**: Formal, shared knowledge representation | JSON Schema embedded; `@units`/`@unitSI`; vocabulary references; RO-Crate JSON-LD using Schema.org |
-| **I2**: FAIR vocabularies | DICOM Modality codes, SNOMED CT, RadLex (human-readable, not hex) |
-| **I3**: Qualified references | `sources/` with typed roles (`emission`, `attenuation`, `mu_map`) |
-| **R1**: Rich, plurality of attributes | Three metadata layers: flat root attrs, structured `metadata/` groups, raw DICOM header in `provenance/` |
-| **R1.1**: Clear usage license | License field in datacite metadata |
+| **I2**: FAIR vocabularies | Domain-specific vocabulary references via `_vocabulary`/`_code` (e.g., DICOM Modality, SNOMED CT, Sequence Ontology, HGNC) |
+| **I3**: Qualified references | `sources/` with typed roles (e.g., `emission_data`, `reference_genome`, `calibration`) |
+| **R1**: Rich, plurality of attributes | Three metadata layers: flat root attrs, structured `metadata/` groups, original source headers in `provenance/` |
+| **R1.1**: Clear usage license | `study/license` (SPDX identifier); propagated to datacite and RO-Crate exports |
 | **R1.2**: Detailed provenance | `sources/` DAG + `provenance/original_files` with SHA-256 hashes |
-| **R1.3**: Meet domain standards | NeXus/OpenPMD conventions; DICOM vocabulary references |
+| **R1.3**: Meet domain standards | NeXus/OpenPMD conventions; domain-specific vocabulary references; RO-Crate JSON-LD for Linked Data interoperability |
 
 ### AI-Readability
 
@@ -1498,7 +1723,7 @@ The comparison with Zarr v3 and OME-Zarr (NGFF) sometimes frames HDF5 as "not cl
 |------------|-------------|
 | Schema discovery | `_schema` root attribute (JSON Schema) |
 | Content understanding | `description` on every group and dataset |
-| Unit interpretation | `__units` (string) + `__unitSI` (numeric factor) |
+| Unit interpretation | Sub-group pattern for attributes: `<name>/{value, units, unitSI}`; dataset attrs for datasets: `units`/`unitSI` |
 | Vocabulary resolution | `_vocabulary` + `_code` attributes |
 | Auto-visualization | `default` attribute chain to best dataset |
 | Provenance tracing | `sources/` group with typed links |
@@ -1515,6 +1740,69 @@ The `_schema_version` attribute on every file root is a monotonically increasing
 - A reader for version N can always read version N-1
 - A reader encountering a version newer than it understands logs a warning and reads what it can
 - The `_type`/`_version` mechanism handles evolution within polymorphic sub-groups independently of the top-level schema version
+
+### Migration and upgrades
+
+**Content hash stability:** The `content_hash` is the Merkle root computed from data + attrs. Adding metadata attributes (e.g., during schema upgrade) changes the `content_hash` because the file content has changed. This is expected and correct -- the file is a new version of the same product (same `id`, new `content_hash`).
+
+**Per-dataset data hashes remain stable** if only metadata changes. The Merkle tree structure means that adding attributes to a group changes the group hash and propagates up to the root, but the dataset hashes (which depend only on the data chunks) remain unchanged. This enables efficient verification: re-hash only the changed metadata, not the data.
+
+**Migration is copy-on-write:** Schema upgrades produce a new file with the upgraded schema, same `id`, new `content_hash`. The old file can be archived or deleted. There is no in-place modification (fd5 files are immutable after creation -- see Immutability and concurrency section).
+
+**SDK migration tool:** The fd5 package provides `fd5.migrate(old_path, new_path, target_version)` which:
+1. Copies all data datasets from old to new (zero-copy via HDF5 virtual datasets where possible)
+2. Copies all existing metadata
+3. Adds new required attributes with sensible defaults (or prompts for values)
+4. Recomputes `content_hash` (fast: ms-scale for metadata-only changes, seconds for full data re-hash on typical products)
+
+**Forward compatibility:** The `_schema_version` attribute on each file tells readers exactly what to expect. Readers encountering a newer version than they support log a warning and read what they can (additive-only guarantee). If a reader requires a specific version, it can check `_schema_version` and refuse to open.
+
+**Re-hashing performance:** Re-hashing a file is fast by design:
+- Metadata-only changes: ms-scale (hash only the changed attributes)
+- Full data re-hash: seconds for typical products (100 MB -- 1 GB), with per-chunk hashing enabling incremental verification
+
+### Immutability and concurrency
+
+fd5 files are **immutable after creation**. This design decision enables simple concurrency semantics, reliable provenance, and content-addressable storage.
+
+**Write-once model:**
+
+The file creation process is a single atomic operation:
+1. Open file for writing
+2. Write all data, metadata, and hashes (streaming hash computation, see Write-time workflow)
+3. Close file
+4. File is sealed -- never modified again
+
+**No in-place edits:** Any change to data or metadata produces a **new file** (copy-and-replace). The new file gets a new `content_hash` but keeps the same `id` if the identity inputs haven't changed (e.g., same scan, different processing). Old versions can coexist for archival or comparison.
+
+**SDK enforcement:** The fd5 SDK enforces immutability via a builder/context-manager API:
+
+```python
+with fd5.create(path, product="recon", ...) as f:
+    f.write_volume(data)
+    f.write_metadata(metadata_dict)
+    # On context exit: Merkle root finalized, content_hash written, file sealed
+```
+
+There is no `fd5.open_for_edit()` or `fd5.append()`. Once the context exits, the file is immutable.
+
+**Concurrency semantics:**
+
+- **Concurrent reads are safe**: HDF5 supports multiple readers on immutable files with no locking concerns. The write-once guarantee means readers never see partial writes or inconsistent state.
+
+- **Single writer during creation**: The creation process is single-threaded (one Python process writes the file). Parallelism happens *across* files, not within them (e.g., N worker processes creating N reconstruction files in parallel).
+
+- **HDF5 SWMR is not used**: Single Writer Multiple Reader (SWMR) mode is designed for append workflows (e.g., live data acquisition writing to a file that readers monitor). fd5 does not support append -- files are created once and sealed.
+
+- **Hashing is live during creation**: Hash computation happens inline as data is written (see Write-time workflow). There is no post-creation reopen or locking. The `content_hash` is finalized just before file close, and the file becomes immutable at close time.
+
+**Implications:**
+
+- **Content-addressable storage**: Immutable files with stable `content_hash` values can be stored in content-addressable systems (e.g., DataLad, git-annex, IPFS) without special handling.
+
+- **Reliable provenance**: The `sources/` DAG references immutable products. A `content_hash` mismatch definitively indicates data corruption or substitution.
+
+- **Simplified archival**: No need to track "latest version" -- each file is a complete, immutable snapshot. Archives can safely hard-link or deduplicate identical files.
 
 
 ## Implementation Notes
@@ -1559,27 +1847,29 @@ These two functions are the foundation of all metadata I/O. They must handle eve
 
 **Key rule: `h5_to_dict` only reads attrs, never datasets.** Datasets hold large data (volumes, tables, MIPs) and are accessed explicitly. The dict representation is metadata only.
 
-**Reserved attr prefixes:** Attrs starting with `_` (`_type`, `_version`, `_schema`, `_schema_version`) are included in the dict. The `__units` and `__unitSI` suffixed attrs are included as-is (the caller handles pairing them with their parent field).
+**Reserved attr prefixes:** Attrs starting with `_` (`_type`, `_version`, `_schema`, `_schema_version`) are included in the dict. Sub-groups representing physical quantities (with `value`, `units`, `unitSI` attrs) are included as groups in the dict tree.
 
 ### `id` computation
 
-The `id` is a SHA-256 hash of identity inputs, prefixed with `"sha256:"`. The identity inputs depend on the product type:
+The `id` is a SHA-256 hash of identity inputs, prefixed with `"sha256:"`. The identity inputs are **product-type-specific** and defined by each domain schema. The guiding principle is: **the same logical data product, re-ingested or reprocessed, should produce the same `id`** -- even if the fd5 schema version, compression, or file layout changes.
+
+**Serialization format:** concatenate the input fields with `\0` (null byte) separator, encode as UTF-8, compute SHA-256. The `id_inputs` attr stores a human-readable description of what was hashed (e.g., `"timestamp + instrument_id + vendor_series_id"`).
+
+**Examples from the medical imaging domain:**
 
 | Product type | Identity inputs | Rationale |
 |---|---|---|
 | `recon` | `timestamp + scanner_uuid + vendor_series_id` | Same acquisition on same scanner = same identity |
 | `listmode` | `timestamp + scanner_uuid + vendor_series_id` | Same as recon |
-| `sinogram` | `timestamp + scanner_uuid + vendor_series_id` | Same as recon |
 | `sim` | `simulation_config_hash + random_seed` | Same config + seed = same simulation |
 | `transform` | `source_id + target_id + method_type + creation_timestamp` | Same inputs + method = same transform |
 | `calibration` | `scanner_uuid + calibration_type + valid_from` | Same scanner + type + time = same calibration |
 | `spectrum` | `source_id + method_type + creation_timestamp` | Derived from specific data + method |
 | `roi` | `reference_image_id + method_type + creation_timestamp` | Drawn on specific image at specific time |
-| `device_data` | `timestamp + device_model + scanner_uuid` | Same device recording at same time on same scanner |
 
-**Serialization format:** concatenate the input fields with `\0` (null byte) separator, encode as UTF-8, compute SHA-256. The `id_inputs` attr stores a human-readable description: `"timestamp + scanner_uuid + vendor_series_id"`.
+**For new domains,** the same pattern applies: choose identity inputs that capture "what makes this product logically the same thing." For genomics, an alignment product might use `sample_id + reference_genome + aligner_version + run_id`. For remote sensing, a raster product might use `satellite + acquisition_time + band + processing_level`.
 
-**`scanner_uuid`:** a stable identifier for the scanner instance. For GE scanners this is `StationName` + `DeviceSerialNumber` from DICOM. For simulations, absent. For manually created products (ROIs), absent -- use creation timestamp + method instead.
+**`instrument_id`:** a stable identifier for the source instrument. Domain-specific: for medical scanners this might be `StationName + DeviceSerialNumber`; for sequencers, `instrument_serial + run_id`; for simulations, absent. The `id_inputs` attr documents exactly what was used.
 
 **Filenames use the first 8 hex chars** of the hash (after the `"sha256:"` prefix). Collision risk at 8 chars (32 bits) is negligible for datasets with < 10,000 products.
 
@@ -1663,12 +1953,34 @@ Partial verification workflow: to check whether `volume` is intact without readi
 
 #### Write-time workflow
 
-1. Write the entire file (all datasets, all attrs, all groups) **except** `content_hash` and `_chunk_hashes`
-2. Close and reopen in `"r+"` mode (ensures all data is flushed)
-3. For each chunked dataset: compute per-chunk hashes, write the `_chunk_hashes` companion dataset
-4. Compute the Merkle tree (using chunk hashes for dataset hashes, skipping `_chunk_hashes` datasets)
-5. Write the `content_hash` root attr
-6. Close
+The fd5 SDK uses an **online / streaming hash** design where hashes are computed incrementally during file creation, not in a post-processing pass. This is single-pass, crash-safe by construction, and eliminates the need to reopen files.
+
+**Streaming write workflow:**
+
+1. Open the file for writing and initialize the Merkle tree accumulator
+2. For each dataset:
+   - Write data chunk-by-chunk using `write_direct_chunk()` or equivalent
+   - Hash each chunk immediately after writing: `sha256(chunk_data.tobytes())`
+   - Accumulate chunk hashes into the dataset hash
+   - Optionally write the `_chunk_hashes` companion dataset
+3. For each group:
+   - Write all attributes (except `content_hash`)
+   - Hash attributes as they are written
+   - Accumulate into the group hash
+4. Finalize the Merkle root: `content_hash = sha256(root_group_hash)`
+5. Write the `content_hash` root attribute
+6. Close the file (sealed, immutable)
+
+**SDK API design:** The SDK enforces this pattern via a context-manager / builder API:
+
+```python
+with fd5.create(path, product="recon", ...) as f:
+    f.write_volume(data)           # hashes computed inline
+    f.write_metadata(metadata_dict)  # hashes accumulated
+    # On context exit: Merkle root finalized, content_hash written, file sealed
+```
+
+There is no `fd5.open_for_edit()`. Files are immutable after creation (see Immutability and concurrency section).
 
 **Full verification:** reopen, recompute chunk hashes from data, recompute Merkle tree, compare with stored `content_hash`.
 
@@ -1686,21 +1998,22 @@ Small datasets (metadata groups, MIPs, small calibration tables) do not benefit 
 
 ### Required vs. optional fields
 
-**Required root attrs (ALL product types):**
+**Required root attrs (ALL product types, ALL domains):**
 
 | Attr | Required | Notes |
 |---|---|---|
-| `_schema_version` | Yes | |
-| `product` | Yes | |
-| `id` | Yes | |
-| `id_inputs` | Yes | |
-| `name` | Yes | |
-| `description` | Yes | AI-readability |
-| `content_hash` | Yes | Integrity |
-| `timestamp` | Conditional | Required for measured data; absent for simulations |
-| `default` | No | But strongly recommended |
+| `_schema_version` | Yes | fd5 core schema version |
+| `product` | Yes | Product type string (domain-defined) |
+| `id` | Yes | Algorithm-prefixed SHA-256 of identity inputs |
+| `id_inputs` | Yes | Documents what was hashed |
+| `name` | Yes | Human-readable name |
+| `description` | Yes | Natural-language description (AI-readability) |
+| `content_hash` | Yes | Algorithm-prefixed Merkle root (integrity) |
+| `timestamp` | Conditional | Required for measured/acquired data; absent for simulations and synthetic products |
+| `domain` | No | Scientific domain string (recommended) |
+| `default` | No | Path to best visualization dataset (strongly recommended) |
 
-**Required per product type:**
+**Required per product type (medical imaging domain):**
 
 | Product | Required groups/datasets | Optional |
 |---|---|---|
@@ -1713,36 +2026,53 @@ Small datasets (metadata groups, MIPs, small calibration tables) do not benefit 
 | `spectrum` | `counts` (dataset), `axes/` (at least `ax0/`), `metadata/method/` | `counts_errors`, `fit/`, `sources/`, `extra/` |
 | `roi` | At least one of `mask`, `geometry/`, `contours/`; `regions/` (at least one); `metadata/method/` | `statistics/`, `sources/`, `extra/` |
 
-**`dicom_header` is provenance, not required data.** It lives in `provenance/dicom_header` (not at the top level). Only present when the product was ingested from DICOM source files. Simulations, manual ROIs, and non-DICOM sources will not have it.
+Other domains define their own required fields per product type, following the same pattern: at least one primary dataset, a `metadata/` group with `_type`/`_version`, and `provenance/`.
 
-**`sources/` is optional at the product level.** A raw acquisition (first in the chain) has no sources. A reconstruction has sources (listmode + CTAC). The `sources/` group is present when there are upstream dependencies, absent when there are none.
+**Domain-specific source headers are provenance, not required data.** For example, a DICOM header lives in `provenance/dicom_header`, a FASTQ header in `provenance/fastq_header`. Only present when relevant. The fd5 core does not mandate any specific source header format.
 
-### `study/` and `subject/` groups in HDF5
+**`sources/` is optional at the product level.** A raw acquisition or first-in-chain product has no sources. A derived product has sources (e.g., a reconstruction references its listmode input; a variant call set references its alignment). The `sources/` group is present when there are upstream dependencies, absent when there are none.
 
-**HDF5 is self-contained.** Every fd5 file carries study and subject metadata so a single file can be understood in isolation.
+### `study/` and context groups in HDF5
+
+**HDF5 is self-contained.** Every fd5 file carries study-level and context metadata so a single file can be understood in isolation.
+
+The `study/` group is domain-agnostic and always present:
 
 ```
 ├── study/
-│   attrs: {type: "clinical",          # "clinical" | "preclinical" | "phantom" | "calibration"
+│   attrs: {type: str,                 # domain-defined (e.g., "clinical", "research", "calibration", "synthetic")
+│           license: "CC-BY-4.0",      # SPDX identifier (required for RO-Crate export)
 │           description: "Study type and context"}
-│
-├── subject/                            # absent for phantom/calibration studies
-│   attrs: {species: "human",          # "human" | "canine" | "porcine" | ...
-│           pseudonym: "a3f2...",       # de-identified identifier
-│           birth_date: "1959-03-15",  # ISO 8601 -- age is derived, birth_date is truth
-│           weight: 72.0, weight__units: "kg",
-│           sex: "M",                  # "M" | "F" | "O"
-│           # species-specific (optional):
-│           breed: "Beagle",           # canine, porcine, etc.
-│           description: "Study subject demographics"}
-│
-├── phantom/                            # only for phantom/calibration studies
-│   attrs: {model: "NEMA IEC",
-│           known_activities: [10.0, 5.0, 2.5, 1.25],
-│           known_activities__units: "MBq",
-│           sphere_diameters: [37, 28, 22, 17],
-│           sphere_diameters__units: "mm",
-│           description: "Phantom specification"}
+│   creators/                           # optional: RO-Crate author field
+│       creator_0/
+│           attrs: {name, affiliation, orcid, role, description}
 ```
 
-These groups are **identical across all files in a dataset** (redundant by design). The manifest `[subject]`/`[study]` sections are the human-readable dump of the same data. If they conflict, the HDF5 is authoritative.
+Additional context groups are **domain-specific**. The fd5 core does not mandate a specific context group beyond `study/`, but each domain schema defines what is needed. For example:
+
+**Medical imaging:**
+
+```
+├── subject/                            # patient/specimen demographics
+│   attrs: {species, pseudonym, birth_date, sex, description}
+├── phantom/                            # for calibration/QC studies
+│   attrs: {model, description, ...}
+```
+
+**Genomics:**
+
+```
+├── sample/                             # biological sample
+│   attrs: {sample_id, tissue, organism, strain, description}
+├── library/                            # sequencing library preparation
+│   attrs: {library_id, strategy, source, selection, description}
+```
+
+**Remote sensing:**
+
+```
+├── platform/                           # satellite/drone/ground station
+│   attrs: {platform_id, sensor, orbit, description}
+```
+
+These context groups are **identical across all files in a dataset** (redundant by design). The manifest sections are the human-readable dump of the same data. If they conflict, the HDF5 is authoritative.
