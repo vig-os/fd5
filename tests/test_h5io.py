@@ -280,6 +280,32 @@ class TestRoundTrip:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# _read_attr edge cases (h5io.py:86,97)
+# ---------------------------------------------------------------------------
+
+
+class TestReadAttrEdgeCases:
+    def test_bytes_attr_decoded(self, h5group):
+        """Covers h5io.py:86 — _read_attr decodes bytes to str."""
+        h5group.attrs.create("raw", data=np.bytes_(b"hello"))
+        result = h5_to_dict(h5group)
+        assert result["raw"] == "hello"
+        assert isinstance(result["raw"], str)
+
+    def test_unrecognized_type_returned_as_is(self, h5group):
+        """Covers h5io.py:97 — _read_attr fallthrough returns value unchanged."""
+        from fd5.h5io import _read_attr
+
+        sentinel = object()
+        assert _read_attr(sentinel) is sentinel
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+
 class TestErrorHandling:
     def test_unsupported_type_raises_typeerror(self, h5group):
         with pytest.raises(TypeError, match="Unsupported type"):

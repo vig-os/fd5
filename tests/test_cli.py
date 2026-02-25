@@ -299,6 +299,54 @@ class TestManifestCommand:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# fd5 rocrate
+# ---------------------------------------------------------------------------
+
+
+class TestRocrateCommand:
+    def test_exits_zero(self, runner: CliRunner, data_dir: Path):
+        result = runner.invoke(cli, ["rocrate", str(data_dir)])
+        assert result.exit_code == 0
+
+    def test_creates_default_output(self, runner: CliRunner, data_dir: Path):
+        runner.invoke(cli, ["rocrate", str(data_dir)])
+        assert (data_dir / "ro-crate-metadata.json").exists()
+
+    def test_custom_output_path(
+        self, runner: CliRunner, data_dir: Path, tmp_path: Path
+    ):
+        out = tmp_path / "custom" / "crate.json"
+        result = runner.invoke(cli, ["rocrate", str(data_dir), "--output", str(out)])
+        assert result.exit_code == 0
+        assert out.exists()
+
+    def test_nonexistent_dir_exits_nonzero(self, runner: CliRunner, tmp_path: Path):
+        result = runner.invoke(cli, ["rocrate", str(tmp_path / "nope")])
+        assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# _format_attr (bytes branch)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatAttr:
+    def test_bytes_attr_decoded(self, runner: CliRunner, tmp_path: Path):
+        """Covers cli.py:156 — _format_attr decoding bytes to str."""
+        path = tmp_path / "bytes_attr.h5"
+        with h5py.File(path, "w") as f:
+            f.attrs["name"] = np.bytes_(b"hello-bytes")
+        result = runner.invoke(cli, ["info", str(path)])
+        assert result.exit_code == 0
+        assert "hello-bytes" in result.output
+
+
+# ---------------------------------------------------------------------------
+# fd5 --help
+# ---------------------------------------------------------------------------
+
+
 class TestHelp:
     def test_help_exits_zero(self, runner: CliRunner):
         result = runner.invoke(cli, ["--help"])

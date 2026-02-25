@@ -265,6 +265,117 @@ class TestWrite:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Edge cases for _build_dates and _collect_tracer_subjects
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDatesNoTimestamps:
+    def test_data_entries_without_timestamp_produce_empty_dates(self, tmp_path: Path):
+        """Covers datacite.py:84 — timestamps list empty returns []."""
+        toml_text = """\
+_schema_version = 1
+dataset_name = "no-ts"
+
+[[data]]
+product = "recon"
+id = "sha256:0000"
+file = "recon-0000.h5"
+"""
+        path = tmp_path / "manifest.toml"
+        path.write_text(toml_text)
+        _create_h5_with_tracer(tmp_path / "recon-0000.h5")
+        result = generate(path)
+        assert result["dates"] == []
+
+
+class TestCollectTracerSubjectsBytesName:
+    def test_tracer_name_stored_as_bytes(self, tmp_path: Path):
+        """Covers datacite.py:123,125 — bytes tracer name decoded."""
+        import numpy as np
+
+        toml_text = """\
+_schema_version = 1
+dataset_name = "bytes-tracer"
+
+[[data]]
+product = "recon"
+id = "sha256:1111"
+file = "recon-bytes.h5"
+scan_type = "pet"
+scan_type_vocabulary = "DICOM Modality"
+timestamp = "2025-01-01T00:00:00Z"
+"""
+        path = tmp_path / "manifest.toml"
+        path.write_text(toml_text)
+        h5_path = tmp_path / "recon-bytes.h5"
+        with h5py.File(h5_path, "w") as f:
+            meta = f.create_group("metadata")
+            pet = meta.create_group("pet")
+            tracer = pet.create_group("tracer")
+            tracer.attrs.create("name", data=np.bytes_(b"FDG"))
+        result = generate(path)
+        tracer_subjects = [
+            s for s in result["subjects"] if s.get("subjectScheme") == "Radiotracer"
+        ]
+        assert len(tracer_subjects) == 1
+        assert tracer_subjects[0]["subject"] == "FDG"
+
+
+class TestCollectTracerSubjectsNoName:
+    def test_tracer_group_without_name_attr(self, tmp_path: Path):
+        """Covers datacite.py:123 — tracer group exists but name attr is missing."""
+        toml_text = """\
+_schema_version = 1
+dataset_name = "no-name"
+
+[[data]]
+product = "recon"
+id = "sha256:2222"
+file = "recon-noname.h5"
+scan_type = "pet"
+scan_type_vocabulary = "DICOM Modality"
+timestamp = "2025-01-01T00:00:00Z"
+"""
+        path = tmp_path / "manifest.toml"
+        path.write_text(toml_text)
+        h5_path = tmp_path / "recon-noname.h5"
+        with h5py.File(h5_path, "w") as f:
+            meta = f.create_group("metadata")
+            pet = meta.create_group("pet")
+            pet.create_group("tracer")
+        result = generate(path)
+        tracer_subjects = [
+            s for s in result["subjects"] if s.get("subjectScheme") == "Radiotracer"
+        ]
+        assert len(tracer_subjects) == 0
+
+
+class TestCollectTracerSubjectsException:
+    def test_corrupt_h5_returns_no_subjects(self, tmp_path: Path):
+        """Covers datacite.py:130-131 — exception in _collect_tracer_subjects."""
+        toml_text = """\
+_schema_version = 1
+dataset_name = "corrupt"
+
+[[data]]
+product = "recon"
+id = "sha256:bad"
+file = "corrupt.h5"
+scan_type = "pet"
+scan_type_vocabulary = "DICOM Modality"
+timestamp = "2025-01-01T00:00:00Z"
+"""
+        path = tmp_path / "manifest.toml"
+        path.write_text(toml_text)
+        (tmp_path / "corrupt.h5").write_bytes(b"not a valid hdf5 file")
+        result = generate(path)
+        tracer_subjects = [
+            s for s in result["subjects"] if s.get("subjectScheme") == "Radiotracer"
+        ]
+        assert len(tracer_subjects) == 0
+
+
 class TestDataciteCLI:
     def test_exits_zero(self, manifest_path: Path):
         from click.testing import CliRunner

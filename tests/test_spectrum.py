@@ -485,6 +485,75 @@ class TestWriteMetadata:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# write() — metadata method with top-level float/int/str (spectrum.py:179,183,185)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteMethodTopLevelValues:
+    def test_method_float_attr(self, schema, h5file):
+        """Covers spectrum.py:183 — float value written to method group."""
+        data = _minimal_1d_data()
+        data["metadata"] = {
+            "method": {
+                "_type": "custom",
+                "threshold": 42.5,
+            },
+        }
+        schema.write(h5file, data)
+        method = h5file["metadata/method"]
+        assert float(method.attrs["threshold"]) == pytest.approx(42.5)
+
+    def test_method_int_attr(self, schema, h5file):
+        """Covers spectrum.py:185 — int value written to method group."""
+        data = _minimal_1d_data()
+        data["metadata"] = {
+            "method": {
+                "_type": "custom",
+                "n_iterations": 100,
+            },
+        }
+        schema.write(h5file, data)
+        method = h5file["metadata/method"]
+        assert int(method.attrs["n_iterations"]) == 100
+
+    def test_method_str_attr(self, schema, h5file):
+        """Covers spectrum.py top-level str in method."""
+        data = _minimal_1d_data()
+        data["metadata"] = {
+            "method": {
+                "_type": "custom",
+                "algorithm": "mlem",
+            },
+        }
+        schema.write(h5file, data)
+        method = h5file["metadata/method"]
+        val = method.attrs["algorithm"]
+        if isinstance(val, bytes):
+            val = val.decode()
+        assert val == "mlem"
+
+    def test_method_subgroup_int_attr(self, schema, h5file):
+        """Covers spectrum.py:179 — int value in method subgroup dict."""
+        data = _minimal_1d_data()
+        data["metadata"] = {
+            "method": {
+                "_type": "custom",
+                "config": {
+                    "n_bins": 256,
+                },
+            },
+        }
+        schema.write(h5file, data)
+        sub = h5file["metadata/method/config"]
+        assert int(sub.attrs["n_bins"]) == 256
+
+
+# ---------------------------------------------------------------------------
+# write() — fit
+# ---------------------------------------------------------------------------
+
+
 class TestWriteFit:
     def test_fit_group_created(self, schema, h5file):
         data = _1d_with_fit()

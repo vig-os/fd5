@@ -37,35 +37,45 @@ def h5path(tmp_path):
 # Helpers — compound dtypes and data builders
 # ---------------------------------------------------------------------------
 
-_SINGLES_DTYPE = np.dtype([
-    ("timestamp", np.uint64),
-    ("energy", np.float32),
-    ("detector_id", np.uint32),
-])
+_SINGLES_DTYPE = np.dtype(
+    [
+        ("timestamp", np.uint64),
+        ("energy", np.float32),
+        ("detector_id", np.uint32),
+    ]
+)
 
-_TIME_MARKERS_DTYPE = np.dtype([
-    ("timestamp", np.uint64),
-    ("marker_type", np.uint8),
-])
+_TIME_MARKERS_DTYPE = np.dtype(
+    [
+        ("timestamp", np.uint64),
+        ("marker_type", np.uint8),
+    ]
+)
 
-_COIN_COUNTERS_DTYPE = np.dtype([
-    ("timestamp", np.uint64),
-    ("prompt", np.uint32),
-    ("delayed", np.uint32),
-])
+_COIN_COUNTERS_DTYPE = np.dtype(
+    [
+        ("timestamp", np.uint64),
+        ("prompt", np.uint32),
+        ("delayed", np.uint32),
+    ]
+)
 
-_TABLE_POSITIONS_DTYPE = np.dtype([
-    ("timestamp", np.uint64),
-    ("position", np.float32),
-])
+_TABLE_POSITIONS_DTYPE = np.dtype(
+    [
+        ("timestamp", np.uint64),
+        ("position", np.float32),
+    ]
+)
 
-_EVENTS_2P_DTYPE = np.dtype([
-    ("timestamp", np.uint64),
-    ("energy_a", np.float32),
-    ("energy_b", np.float32),
-    ("detector_a", np.uint32),
-    ("detector_b", np.uint32),
-])
+_EVENTS_2P_DTYPE = np.dtype(
+    [
+        ("timestamp", np.uint64),
+        ("energy_a", np.float32),
+        ("energy_b", np.float32),
+        ("detector_a", np.uint32),
+        ("detector_b", np.uint32),
+    ]
+)
 
 
 def _make_singles(n: int = 100) -> np.ndarray:
@@ -481,6 +491,34 @@ class TestWriteDaq:
         data = _minimal_data()
         schema.write(h5file, data)
         assert "metadata" not in h5file
+
+
+# ---------------------------------------------------------------------------
+# Entry point registration (manual via register_schema)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# write() — metadata/daq int and fallthrough (listmode.py:154,160)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteDaqIntAndFallthrough:
+    def test_daq_int_attr(self, schema, h5file):
+        """Covers listmode.py:154 — _write_daq with int value."""
+        data = _minimal_data()
+        data["daq"] = {"n_channels": 1024}
+        schema.write(h5file, data)
+        daq = h5file["metadata/daq"]
+        assert int(daq.attrs["n_channels"]) == 1024
+
+    def test_daq_fallthrough_attr(self, schema, h5file):
+        """Covers listmode.py:160 — _write_daq else branch (e.g. numpy array)."""
+        data = _minimal_data()
+        data["daq"] = {"offsets": np.array([1.0, 2.0], dtype=np.float64)}
+        schema.write(h5file, data)
+        daq = h5file["metadata/daq"]
+        np.testing.assert_array_equal(daq.attrs["offsets"], [1.0, 2.0])
 
 
 # ---------------------------------------------------------------------------
