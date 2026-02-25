@@ -123,6 +123,9 @@ def _group_hash(group: h5py.Group) -> str:
     for key in sorted(group.keys()):
         if _is_chunk_hashes_dataset(key):
             continue
+        link = group.get(key, getlink=True)
+        if isinstance(link, h5py.ExternalLink):
+            continue
         child = group[key]
         if isinstance(child, h5py.Group):
             h.update(_group_hash(child).encode("utf-8"))
