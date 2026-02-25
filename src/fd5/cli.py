@@ -11,15 +11,15 @@ import h5py
 
 from fd5.hash import verify
 from fd5.manifest import write_manifest
-from fd5.rocrate import write as write_rocrate
 from fd5.quality import check_descriptions
+from fd5.rocrate import write as write_rocrate
 from fd5.schema import dump_schema, validate
 
 
 @click.group()
 @click.version_option(package_name="fd5")
 def cli() -> None:
-    """fd5 – Fusion Data Format 5 toolkit."""
+    """fd5 – FAIR Data Format 5 toolkit."""
 
 
 @cli.command()
@@ -167,7 +167,6 @@ def migrate(source: str, output: str, target: int) -> None:
         sys.exit(1)
 
 
-
 @cli.command("datalad-register")
 @click.argument("file", type=click.Path(exists=True, dir_okay=False))
 @click.option(
@@ -200,7 +199,6 @@ def datalad_register(file: str, dataset: str | None) -> None:
     click.echo(f"  title: {metadata.get('title', 'N/A')}")
     click.echo(f"  product: {metadata.get('product', 'N/A')}")
     click.echo(f"  id: {metadata.get('id', 'N/A')}")
-
 
 
 @cli.command("check-descriptions")

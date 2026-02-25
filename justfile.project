@@ -19,6 +19,45 @@ info:
     @echo "Project: {{ project }}"
 
 # ===============================================================================
+# TESTING
+# ===============================================================================
+
+# Run all tests (alias for test-pytest)
+[group('test')]
+test *args:
+    just test-pytest {{ args }}
+
+# Run a single test file by short name (e.g. just test-one recon)
+[group('test')]
+test-one name *args:
+    uv run pytest tests/test_{{ name }}.py -v {{ args }}
+
+# Run only integration tests
+[group('test')]
+test-integration *args:
+    uv run pytest tests/test_integration.py -v {{ args }}
+
+# Run tests matching a keyword expression (pytest -k)
+[group('test')]
+test-k expr *args:
+    uv run pytest -k "{{ expr }}" -v {{ args }}
+
+# Run tests that failed in the last run
+[group('test')]
+test-failed:
+    uv run pytest --lf -v
+
+# Run all benchmarks
+[group('bench')]
+bench:
+    uv run python -m benchmarks.run_all
+
+# Run a single benchmark by short name (e.g. just bench-one hash)
+[group('bench')]
+bench-one name:
+    uv run python -m benchmarks.bench_{{ name }}
+
+# ===============================================================================
 # PROJECT-SPECIFIC RECIPES
 # ===============================================================================
 # Uncomment and customize for your project:
