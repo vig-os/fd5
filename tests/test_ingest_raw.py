@@ -136,7 +136,7 @@ class TestIngestArray:
 
         with h5py.File(result, "r") as f:
             assert "study" in f
-            assert f["study"].attrs["study_type"] == "clinical"
+            assert f["study"].attrs["type"] == "clinical"
 
     def test_default_timestamp(self, tmp_path: Path):
         from fd5.ingest.raw import ingest_array
