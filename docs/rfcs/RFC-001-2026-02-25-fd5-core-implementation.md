@@ -349,8 +349,11 @@ Milestone: Phase 2: Recon Schema + CLI
 | #23 | `fd5.cli` | Merged (PR #47) | 201 pass (full suite) | — |
 | #49 | Integration tests | Merged (PR #62) | 20 e2e tests | — |
 | #48 | CI: add pre-commit deps | Merged (PR #50) | — | — |
-| #63 | CI: vig-utils hooks | In progress | — | — |
-| #65 | README + CHANGELOG | In progress | — | — |
+| #63 | CI: vig-utils hooks | Merged (PR #64) | — | — |
+| #65 | README + CHANGELOG | Merged (PR #66) | — | — |
+| #80 | Coverage config + gaps | Merged (PR #83) | 791 pass | 98% |
+| #81 | Implementation audit | Closed (PR #82) | — | — |
+| #84 | Audit quick-fixes | In progress | — | — |
 
 ### Phase 3: Medical Imaging Schemas — COMPLETE
 
@@ -358,16 +361,16 @@ Epic: #61 | Milestone: Phase 3: Medical Imaging Schemas
 
 | Issue | Schema | Status | Tests |
 |-------|--------|--------|-------|
-| #51 | `fd5.imaging.listmode` | Implemented | `test_listmode.py` |
-| #52 | `fd5.imaging.sinogram` | Implemented | `test_sinogram.py` |
-| #53 | `fd5.imaging.sim` | Implemented | `test_sim.py` |
-| #54 | `fd5.imaging.transform` | Implemented | `test_transform.py` |
-| #55 | `fd5.imaging.calibration` | Implemented | `test_calibration.py` |
-| #56 | `fd5.imaging.spectrum` | Implemented | `test_spectrum.py` |
-| #57 | `fd5.imaging.roi` | Implemented | `test_roi.py` |
-| #58 | `fd5.imaging.device_data` | Implemented | `test_device_data.py` |
+| #51 | `fd5.imaging.listmode` | Merged (PR #69) | `test_listmode.py` |
+| #52 | `fd5.imaging.sinogram` | Merged (PR #68) | `test_sinogram.py` |
+| #53 | `fd5.imaging.sim` | Merged (PR #72) | `test_sim.py` |
+| #54 | `fd5.imaging.transform` | Merged (PR #75) | `test_transform.py` |
+| #55 | `fd5.imaging.calibration` | Merged (PR #74) | `test_calibration.py` |
+| #56 | `fd5.imaging.spectrum` | Merged (PR #70) | `test_spectrum.py` |
+| #57 | `fd5.imaging.roi` | Merged (PR #71) | `test_roi.py` |
+| #58 | `fd5.imaging.device_data` | Merged (PR #73) | `test_device_data.py` |
 
-All 9 schemas registered via entry points in `pyproject.toml`. Full suite: 791 tests passing.
+All 9 schemas registered via entry points (PR #76). Full suite: 791 tests passing.
 
 ### Phase 4: FAIR Export Layer — COMPLETE
 
@@ -375,7 +378,31 @@ Milestone: Phase 4: FAIR Export Layer
 
 | Issue | Module | Status | Tests |
 |-------|--------|--------|-------|
-| #59 | `fd5.rocrate` (RO-Crate JSON-LD) | Implemented | `test_rocrate.py` |
-| #60 | `fd5.datacite` (DataCite YAML) | Implemented | `test_datacite.py` |
+| #59 | `fd5.rocrate` (RO-Crate JSON-LD) | Merged (PR #79) | `test_rocrate.py` |
+| #60 | `fd5.datacite` (DataCite YAML) | Merged (PR #77) | `test_datacite.py` |
 
-CLI commands `fd5 rocrate` and `fd5 datacite` added. See audit on #81 for deviations.
+CLI commands `fd5 rocrate` and `fd5 datacite` added.
+
+### Phase 5: Ecosystem & Tooling — PLANNED
+
+Epic: #85 | Milestone: Phase 5: Ecosystem & Tooling
+
+| Issue | Feature | Status |
+|-------|---------|--------|
+| #86 | Streaming chunk hashing in create flow | Open |
+| #87 | Schema migration tool (`fd5.migrate`) | Open |
+| #88 | Optional schema features (MIPs, gate, embedded device_data) | Open |
+| #89 | `_types.py` shared types + `SourceRecord` dataclass | Open |
+| #90 | Performance benchmarks | Open |
+| #91 | Description quality validation | Open |
+| #92 | DataLad integration hooks | Open |
+
+### Overall Statistics
+
+| Metric | Value |
+|--------|-------|
+| Total tests | 791 |
+| Overall coverage | 98% |
+| Modules at 100% | 13 of 23 |
+| Tags | `phase-1-complete`, `phase-2-complete`, `phase-3-complete`, `phase-4-complete` |
+| Audit | #81 (passed, deviations documented) |
