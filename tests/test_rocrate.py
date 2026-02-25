@@ -409,6 +409,61 @@ class TestEdgeCases:
         assert person["name"] == "Solo Dev"
         assert "affiliation" not in person
 
+    def test_creators_not_dict_returns_no_authors(self, tmp_path: Path):
+        """Covers rocrate.py:113 — creators is not a dict (e.g. empty string)."""
+        from fd5.rocrate import generate
+
+        _create_h5(
+            tmp_path / "recon-aaa.h5",
+            root_attrs={
+                "_schema_version": 1,
+                "product": "recon",
+                "id": "sha256:aaa",
+                "content_hash": "sha256:bbb",
+                "timestamp": "2025-01-01T00:00:00Z",
+            },
+            groups={
+                "study": {
+                    "license": "CC0-1.0",
+                    "name": "Test",
+                },
+            },
+        )
+        entities = _graph_by_id(generate(tmp_path))
+        root = entities["./"]
+        assert "author" not in root
+
+    def test_non_dict_creator_entry_skipped(self, tmp_path: Path):
+        """Covers rocrate.py:119 — non-dict creator entry skipped."""
+        from fd5.rocrate import generate
+
+        path = tmp_path / "recon-skip.h5"
+        with h5py.File(path, "w") as f:
+            dict_to_h5(
+                f,
+                {
+                    "_schema_version": 1,
+                    "product": "recon",
+                    "id": "sha256:skip",
+                    "content_hash": "sha256:skip",
+                    "timestamp": "2025-01-01T00:00:00Z",
+                },
+            )
+            study = f.create_group("study")
+            study.attrs["license"] = "CC0-1.0"
+            study.attrs["name"] = "Test"
+            creators = study.create_group("creators")
+            creators.attrs["bad_entry"] = "not-a-dict"
+            good = creators.create_group("good_entry")
+            good.attrs["name"] = "Good Person"
+
+        entities = _graph_by_id(generate(tmp_path))
+        root = entities["./"]
+        authors = root.get("author", [])
+        names = {a["name"] for a in authors}
+        assert "Good Person" in names
+        assert len(authors) == 1
+
     def test_multiple_sources(self, tmp_path: Path):
         """File with multiple sources should produce multiple isBasedOn refs."""
         from fd5.rocrate import generate

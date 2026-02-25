@@ -500,6 +500,98 @@ class TestIdempotency:
 
 
 # ---------------------------------------------------------------------------
+# _validate with bytes attrs (create.py:128)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateBytesAttrs:
+    def test_validate_decodes_bytes_attr(self, out_dir: Path):
+        """Covers create.py:128 — _validate decoding bytes attr values."""
+        with create(
+            out_dir,
+            product="test/product",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.file.attrs["name"] = np.bytes_(b"sample")
+            builder.file.attrs["description"] = np.bytes_(b"desc")
+            builder.file.attrs["timestamp"] = np.bytes_(b"2026-02-25T12:00:00Z")
+
+        final = _find_h5(out_dir)
+        assert final.exists()
+
+
+# ---------------------------------------------------------------------------
+# _seal with bytes id_input attrs (create.py:146)
+# ---------------------------------------------------------------------------
+
+
+class TestSealBytesIdInputs:
+    def test_seal_decodes_bytes_id_input(self, out_dir: Path):
+        """Covers create.py:146 — _seal decoding bytes id_input values."""
+        with create(
+            out_dir,
+            product="test/product",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.file.attrs["product"] = np.bytes_(b"test/product")
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            assert f.attrs["id"].startswith("sha256:")
+
+
+# ---------------------------------------------------------------------------
+# _parse_timestamp edge cases (create.py:226,229-230)
+# ---------------------------------------------------------------------------
+
+
+class TestParseTimestamp:
+    def test_empty_timestamp_returns_none(self):
+        """Covers create.py:226 — empty ts returns None."""
+        from fd5.create import _parse_timestamp
+
+        assert _parse_timestamp("") is None
+
+    def test_invalid_timestamp_falls_back_to_now(self, out_dir: Path):
+        """Covers create.py:229-230 — invalid ISO format falls back to datetime.now."""
+        with create(
+            out_dir,
+            product="test/product",
+            name="sample",
+            description="desc",
+            timestamp="not-a-valid-iso-timestamp",
+        ):
+            pass
+
+        final = _find_h5(out_dir)
+        assert final.exists()
+
+
+# ---------------------------------------------------------------------------
+# Exception path when file handle already invalid (create.py:214-215)
+# ---------------------------------------------------------------------------
+
+
+class TestExceptionFileHandleInvalid:
+    def test_exception_after_file_closed(self, out_dir: Path):
+        """Covers create.py:214-215 — f.id invalid when exception raised after close."""
+        with pytest.raises(RuntimeError, match="after close"):
+            with create(
+                out_dir,
+                product="test/product",
+                name="sample",
+                description="desc",
+                timestamp="2026-02-25T12:00:00Z",
+            ) as builder:
+                builder.file.close()
+                raise RuntimeError("after close")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

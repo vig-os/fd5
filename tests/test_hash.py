@@ -377,6 +377,48 @@ class TestVerify:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# _serialize_attr edge cases (hash.py:78,85)
+# ---------------------------------------------------------------------------
+
+
+class TestSerializeAttr:
+    def test_bytes_attr_returned_as_bytes(self):
+        """Covers hash.py:78 — _serialize_attr returns bytes as-is."""
+        from fd5.hash import _serialize_attr
+
+        raw = b"raw-bytes"
+        assert _serialize_attr(raw) == raw
+
+    def test_unsupported_type_falls_back_to_str(self):
+        """Covers hash.py:85 — _serialize_attr str(value).encode fallthrough."""
+        from fd5.hash import _serialize_attr
+
+        result = _serialize_attr(42)
+        assert result == b"42"
+
+
+# ---------------------------------------------------------------------------
+# verify with bytes content_hash (hash.py:175)
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyBytesContentHash:
+    def test_bytes_content_hash_decoded(self, h5path: Path):
+        """Covers hash.py:175 — verify decodes bytes content_hash."""
+        with h5py.File(h5path, "w") as f:
+            f.create_dataset("data", data=np.array([1.0, 2.0]))
+            h = compute_content_hash(f)
+            f.attrs.create("content_hash", data=np.bytes_(h.encode("utf-8")))
+
+        assert verify(h5path) is True
+
+
+# ---------------------------------------------------------------------------
+# Edge cases and integration
+# ---------------------------------------------------------------------------
+
+
 class TestEdgeCases:
     def test_chunk_hash_edge_chunk(self):
         """Edge chunks (partial) should hash actual data only."""

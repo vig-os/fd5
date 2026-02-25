@@ -637,6 +637,36 @@ class TestRegistration:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# _coerce_list_attr edge case (calibration.py:326)
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceListAttrEmptyList:
+    def test_empty_list_in_metadata(self, schema, h5file):
+        """Covers calibration.py:326 — _coerce_list_attr with empty list."""
+        data = _base_data(
+            calibration_type="energy_calibration",
+            metadata={
+                "calibration": {
+                    "_type": "energy_calibration",
+                    "_version": 1,
+                    "description": "Test",
+                    "empty_values": [],
+                },
+            },
+        )
+        schema.write(h5file, data)
+        grp = h5file["metadata/calibration"]
+        result = grp.attrs["empty_values"]
+        assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# Integration: write + embed_schema + validate
+# ---------------------------------------------------------------------------
+
+
 class TestIntegration:
     def test_create_validate_roundtrip(self, schema, h5path):
         from fd5.schema import embed_schema, validate

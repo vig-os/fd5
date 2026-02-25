@@ -381,6 +381,26 @@ class TestWriteSimulationMetadata:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# write() — simulation metadata with pre-existing metadata group (sim.py:130)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteSimulationMetadataExisting:
+    def test_uses_existing_metadata_group(self, schema, h5file):
+        """Covers sim.py:130 — metadata group already exists."""
+        h5file.create_group("metadata")
+        data = _full_sim_data()
+        schema.write(h5file, data)
+        assert "metadata/simulation" in h5file
+        assert h5file["metadata/simulation"].attrs["_type"] == "gate"
+
+
+# ---------------------------------------------------------------------------
+# write() — full round-trip
+# ---------------------------------------------------------------------------
+
+
 class TestWriteFullRoundTrip:
     def test_all_groups_present(self, schema, h5file):
         data = _full_sim_data()
