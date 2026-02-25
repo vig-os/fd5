@@ -43,6 +43,14 @@ packages = ["src/fd5"]
 
 [project.entry-points."fd5.schemas"]
 recon = "fd5.imaging.recon:ReconSchema"
+listmode = "fd5.imaging.listmode:ListmodeSchema"
+sinogram = "fd5.imaging.sinogram:SinogramSchema"
+sim = "fd5.imaging.sim:SimSchema"
+transform = "fd5.imaging.transform:TransformSchema"
+calibration = "fd5.imaging.calibration:CalibrationSchema"
+spectrum = "fd5.imaging.spectrum:SpectrumSchema"
+roi = "fd5.imaging.roi:RoiSchema"
+device_data = "fd5.imaging.device_data:DeviceDataSchema"
 
 [dependency-groups]
 dev = [
