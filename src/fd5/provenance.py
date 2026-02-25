@@ -7,11 +7,13 @@ provenance/ingest/ attrs) per white-paper.md §§ sources/ group, provenance/ gr
 
 from __future__ import annotations
 
-from typing import Any
+import dataclasses
+from typing import Any, Union
 
 import h5py
 import numpy as np
 
+from fd5._types import SourceRecord
 from fd5.h5io import dict_to_h5
 
 _SOURCES_DESCRIPTION = "Data products this file was derived from"
@@ -23,13 +25,21 @@ _INGEST_DESCRIPTION = "Ingest pipeline that created this file"
 _SOURCE_ATTR_KEYS = ("id", "product", "file", "content_hash", "role", "description")
 
 
+def _normalise_source(src: Union[SourceRecord, dict[str, Any]]) -> dict[str, Any]:
+    """Convert a *SourceRecord* or plain dict into a uniform dict."""
+    if dataclasses.is_dataclass(src) and not isinstance(src, type):
+        return dataclasses.asdict(src)  # type: ignore[arg-type]
+    return src  # type: ignore[return-value]
+
+
 def write_sources(
     file: h5py.File,
-    sources: list[dict[str, Any]],
+    sources: list[Union[SourceRecord, dict[str, Any]]],
 ) -> None:
     """Create ``sources/`` group with per-source sub-groups, attrs, and external links.
 
-    Each dict in *sources* must contain ``name`` (used as the sub-group key)
+    Each element in *sources* may be a :class:`~fd5._types.SourceRecord`
+    or a plain dict.  Dicts must contain ``name`` (used as the sub-group key)
     plus ``id``, ``product``, ``file``, ``content_hash``, ``role``, and
     ``description``.  The ``file`` value is used as a relative-path HDF5
     external link targeting ``"/"``.
@@ -41,11 +51,12 @@ def write_sources(
     grp.attrs["description"] = _SOURCES_DESCRIPTION
 
     for src in sources:
-        name = src["name"]
-        attrs = {k: src[k] for k in _SOURCE_ATTR_KEYS}
+        d = _normalise_source(src)
+        name = d["name"]
+        attrs = {k: d[k] for k in _SOURCE_ATTR_KEYS}
         sub = grp.create_group(name)
         dict_to_h5(sub, attrs)
-        sub["link"] = h5py.ExternalLink(src["file"], "/")
+        sub["link"] = h5py.ExternalLink(d["file"], "/")
 
 
 def write_original_files(

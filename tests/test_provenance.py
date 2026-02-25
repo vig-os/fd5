@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import h5py
 import pytest
 
@@ -102,6 +104,42 @@ class TestWriteSources:
         write_sources(h5file, [self._make_source()])
         grp = h5file["sources/emission"]
         assert "name" not in grp.attrs
+
+    def test_accepts_dataclass_instances(self, h5file):
+        @dataclasses.dataclass
+        class _SourceDC:
+            name: str = "emission"
+            id: str = "sha256:abc"
+            product: str = "listmode"
+            file: str = "file.h5"
+            content_hash: str = "sha256:def"
+            role: str = "emission_data"
+            description: str = "test source"
+
+        write_sources(h5file, [_SourceDC()])
+        assert "emission" in h5file["sources"]
+        grp = h5file["sources/emission"]
+        assert grp.attrs["id"] == "sha256:abc"
+        assert grp.attrs["content_hash"] == "sha256:def"
+
+    def test_mixed_dict_and_dataclass(self, h5file):
+        @dataclasses.dataclass
+        class _SourceDC:
+            name: str = "dc_source"
+            id: str = "sha256:dc"
+            product: str = "recon"
+            file: str = "dc.h5"
+            content_hash: str = "sha256:dchash"
+            role: str = "mu_map"
+            description: str = "dataclass source"
+
+        sources = [
+            self._make_source(name="dict_source"),
+            _SourceDC(),
+        ]
+        write_sources(h5file, sources)
+        assert "dict_source" in h5file["sources"]
+        assert "dc_source" in h5file["sources"]
 
 
 # ---------------------------------------------------------------------------
