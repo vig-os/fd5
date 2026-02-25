@@ -352,26 +352,30 @@ Milestone: Phase 2: Recon Schema + CLI
 | #63 | CI: vig-utils hooks | In progress | — | — |
 | #65 | README + CHANGELOG | In progress | — | — |
 
-### Phase 3: Medical Imaging Schemas — PLANNED
+### Phase 3: Medical Imaging Schemas — COMPLETE
 
 Epic: #61 | Milestone: Phase 3: Medical Imaging Schemas
 
-| Issue | Schema | Status |
-|-------|--------|--------|
-| #51 | `listmode` | Open |
-| #52 | `sinogram` | Open |
-| #53 | `sim` | Open |
-| #54 | `transform` | Open |
-| #55 | `calibration` | Open |
-| #56 | `spectrum` | Open |
-| #57 | `roi` | Open |
-| #58 | `device_data` | Open |
+| Issue | Schema | Status | Tests |
+|-------|--------|--------|-------|
+| #51 | `fd5.imaging.listmode` | Implemented | `test_listmode.py` |
+| #52 | `fd5.imaging.sinogram` | Implemented | `test_sinogram.py` |
+| #53 | `fd5.imaging.sim` | Implemented | `test_sim.py` |
+| #54 | `fd5.imaging.transform` | Implemented | `test_transform.py` |
+| #55 | `fd5.imaging.calibration` | Implemented | `test_calibration.py` |
+| #56 | `fd5.imaging.spectrum` | Implemented | `test_spectrum.py` |
+| #57 | `fd5.imaging.roi` | Implemented | `test_roi.py` |
+| #58 | `fd5.imaging.device_data` | Implemented | `test_device_data.py` |
 
-### Phase 4: FAIR Export Layer — PLANNED
+All 9 schemas registered via entry points in `pyproject.toml`. Full suite: 791 tests passing.
+
+### Phase 4: FAIR Export Layer — COMPLETE
 
 Milestone: Phase 4: FAIR Export Layer
 
-| Issue | Module | Status |
-|-------|--------|--------|
-| #59 | `fd5.rocrate` (RO-Crate JSON-LD) | Open |
-| #60 | `fd5.datacite` (DataCite YAML) | Open |
+| Issue | Module | Status | Tests |
+|-------|--------|--------|-------|
+| #59 | `fd5.rocrate` (RO-Crate JSON-LD) | Implemented | `test_rocrate.py` |
+| #60 | `fd5.datacite` (DataCite YAML) | Implemented | `test_datacite.py` |
+
+CLI commands `fd5 rocrate` and `fd5 datacite` added. See audit on #81 for deviations.
