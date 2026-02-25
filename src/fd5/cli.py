@@ -18,7 +18,7 @@ from fd5.schema import dump_schema, validate
 @click.group()
 @click.version_option(package_name="fd5")
 def cli() -> None:
-    """fd5 – Fusion Data Format 5 toolkit."""
+    """fd5 \u2013 Fusion Data Format 5 toolkit."""
 
 
 @cli.command()
@@ -45,7 +45,7 @@ def validate_cmd(file: str) -> None:
             click.echo(msg, err=True)
         sys.exit(1)
 
-    click.echo("OK – schema valid, content_hash verified.")
+    click.echo("OK \u2013 schema valid, content_hash verified.")
 
 
 # click registers the command name from the function; override with the decorator
@@ -99,6 +99,29 @@ def manifest(directory: str, output: str | None) -> None:
     dir_path = Path(directory)
     out_path = Path(output) if output else dir_path / "manifest.toml"
     write_manifest(dir_path, out_path)
+    click.echo(f"Wrote {out_path}")
+
+
+@cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="Output path for datacite.yml (default: <directory>/datacite.yml).",
+)
+def datacite(directory: str, output: str | None) -> None:
+    """Generate datacite.yml from manifest.toml in a directory."""
+    from fd5.datacite import write as datacite_write
+
+    dir_path = Path(directory)
+    manifest_path = dir_path / "manifest.toml"
+    if not manifest_path.is_file():
+        click.echo(f"Error: {manifest_path} not found.", err=True)
+        sys.exit(1)
+    out_path = Path(output) if output else dir_path / "datacite.yml"
+    datacite_write(manifest_path, out_path)
     click.echo(f"Wrote {out_path}")
 
 
