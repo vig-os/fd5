@@ -343,6 +343,89 @@ class TestFormatAttr:
 
 
 # ---------------------------------------------------------------------------
+# fd5 migrate
+# ---------------------------------------------------------------------------
+
+
+def _make_v1_h5(path: Path) -> Path:
+    """Create a minimal sealed v1 fd5 file for CLI migration tests."""
+    schema_dict = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "_schema_version": {"type": "integer"},
+            "product": {"type": "string"},
+        },
+        "required": ["_schema_version", "product"],
+    }
+    with h5py.File(path, "w") as f:
+        f.attrs["product"] = "test/climock"
+        f.attrs["name"] = "sample"
+        f.attrs["description"] = "A v1 file"
+        f.attrs["timestamp"] = "2026-01-15T10:00:00Z"
+        f.attrs["id"] = "sha256:abc123"
+        f.attrs["id_inputs"] = "product + name + timestamp"
+        f.attrs["_schema_version"] = np.int64(1)
+        embed_schema(f, schema_dict)
+        f.create_dataset("volume", data=np.zeros((4, 4), dtype=np.float32))
+        f.attrs["content_hash"] = compute_content_hash(f)
+    return path
+
+
+def _cli_v1_to_v2(src: h5py.File, dst: h5py.File) -> None:
+    if "volume" in src:
+        dst.create_dataset("volume", data=src["volume"][...])
+    dst.attrs["cli_added"] = "yes"
+
+
+class TestMigrateCommand:
+    @pytest.fixture(autouse=True)
+    def _register(self):
+        from fd5.migrate import clear_migrations, register_migration
+
+        register_migration("test/climock", 1, 2, _cli_v1_to_v2)
+        yield
+        clear_migrations()
+
+    def test_exits_zero(self, runner: CliRunner, tmp_path: Path):
+        src = _make_v1_h5(tmp_path / "src.h5")
+        out = tmp_path / "out.h5"
+        result = runner.invoke(cli, ["migrate", str(src), str(out), "--target", "2"])
+        assert result.exit_code == 0, result.output
+
+    def test_creates_output_file(self, runner: CliRunner, tmp_path: Path):
+        src = _make_v1_h5(tmp_path / "src.h5")
+        out = tmp_path / "out.h5"
+        runner.invoke(cli, ["migrate", str(src), str(out), "--target", "2"])
+        assert out.exists()
+
+    def test_prints_confirmation(self, runner: CliRunner, tmp_path: Path):
+        src = _make_v1_h5(tmp_path / "src.h5")
+        out = tmp_path / "out.h5"
+        result = runner.invoke(cli, ["migrate", str(src), str(out), "--target", "2"])
+        assert "migrated" in result.output.lower() or "out.h5" in result.output
+
+    def test_nonexistent_source_exits_nonzero(self, runner: CliRunner, tmp_path: Path):
+        result = runner.invoke(
+            cli,
+            [
+                "migrate",
+                str(tmp_path / "ghost.h5"),
+                str(tmp_path / "o.h5"),
+                "--target",
+                "2",
+            ],
+        )
+        assert result.exit_code != 0
+
+    def test_same_version_exits_nonzero(self, runner: CliRunner, tmp_path: Path):
+        src = _make_v1_h5(tmp_path / "src.h5")
+        out = tmp_path / "out.h5"
+        result = runner.invoke(cli, ["migrate", str(src), str(out), "--target", "1"])
+        assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
 # fd5 --help
 # ---------------------------------------------------------------------------
 
@@ -354,5 +437,5 @@ class TestHelp:
 
     def test_help_lists_commands(self, runner: CliRunner):
         result = runner.invoke(cli, ["--help"])
-        for cmd in ("validate", "info", "schema-dump", "manifest"):
+        for cmd in ("validate", "info", "schema-dump", "manifest", "migrate"):
             assert cmd in result.output
