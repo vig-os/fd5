@@ -426,6 +426,383 @@ class TestWriteMIP:
 
 
 # ---------------------------------------------------------------------------
+# write() — mips_per_frame (optional, 4D+ only)
+# ---------------------------------------------------------------------------
+
+
+class TestWriteMipsPerFrame:
+    def test_mips_per_frame_created_for_4d(self, schema, h5file):
+        data = _minimal_4d_data()
+        data["mips_per_frame"] = True
+        schema.write(h5file, data)
+        assert "mips_per_frame" in h5file
+        assert isinstance(h5file["mips_per_frame"], h5py.Group)
+
+    def test_mips_per_frame_coronal_shape(self, schema, h5file):
+        data = _minimal_4d_data()
+        data["mips_per_frame"] = True
+        schema.write(h5file, data)
+        ds = h5file["mips_per_frame/coronal"]
+        n_frames, z, y, x = data["volume"].shape
+        assert ds.shape == (n_frames, z, x)
+        assert ds.dtype == np.float32
+
+    def test_mips_per_frame_sagittal_shape(self, schema, h5file):
+        data = _minimal_4d_data()
+        data["mips_per_frame"] = True
+        schema.write(h5file, data)
+        ds = h5file["mips_per_frame/sagittal"]
+        n_frames, z, y, x = data["volume"].shape
+        assert ds.shape == (n_frames, z, y)
+        assert ds.dtype == np.float32
+
+    def test_mips_per_frame_coronal_attrs(self, schema, h5file):
+        data = _minimal_4d_data()
+        data["mips_per_frame"] = True
+        schema.write(h5file, data)
+        ds = h5file["mips_per_frame/coronal"]
+        assert ds.attrs["projection_type"] == "mip"
+        assert ds.attrs["axis"] == 1
+        assert ds.attrs["description"] == "Per-frame coronal MIPs"
+
+    def test_mips_per_frame_sagittal_attrs(self, schema, h5file):
+        data = _minimal_4d_data()
+        data["mips_per_frame"] = True
+        schema.write(h5file, data)
+        ds = h5file["mips_per_frame/sagittal"]
+        assert ds.attrs["projection_type"] == "mip"
+        assert ds.attrs["axis"] == 2
+        assert ds.attrs["description"] == "Per-frame sagittal MIPs"
+
+    def test_mips_per_frame_not_created_for_3d(self, schema, h5file):
+        data = _minimal_3d_data()
+        data["mips_per_frame"] = True
+        schema.write(h5file, data)
+        assert "mips_per_frame" not in h5file
+
+    def test_mips_per_frame_absent_when_not_requested(self, schema, h5file):
+        data = _minimal_4d_data()
+        schema.write(h5file, data)
+        assert "mips_per_frame" not in h5file
+
+    def test_mips_per_frame_values_match_manual(self, schema, h5file):
+        data = _minimal_4d_data()
+        data["mips_per_frame"] = True
+        schema.write(h5file, data)
+        vol = data["volume"]
+        expected_cor_0 = vol[0].max(axis=1).astype(np.float32)
+        np.testing.assert_array_almost_equal(
+            h5file["mips_per_frame/coronal"][0], expected_cor_0
+        )
+
+
+# ---------------------------------------------------------------------------
+# write() — gate_phase and gate_trigger (optional gated recon)
+# ---------------------------------------------------------------------------
+
+
+def _gated_cardiac_data():
+    vol = _make_volume_4d((8, 8, 16, 16))
+    return {
+        "volume": vol,
+        "affine": _make_affine(),
+        "dimension_order": "TZYX",
+        "reference_frame": "LPS",
+        "description": "Gated cardiac reconstruction",
+        "frames": {
+            "n_frames": 8,
+            "frame_type": "gate_cardiac",
+            "description": "Cardiac gated frames",
+            "frame_start": np.linspace(0.0, 0.7, 8),
+            "frame_duration": np.full(8, 0.1),
+            "gate_phase": np.linspace(0.0, 87.5, 8),
+            "gate_trigger": {
+                "signal": np.sin(np.linspace(0, 4 * np.pi, 500)),
+                "sampling_rate": 500.0,
+                "trigger_times": np.array([0.0, 0.8, 1.6]),
+            },
+        },
+    }
+
+
+class TestWriteGating:
+    def test_gate_phase_dataset_created(self, schema, h5file):
+        data = _gated_cardiac_data()
+        schema.write(h5file, data)
+        assert "frames/gate_phase" in h5file
+
+    def test_gate_phase_values(self, schema, h5file):
+        data = _gated_cardiac_data()
+        schema.write(h5file, data)
+        ds = h5file["frames/gate_phase"]
+        np.testing.assert_array_almost_equal(ds[:], data["frames"]["gate_phase"])
+
+    def test_gate_phase_attrs(self, schema, h5file):
+        data = _gated_cardiac_data()
+        schema.write(h5file, data)
+        ds = h5file["frames/gate_phase"]
+        assert ds.attrs["units"] == "%"
+        assert "description" in ds.attrs
+
+    def test_gate_trigger_group_created(self, schema, h5file):
+        data = _gated_cardiac_data()
+        schema.write(h5file, data)
+        assert "frames/gate_trigger" in h5file
+        assert isinstance(h5file["frames/gate_trigger"], h5py.Group)
+
+    def test_gate_trigger_signal(self, schema, h5file):
+        data = _gated_cardiac_data()
+        schema.write(h5file, data)
+        ds = h5file["frames/gate_trigger/signal"]
+        np.testing.assert_array_almost_equal(
+            ds[:], data["frames"]["gate_trigger"]["signal"]
+        )
+        assert ds.attrs["description"] == "Raw physiological gating signal"
+
+    def test_gate_trigger_sampling_rate(self, schema, h5file):
+        data = _gated_cardiac_data()
+        schema.write(h5file, data)
+        sr = h5file["frames/gate_trigger/sampling_rate"]
+        assert sr.attrs["value"] == pytest.approx(500.0)
+        assert sr.attrs["units"] == "Hz"
+        assert sr.attrs["unitSI"] == pytest.approx(1.0)
+
+    def test_gate_trigger_times(self, schema, h5file):
+        data = _gated_cardiac_data()
+        schema.write(h5file, data)
+        ds = h5file["frames/gate_trigger/trigger_times"]
+        np.testing.assert_array_almost_equal(ds[:], [0.0, 0.8, 1.6])
+        assert ds.attrs["units"] == "s"
+
+    def test_no_gate_phase_for_time_frames(self, schema, h5file):
+        data = _minimal_4d_data()
+        schema.write(h5file, data)
+        assert "frames/gate_phase" not in h5file
+
+    def test_no_gate_trigger_for_time_frames(self, schema, h5file):
+        data = _minimal_4d_data()
+        schema.write(h5file, data)
+        assert "frames/gate_trigger" not in h5file
+
+
+# ---------------------------------------------------------------------------
+# write() — device_data (optional embedded device signals)
+# ---------------------------------------------------------------------------
+
+
+def _ecg_channel():
+    n = 500
+    return {
+        "_type": "ecg",
+        "_version": 1,
+        "model": "GE CardioLab",
+        "measurement": "voltage",
+        "run_control": True,
+        "description": "ECG trace for cardiac gating",
+        "sampling_rate": 500.0,
+        "signal": np.sin(np.linspace(0, 4 * np.pi, n)),
+        "time": np.linspace(0.0, 1.0, n),
+        "units": "mV",
+        "unitSI": 0.001,
+    }
+
+
+def _bellows_channel():
+    n = 200
+    return {
+        "_type": "bellows",
+        "description": "Respiratory bellows signal",
+        "sampling_rate": 50.0,
+        "signal": np.sin(np.linspace(0, 2 * np.pi, n)),
+        "time": np.linspace(0.0, 4.0, n),
+        "units": "au",
+        "unitSI": 1.0,
+    }
+
+
+class TestWriteDeviceData:
+    def test_device_data_group_created(self, schema, h5file):
+        data = _minimal_3d_data()
+        data["device_data"] = {"ecg": _ecg_channel()}
+        schema.write(h5file, data)
+        assert "device_data" in h5file
+        assert isinstance(h5file["device_data"], h5py.Group)
+        assert h5file["device_data"].attrs["description"] == (
+            "Device signals recorded during this acquisition"
+        )
+
+    def test_ecg_channel_attrs(self, schema, h5file):
+        data = _minimal_3d_data()
+        data["device_data"] = {"ecg": _ecg_channel()}
+        schema.write(h5file, data)
+        ch = h5file["device_data/ecg"]
+        assert ch.attrs["_type"] == "ecg"
+        assert int(ch.attrs["_version"]) == 1
+        assert ch.attrs["model"] == "GE CardioLab"
+        assert ch.attrs["measurement"] == "voltage"
+        assert bool(ch.attrs["run_control"]) is True
+
+    def test_ecg_signal_dataset(self, schema, h5file):
+        data = _minimal_3d_data()
+        ecg = _ecg_channel()
+        data["device_data"] = {"ecg": ecg}
+        schema.write(h5file, data)
+        ds = h5file["device_data/ecg/signal"]
+        np.testing.assert_array_almost_equal(ds[:], ecg["signal"])
+        assert ds.attrs["units"] == "mV"
+        assert ds.attrs["unitSI"] == pytest.approx(0.001)
+
+    def test_ecg_time_dataset(self, schema, h5file):
+        data = _minimal_3d_data()
+        ecg = _ecg_channel()
+        data["device_data"] = {"ecg": ecg}
+        schema.write(h5file, data)
+        ds = h5file["device_data/ecg/time"]
+        np.testing.assert_array_almost_equal(ds[:], ecg["time"])
+        assert ds.attrs["units"] == "s"
+
+    def test_ecg_sampling_rate(self, schema, h5file):
+        data = _minimal_3d_data()
+        data["device_data"] = {"ecg": _ecg_channel()}
+        schema.write(h5file, data)
+        sr = h5file["device_data/ecg/sampling_rate"]
+        assert sr.attrs["value"] == pytest.approx(500.0)
+        assert sr.attrs["units"] == "Hz"
+
+    def test_multiple_channels(self, schema, h5file):
+        data = _minimal_3d_data()
+        data["device_data"] = {
+            "ecg": _ecg_channel(),
+            "bellows": _bellows_channel(),
+        }
+        schema.write(h5file, data)
+        assert "device_data/ecg" in h5file
+        assert "device_data/bellows" in h5file
+
+    def test_no_device_data_when_absent(self, schema, h5file):
+        data = _minimal_3d_data()
+        schema.write(h5file, data)
+        assert "device_data" not in h5file
+
+
+# ---------------------------------------------------------------------------
+# write() — provenance (optional DICOM header and per-slice metadata)
+# ---------------------------------------------------------------------------
+
+
+def _per_slice_metadata_dtype():
+    return np.dtype(
+        [
+            ("instance_number", np.int32),
+            ("slice_location", np.float64),
+            ("acquisition_time", "S26"),
+            ("image_position_patient", np.float64, (3,)),
+        ]
+    )
+
+
+class TestWriteProvenance:
+    def test_dicom_header_written(self, schema, h5file):
+        data = _minimal_3d_data()
+        data["provenance"] = {
+            "dicom_header": '{"PatientID": "ANON"}',
+        }
+        schema.write(h5file, data)
+        assert "provenance/dicom_header" in h5file
+        stored = h5file["provenance/dicom_header"][()]
+        if isinstance(stored, bytes):
+            stored = stored.decode()
+        assert "PatientID" in stored
+
+    def test_dicom_header_description_attr(self, schema, h5file):
+        data = _minimal_3d_data()
+        data["provenance"] = {"dicom_header": "{}"}
+        schema.write(h5file, data)
+        ds = h5file["provenance/dicom_header"]
+        assert "description" in ds.attrs
+
+    def test_dicom_header_accepts_dict(self, schema, h5file):
+        data = _minimal_3d_data()
+        data["provenance"] = {"dicom_header": {"PatientID": "ANON"}}
+        schema.write(h5file, data)
+        stored = h5file["provenance/dicom_header"][()]
+        if isinstance(stored, bytes):
+            stored = stored.decode()
+        import json
+
+        parsed = json.loads(stored)
+        assert parsed["PatientID"] == "ANON"
+
+    def test_per_slice_metadata_written(self, schema, h5file):
+        data = _minimal_3d_data()
+        dt = _per_slice_metadata_dtype()
+        slices = np.array(
+            [
+                (1, -50.0, b"2024-07-24T10:00:00.000000", [0.0, 0.0, -50.0]),
+                (2, -49.0, b"2024-07-24T10:00:00.100000", [0.0, 0.0, -49.0]),
+            ],
+            dtype=dt,
+        )
+        data["provenance"] = {"per_slice_metadata": slices}
+        schema.write(h5file, data)
+        assert "provenance/per_slice_metadata" in h5file
+        ds = h5file["provenance/per_slice_metadata"]
+        assert ds.shape == (2,)
+        assert ds.attrs["description"].startswith("Per-slice DICOM metadata")
+
+    def test_no_provenance_when_absent(self, schema, h5file):
+        data = _minimal_3d_data()
+        schema.write(h5file, data)
+        assert "provenance" not in h5file
+
+    def test_both_provenance_fields(self, schema, h5file):
+        data = _minimal_3d_data()
+        dt = _per_slice_metadata_dtype()
+        slices = np.array(
+            [
+                (1, -50.0, b"2024-07-24T10:00:00.000000", [0.0, 0.0, -50.0]),
+            ],
+            dtype=dt,
+        )
+        data["provenance"] = {
+            "dicom_header": '{"PatientID": "ANON"}',
+            "per_slice_metadata": slices,
+        }
+        schema.write(h5file, data)
+        assert "provenance/dicom_header" in h5file
+        assert "provenance/per_slice_metadata" in h5file
+
+
+# ---------------------------------------------------------------------------
+# json_schema() — optional properties
+# ---------------------------------------------------------------------------
+
+
+class TestJsonSchemaOptionalProperties:
+    def test_has_mips_per_frame_property(self, schema):
+        result = schema.json_schema()
+        assert "mips_per_frame" in result["properties"]
+
+    def test_has_frames_property(self, schema):
+        result = schema.json_schema()
+        assert "frames" in result["properties"]
+
+    def test_has_device_data_property(self, schema):
+        result = schema.json_schema()
+        assert "device_data" in result["properties"]
+
+    def test_has_provenance_property(self, schema):
+        result = schema.json_schema()
+        assert "provenance" in result["properties"]
+
+    def test_optional_properties_not_required(self, schema):
+        result = schema.json_schema()
+        required = result.get("required", [])
+        for prop in ("mips_per_frame", "frames", "device_data", "provenance"):
+            assert prop not in required
+
+
+# ---------------------------------------------------------------------------
 # Entry point registration
 # ---------------------------------------------------------------------------
 

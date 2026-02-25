@@ -3,10 +3,18 @@
 Implements the ``recon`` product schema per white-paper.md § recon.
 Handles 3D/4D/5D float32 volumes with multiscale pyramids, MIP projections,
 dynamic frames, affine transforms, and chunked gzip compression.
+
+Optional features (per white-paper.md § recon):
+- ``mips_per_frame/``: per-frame coronal/sagittal MIPs for 4D+ data
+- ``gate_phase`` and ``gate_trigger/`` sub-groups in ``frames/`` for gated recon
+- ``device_data/``: embedded device streams (ECG, bellows) following NXlog pattern
+- ``provenance/dicom_header``: JSON string from pydicom
+- ``provenance/per_slice_metadata``: compound dataset with per-slice DICOM fields
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import h5py
@@ -39,6 +47,22 @@ class ReconSchema:
                     "type": "object",
                     "description": "Root-level volume dataset (represented as attrs in h5_to_dict)",
                 },
+                "mips_per_frame": {
+                    "type": "object",
+                    "description": "Per-frame MIP projections for dynamic (4D+) data",
+                },
+                "frames": {
+                    "type": "object",
+                    "description": "Frame timing, gating phase, and trigger data for 4D+ volumes",
+                },
+                "device_data": {
+                    "type": "object",
+                    "description": "Embedded device streams (ECG, bellows) following NXlog pattern",
+                },
+                "provenance": {
+                    "type": "object",
+                    "description": "Original file provenance, DICOM header, per-slice metadata",
+                },
             },
             "required": ["_schema_version", "product", "name", "description"],
         }
@@ -65,6 +89,9 @@ class ReconSchema:
         Optional keys:
         - ``frames``: dict with frame timing for 4D+ data
         - ``pyramid``: dict with ``scale_factors`` and ``method``
+        - ``mips_per_frame``: bool — write per-frame MIPs (requires 4D+ volume)
+        - ``device_data``: dict of channel dicts for embedded device signals
+        - ``provenance``: dict with ``dicom_header`` and/or ``per_slice_metadata``
         """
         target.attrs["default"] = "volume"
 
@@ -80,6 +107,15 @@ class ReconSchema:
             self._write_pyramid(target, spatial_vol, data)
 
         self._write_mips(target, spatial_vol)
+
+        if data.get("mips_per_frame") and volume.ndim >= 4:
+            self._write_mips_per_frame(target, volume)
+
+        if "device_data" in data:
+            self._write_device_data(target, data["device_data"])
+
+        if "provenance" in data:
+            self._write_provenance(target, data["provenance"])
 
     # ------------------------------------------------------------------
     # Volume
@@ -145,6 +181,43 @@ class ReconSchema:
             grp.create_dataset("frame_label", data=labels, dtype=dt)
             grp["frame_label"].attrs["description"] = "Human-readable label per frame"
 
+        if "gate_phase" in frames:
+            ds = grp.create_dataset(
+                "gate_phase",
+                data=np.asarray(frames["gate_phase"], dtype=np.float64),
+            )
+            ds.attrs["units"] = "%"
+            ds.attrs["description"] = "Phase within physiological cycle per gate bin"
+
+        if "gate_trigger" in frames:
+            self._write_gate_trigger(grp, frames["gate_trigger"])
+
+    @staticmethod
+    def _write_gate_trigger(
+        frames_grp: h5py.Group,
+        trigger: dict[str, Any],
+    ) -> None:
+        gt_grp = frames_grp.create_group("gate_trigger")
+
+        ds = gt_grp.create_dataset(
+            "signal",
+            data=np.asarray(trigger["signal"], dtype=np.float64),
+        )
+        ds.attrs["description"] = "Raw physiological gating signal"
+
+        sr_grp = gt_grp.create_group("sampling_rate")
+        sr_grp.attrs["value"] = np.float64(trigger["sampling_rate"])
+        sr_grp.attrs["units"] = "Hz"
+        sr_grp.attrs["unitSI"] = np.float64(1.0)
+
+        ds_tt = gt_grp.create_dataset(
+            "trigger_times",
+            data=np.asarray(trigger["trigger_times"], dtype=np.float64),
+        )
+        ds_tt.attrs["units"] = "s"
+        ds_tt.attrs["unitSI"] = np.float64(1.0)
+        ds_tt.attrs["description"] = "Detected trigger timestamps"
+
     # ------------------------------------------------------------------
     # Pyramid
     # ------------------------------------------------------------------
@@ -195,19 +268,129 @@ class ReconSchema:
         target: h5py.File | h5py.Group,
         spatial_vol: np.ndarray,
     ) -> None:
-        # Coronal: project along Y (axis=1) → shape (Z, X)
         mip_cor = spatial_vol.max(axis=1).astype(np.float32)
         ds_cor = target.create_dataset("mip_coronal", data=mip_cor)
         ds_cor.attrs["projection_type"] = "mip"
         ds_cor.attrs["axis"] = np.int64(1)
         ds_cor.attrs["description"] = "Coronal MIP (summed over all frames if dynamic)"
 
-        # Sagittal: project along X (axis=2) → shape (Z, Y)
         mip_sag = spatial_vol.max(axis=2).astype(np.float32)
         ds_sag = target.create_dataset("mip_sagittal", data=mip_sag)
         ds_sag.attrs["projection_type"] = "mip"
         ds_sag.attrs["axis"] = np.int64(2)
         ds_sag.attrs["description"] = "Sagittal MIP (summed over all frames if dynamic)"
+
+    # ------------------------------------------------------------------
+    # Per-frame MIPs (optional, 4D+ only)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_mips_per_frame(
+        target: h5py.File | h5py.Group,
+        volume: np.ndarray,
+    ) -> None:
+        n_frames = volume.shape[0]
+        z, y, x = volume.shape[-3], volume.shape[-2], volume.shape[-1]
+
+        cor_stack = np.empty((n_frames, z, x), dtype=np.float32)
+        sag_stack = np.empty((n_frames, z, y), dtype=np.float32)
+        for i in range(n_frames):
+            frame_3d = volume[i]
+            while frame_3d.ndim > 3:
+                frame_3d = frame_3d.sum(axis=0)
+            cor_stack[i] = frame_3d.max(axis=1).astype(np.float32)
+            sag_stack[i] = frame_3d.max(axis=2).astype(np.float32)
+
+        grp = target.create_group("mips_per_frame")
+
+        ds_cor = grp.create_dataset("coronal", data=cor_stack)
+        ds_cor.attrs["projection_type"] = "mip"
+        ds_cor.attrs["axis"] = np.int64(1)
+        ds_cor.attrs["description"] = "Per-frame coronal MIPs"
+
+        ds_sag = grp.create_dataset("sagittal", data=sag_stack)
+        ds_sag.attrs["projection_type"] = "mip"
+        ds_sag.attrs["axis"] = np.int64(2)
+        ds_sag.attrs["description"] = "Per-frame sagittal MIPs"
+
+    # ------------------------------------------------------------------
+    # Embedded device_data (optional, NXlog pattern)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_device_data(
+        target: h5py.File | h5py.Group,
+        channels: dict[str, dict[str, Any]],
+    ) -> None:
+        dd_grp = target.create_group("device_data")
+        dd_grp.attrs["description"] = "Device signals recorded during this acquisition"
+
+        for name, ch in channels.items():
+            ch_grp = dd_grp.create_group(name)
+            ch_grp.attrs["_type"] = ch.get("_type", name)
+            ch_grp.attrs["_version"] = np.int64(ch.get("_version", 1))
+            ch_grp.attrs["description"] = ch["description"]
+
+            if "model" in ch:
+                ch_grp.attrs["model"] = ch["model"]
+            if "measurement" in ch:
+                ch_grp.attrs["measurement"] = ch["measurement"]
+            if "run_control" in ch:
+                ch_grp.attrs["run_control"] = np.bool_(ch["run_control"])
+
+            sr_grp = ch_grp.create_group("sampling_rate")
+            sr_grp.attrs["value"] = np.float64(ch["sampling_rate"])
+            sr_grp.attrs["units"] = "Hz"
+            sr_grp.attrs["unitSI"] = np.float64(1.0)
+
+            sig_ds = ch_grp.create_dataset(
+                "signal",
+                data=np.asarray(ch["signal"], dtype=np.float64),
+                compression="gzip",
+                compression_opts=_GZIP_LEVEL,
+            )
+            sig_ds.attrs["units"] = ch["units"]
+            sig_ds.attrs["unitSI"] = np.float64(ch["unitSI"])
+
+            time_ds = ch_grp.create_dataset(
+                "time",
+                data=np.asarray(ch["time"], dtype=np.float64),
+                compression="gzip",
+                compression_opts=_GZIP_LEVEL,
+            )
+            time_ds.attrs["units"] = "s"
+            time_ds.attrs["unitSI"] = np.float64(1.0)
+            if "time_start" in ch:
+                time_ds.attrs["start"] = ch["time_start"]
+
+    # ------------------------------------------------------------------
+    # Provenance (optional)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_provenance(
+        target: h5py.File | h5py.Group,
+        provenance: dict[str, Any],
+    ) -> None:
+        prov_grp = target.require_group("provenance")
+
+        if "dicom_header" in provenance:
+            header_json = provenance["dicom_header"]
+            if not isinstance(header_json, str):
+                header_json = json.dumps(header_json)
+            dt = h5py.special_dtype(vlen=str)
+            ds = prov_grp.create_dataset("dicom_header", data=header_json, dtype=dt)
+            ds.attrs["description"] = (
+                "Full DICOM header from representative source file, round-trippable"
+            )
+
+        if "per_slice_metadata" in provenance:
+            arr = provenance["per_slice_metadata"]
+            ds = prov_grp.create_dataset("per_slice_metadata", data=arr)
+            ds.attrs["description"] = (
+                "Per-slice DICOM metadata (instance_number, slice_location, "
+                "acquisition_time, image_position_patient)"
+            )
 
 
 # ---------------------------------------------------------------------------

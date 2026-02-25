@@ -507,8 +507,119 @@ class TestWriteDaq:
 
 
 # ---------------------------------------------------------------------------
-# Entry point registration (manual via register_schema)
+# write() — device_data (optional embedded device signals)
 # ---------------------------------------------------------------------------
+
+
+def _ecg_channel():
+    n = 500
+    return {
+        "_type": "ecg",
+        "_version": 1,
+        "model": "GE CardioLab",
+        "measurement": "voltage",
+        "run_control": True,
+        "description": "ECG trace for cardiac gating",
+        "sampling_rate": 500.0,
+        "signal": np.sin(np.linspace(0, 4 * np.pi, n)),
+        "time": np.linspace(0.0, 1.0, n),
+        "units": "mV",
+        "unitSI": 0.001,
+    }
+
+
+def _bellows_channel():
+    n = 200
+    return {
+        "_type": "bellows",
+        "description": "Respiratory bellows signal",
+        "sampling_rate": 50.0,
+        "signal": np.sin(np.linspace(0, 2 * np.pi, n)),
+        "time": np.linspace(0.0, 4.0, n),
+        "units": "au",
+        "unitSI": 1.0,
+    }
+
+
+class TestWriteDeviceData:
+    def test_device_data_group_created(self, schema, h5file):
+        data = _minimal_data()
+        data["device_data"] = {"ecg": _ecg_channel()}
+        schema.write(h5file, data)
+        assert "device_data" in h5file
+        assert isinstance(h5file["device_data"], h5py.Group)
+        assert h5file["device_data"].attrs["description"] == (
+            "Device signals recorded during this acquisition"
+        )
+
+    def test_ecg_channel_attrs(self, schema, h5file):
+        data = _minimal_data()
+        data["device_data"] = {"ecg": _ecg_channel()}
+        schema.write(h5file, data)
+        ch = h5file["device_data/ecg"]
+        assert ch.attrs["_type"] == "ecg"
+        assert int(ch.attrs["_version"]) == 1
+        assert ch.attrs["model"] == "GE CardioLab"
+        assert ch.attrs["measurement"] == "voltage"
+        assert bool(ch.attrs["run_control"]) is True
+
+    def test_ecg_signal_dataset(self, schema, h5file):
+        data = _minimal_data()
+        ecg = _ecg_channel()
+        data["device_data"] = {"ecg": ecg}
+        schema.write(h5file, data)
+        ds = h5file["device_data/ecg/signal"]
+        np.testing.assert_array_almost_equal(ds[:], ecg["signal"])
+        assert ds.attrs["units"] == "mV"
+        assert ds.attrs["unitSI"] == pytest.approx(0.001)
+
+    def test_ecg_time_dataset(self, schema, h5file):
+        data = _minimal_data()
+        ecg = _ecg_channel()
+        data["device_data"] = {"ecg": ecg}
+        schema.write(h5file, data)
+        ds = h5file["device_data/ecg/time"]
+        np.testing.assert_array_almost_equal(ds[:], ecg["time"])
+        assert ds.attrs["units"] == "s"
+
+    def test_ecg_sampling_rate(self, schema, h5file):
+        data = _minimal_data()
+        data["device_data"] = {"ecg": _ecg_channel()}
+        schema.write(h5file, data)
+        sr = h5file["device_data/ecg/sampling_rate"]
+        assert sr.attrs["value"] == pytest.approx(500.0)
+        assert sr.attrs["units"] == "Hz"
+
+    def test_multiple_channels(self, schema, h5file):
+        data = _minimal_data()
+        data["device_data"] = {
+            "ecg": _ecg_channel(),
+            "bellows": _bellows_channel(),
+        }
+        schema.write(h5file, data)
+        assert "device_data/ecg" in h5file
+        assert "device_data/bellows" in h5file
+
+    def test_no_device_data_when_absent(self, schema, h5file):
+        data = _minimal_data()
+        schema.write(h5file, data)
+        assert "device_data" not in h5file
+
+
+# ---------------------------------------------------------------------------
+# json_schema() — optional properties
+# ---------------------------------------------------------------------------
+
+
+class TestJsonSchemaOptionalProperties:
+    def test_has_device_data_property(self, schema):
+        result = schema.json_schema()
+        assert "device_data" in result["properties"]
+
+    def test_device_data_not_required(self, schema):
+        result = schema.json_schema()
+        required = result.get("required", [])
+        assert "device_data" not in required
 
 
 # ---------------------------------------------------------------------------
