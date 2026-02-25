@@ -230,8 +230,10 @@ class TestJsonSchema:
     def test_has_listmode_specific_properties(self, schema):
         result = schema.json_schema()
         props = result["properties"]
-        for key in ("mode", "table_pos", "duration", "z_min", "z_max"):
+        assert "mode" in props
+        for key in ("table_pos", "duration", "z_min", "z_max"):
             assert key in props, f"{key} missing from json_schema properties"
+            assert props[key]["type"] == "object"
 
     def test_has_metadata_property(self, schema):
         result = schema.json_schema()
@@ -305,22 +307,33 @@ class TestWriteRootAttrs:
         schema.write(h5file, _minimal_data())
         assert h5file.attrs["mode"] == "3d"
 
-    def test_writes_table_pos_attr(self, schema, h5file):
+    def test_writes_table_pos_quantity(self, schema, h5file):
         schema.write(h5file, _minimal_data())
-        assert h5file.attrs["table_pos"] == pytest.approx(150.0)
-        assert h5file.attrs["table_pos"].dtype == np.float64
+        grp = h5file["table_pos"]
+        assert grp.attrs["value"] == pytest.approx(150.0)
+        assert grp.attrs["units"] == "mm"
+        assert grp.attrs["unitSI"] == pytest.approx(0.001)
 
-    def test_writes_duration_attr(self, schema, h5file):
+    def test_writes_duration_quantity(self, schema, h5file):
         schema.write(h5file, _minimal_data())
-        assert h5file.attrs["duration"] == pytest.approx(600.0)
+        grp = h5file["duration"]
+        assert grp.attrs["value"] == pytest.approx(600.0)
+        assert grp.attrs["units"] == "s"
+        assert grp.attrs["unitSI"] == pytest.approx(1.0)
 
-    def test_writes_z_min_attr(self, schema, h5file):
+    def test_writes_z_min_quantity(self, schema, h5file):
         schema.write(h5file, _minimal_data())
-        assert h5file.attrs["z_min"] == pytest.approx(-100.0)
+        grp = h5file["z_min"]
+        assert grp.attrs["value"] == pytest.approx(-100.0)
+        assert grp.attrs["units"] == "mm"
+        assert grp.attrs["unitSI"] == pytest.approx(0.001)
 
-    def test_writes_z_max_attr(self, schema, h5file):
+    def test_writes_z_max_quantity(self, schema, h5file):
         schema.write(h5file, _minimal_data())
-        assert h5file.attrs["z_max"] == pytest.approx(100.0)
+        grp = h5file["z_max"]
+        assert grp.attrs["value"] == pytest.approx(100.0)
+        assert grp.attrs["units"] == "mm"
+        assert grp.attrs["unitSI"] == pytest.approx(0.001)
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +598,7 @@ class TestIntegration:
 
         with h5py.File(h5path, "r") as f:
             assert f.attrs["mode"] == "3d"
-            assert f.attrs["duration"] == pytest.approx(1200.0)
+            assert f["duration"].attrs["value"] == pytest.approx(1200.0)
             assert "raw_data" in f
             assert "singles" in f["raw_data"]
             assert "metadata/daq" in f

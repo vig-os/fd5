@@ -105,6 +105,8 @@ class DeviceDataSchema:
         - ``average_value``, ``minimum_value``, ``maximum_value``
         - ``cue_timestamp_zero``, ``cue_index``
         """
+        target.attrs["default"] = "channels"
+
         target.attrs["device_type"] = data["device_type"]
         target.attrs["device_model"] = data["device_model"]
         target.attrs["recording_start"] = data["recording_start"]

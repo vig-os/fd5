@@ -66,6 +66,8 @@ class ReconSchema:
         - ``frames``: dict with frame timing for 4D+ data
         - ``pyramid``: dict with ``scale_factors`` and ``method``
         """
+        target.attrs["default"] = "volume"
+
         volume = data["volume"]
         self._write_volume(target, volume, data)
 

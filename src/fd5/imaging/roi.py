@@ -63,6 +63,8 @@ class RoiSchema:
         - ``regions``: dict mapping region names to region metadata
         - ``sources``: dict with ``reference_image`` sub-dict
         """
+        target.attrs["default"] = "contours"
+
         if "metadata" in data:
             self._write_metadata(target, data["metadata"])
 

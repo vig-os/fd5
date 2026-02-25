@@ -12,6 +12,8 @@ from typing import Any
 import h5py
 import numpy as np
 
+from fd5.units import write_quantity
+
 _SCHEMA_VERSION = "1.0.0"
 
 _GZIP_LEVEL = 4
@@ -39,10 +41,22 @@ class ListmodeSchema:
                 "description": {"type": "string"},
                 "domain": {"type": "string"},
                 "mode": {"type": "string"},
-                "table_pos": {"type": "number"},
-                "duration": {"type": "number"},
-                "z_min": {"type": "number"},
-                "z_max": {"type": "number"},
+                "table_pos": {
+                    "type": "object",
+                    "description": "Table position with units",
+                },
+                "duration": {
+                    "type": "object",
+                    "description": "Acquisition duration with units",
+                },
+                "z_min": {
+                    "type": "object",
+                    "description": "Axial FOV minimum with units",
+                },
+                "z_max": {
+                    "type": "object",
+                    "description": "Axial FOV maximum with units",
+                },
                 "metadata": {
                     "type": "object",
                     "properties": {
@@ -91,6 +105,8 @@ class ListmodeSchema:
         Optional:
         - ``daq``: dict of DAQ parameters written to ``metadata/daq/``
         """
+        target.attrs["default"] = "raw_data"
+
         self._write_root_attrs(target, data)
 
         if "raw_data" in data:
@@ -112,10 +128,10 @@ class ListmodeSchema:
         data: dict[str, Any],
     ) -> None:
         target.attrs["mode"] = data["mode"]
-        target.attrs["table_pos"] = np.float64(data["table_pos"])
-        target.attrs["duration"] = np.float64(data["duration"])
-        target.attrs["z_min"] = np.float64(data["z_min"])
-        target.attrs["z_max"] = np.float64(data["z_max"])
+        write_quantity(target, "table_pos", np.float64(data["table_pos"]), "mm", 0.001)
+        write_quantity(target, "duration", np.float64(data["duration"]), "s", 1.0)
+        write_quantity(target, "z_min", np.float64(data["z_min"]), "mm", 0.001)
+        write_quantity(target, "z_max", np.float64(data["z_max"]), "mm", 0.001)
 
     # ------------------------------------------------------------------
     # Event data groups (raw_data / proc_data)
