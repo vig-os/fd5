@@ -11,6 +11,7 @@ import h5py
 
 from fd5.hash import verify
 from fd5.manifest import write_manifest
+from fd5.quality import check_descriptions
 from fd5.rocrate import write as write_rocrate
 from fd5.schema import dump_schema, validate
 
@@ -125,7 +126,6 @@ def datacite(directory: str, output: str | None) -> None:
     click.echo(f"Wrote {out_path}")
 
 
-
 @cli.command()
 @click.argument("directory", type=click.Path(exists=True, file_okay=False))
 @click.option(
@@ -142,6 +142,23 @@ def rocrate(directory: str, output: str | None) -> None:
     write_rocrate(dir_path, out_path)
     written = out_path or dir_path / "ro-crate-metadata.json"
     click.echo(f"Wrote {written}")
+
+
+@cli.command("check-descriptions")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+def check_descriptions_cmd(file: str) -> None:
+    """Check description attribute quality for AI-readability."""
+    path = Path(file)
+    warnings = check_descriptions(path)
+
+    if not warnings:
+        click.echo("OK – all descriptions pass quality checks.")
+        return
+
+    for w in warnings:
+        click.echo(f"{w.severity.upper()}: {w.path}: {w.message}", err=True)
+
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
