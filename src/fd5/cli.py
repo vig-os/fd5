@@ -12,6 +12,7 @@ import h5py
 from fd5.hash import verify
 from fd5.manifest import write_manifest
 from fd5.rocrate import write as write_rocrate
+from fd5.quality import check_descriptions
 from fd5.schema import dump_schema, validate
 
 
@@ -199,6 +200,25 @@ def datalad_register(file: str, dataset: str | None) -> None:
     click.echo(f"  title: {metadata.get('title', 'N/A')}")
     click.echo(f"  product: {metadata.get('product', 'N/A')}")
     click.echo(f"  id: {metadata.get('id', 'N/A')}")
+
+
+
+@cli.command("check-descriptions")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+def check_descriptions_cmd(file: str) -> None:
+    """Check description attribute quality for AI-readability."""
+    path = Path(file)
+    warnings = check_descriptions(path)
+
+    if not warnings:
+        click.echo("OK \u2013 all descriptions meet quality standards.")
+        return
+
+    for w in warnings:
+        click.echo(f"  {w.path}: {w.message}", err=True)
+
+    click.echo(f"\n{len(warnings)} warning(s) found.", err=True)
+    sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
