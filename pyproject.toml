@@ -31,8 +31,11 @@ science = [
     "pandas>=2.2",
     "matplotlib>=3.9",
 ]
+nifti = [
+    "nibabel>=5.0",
+]
 all = [
-    "fd5[dev,science]",
+    "fd5[dev,science,nifti]",
 ]
 
 [build-system]
