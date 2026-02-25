@@ -10,12 +10,12 @@ import h5py
 import numpy as np
 import pytest
 
-from fd5.hash import verify
+from fd5.hash import compute_content_hash, verify
 from fd5.registry import register_schema
 
 
 # ---------------------------------------------------------------------------
-# Stub schema
+# Stub schemas
 # ---------------------------------------------------------------------------
 
 
@@ -49,11 +49,45 @@ class _StubSchema:
         return ["product", "name", "timestamp"]
 
 
+class _ChunkedStubSchema:
+    """ProductSchema that creates chunked datasets — exercises inline hashing."""
+
+    product_type: str = "test/chunked"
+    schema_version: str = "1.0.0"
+
+    def json_schema(self) -> dict[str, Any]:
+        return {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "_schema_version": {"type": "integer"},
+                "product": {"type": "string", "const": "test/chunked"},
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+                "timestamp": {"type": "string"},
+            },
+            "required": ["_schema_version", "product", "name"],
+        }
+
+    def required_root_attrs(self) -> dict[str, Any]:
+        return {"product": "test/chunked"}
+
+    def write(self, target: Any, data: Any) -> None:
+        ds = target.create_dataset(
+            "volume", data=data, chunks=(2, 4), compression="gzip"
+        )
+        ds.attrs["units"] = "mm"
+
+    def id_inputs(self) -> list[str]:
+        return ["product", "name", "timestamp"]
+
+
 @pytest.fixture(autouse=True)
 def _register_stub():
     import fd5.registry as reg
 
     register_schema("test/product", _StubSchema())
+    register_schema("test/chunked", _ChunkedStubSchema())
     reg._ep_loaded = True
 
 
@@ -589,6 +623,171 @@ class TestExceptionFileHandleInvalid:
             ) as builder:
                 builder.file.close()
                 raise RuntimeError("after close")
+
+
+# ---------------------------------------------------------------------------
+# Inline chunk hashing — _chunk_hashes stored alongside chunked datasets
+# ---------------------------------------------------------------------------
+
+
+class TestInlineChunkHashing:
+    def test_chunk_hashes_dataset_created(self, out_dir: Path):
+        """Chunked datasets should get a sibling ``_chunk_hashes`` dataset."""
+        data = np.arange(24, dtype=np.float32).reshape(6, 4)
+        with create(
+            out_dir,
+            product="test/chunked",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            assert "volume_chunk_hashes" in f
+
+    def test_chunk_hashes_algorithm_attr(self, out_dir: Path):
+        data = np.arange(24, dtype=np.float32).reshape(6, 4)
+        with create(
+            out_dir,
+            product="test/chunked",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            assert f["volume_chunk_hashes"].attrs["algorithm"] == "sha256"
+
+    def test_chunk_hashes_count_matches_chunks(self, out_dir: Path):
+        """Number of stored digests equals the number of HDF5 chunks."""
+        data = np.arange(24, dtype=np.float32).reshape(6, 4)
+        with create(
+            out_dir,
+            product="test/chunked",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            n_hashes = len(f["volume_chunk_hashes"][...])
+            assert n_hashes == 3  # 6 rows / 2-row chunks
+
+    def test_no_chunk_hashes_for_non_chunked_dataset(self, out_dir: Path):
+        data = np.zeros((4, 4), dtype=np.float32)
+        with create(
+            out_dir,
+            product="test/product",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            assert "volume_chunk_hashes" not in f
+
+    def test_content_hash_verifies_with_chunk_hashes(self, out_dir: Path):
+        data = np.arange(24, dtype=np.float32).reshape(6, 4)
+        with create(
+            out_dir,
+            product="test/chunked",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+
+        final = _find_h5(out_dir)
+        assert verify(final) is True
+
+
+# ---------------------------------------------------------------------------
+# Inline vs second-pass hash identity
+# ---------------------------------------------------------------------------
+
+
+class TestInlineVsSecondPassHashIdentity:
+    """The content_hash must be identical whether computed from the inline
+    data-hash cache or by the standard full-read Merkle tree walk."""
+
+    def test_chunked_dataset_inline_matches_second_pass(self, out_dir: Path):
+        data = np.arange(24, dtype=np.float32).reshape(6, 4)
+        with create(
+            out_dir,
+            product="test/chunked",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            stored = f.attrs["content_hash"]
+            second_pass = compute_content_hash(f, data_hash_cache=None)
+            assert stored == second_pass
+
+    def test_non_chunked_dataset_hash_unchanged(self, out_dir: Path):
+        data = np.zeros((4, 4), dtype=np.float32)
+        with create(
+            out_dir,
+            product="test/product",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            stored = f.attrs["content_hash"]
+            second_pass = compute_content_hash(f, data_hash_cache=None)
+            assert stored == second_pass
+
+    def test_large_chunked_dataset(self, out_dir: Path):
+        """Larger dataset with many chunks to exercise chunk iteration order."""
+        data = np.random.default_rng(42).standard_normal((32, 16), dtype=np.float32)
+        with create(
+            out_dir,
+            product="test/chunked",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            stored = f.attrs["content_hash"]
+            second_pass = compute_content_hash(f, data_hash_cache=None)
+            assert stored == second_pass
+
+    def test_mixed_chunked_and_non_chunked(self, out_dir: Path):
+        """File with both chunked and non-chunked datasets (via extra)."""
+        data = np.arange(24, dtype=np.float32).reshape(6, 4)
+        with create(
+            out_dir,
+            product="test/chunked",
+            name="sample",
+            description="desc",
+            timestamp="2026-02-25T12:00:00Z",
+        ) as builder:
+            builder.write_product(data)
+            builder.write_metadata({"algorithm": "osem"})
+
+        final = _find_h5(out_dir)
+        with h5py.File(final, "r") as f:
+            stored = f.attrs["content_hash"]
+            second_pass = compute_content_hash(f, data_hash_cache=None)
+            assert stored == second_pass
 
 
 # ---------------------------------------------------------------------------
