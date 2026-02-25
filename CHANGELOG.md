@@ -77,6 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **End-to-end integration test** ([#49](https://github.com/vig-os/fd5/issues/49))
   - Full create → validate → info → manifest round-trip test
 
+- **Description quality validation** ([#91](https://github.com/vig-os/fd5/issues/91))
+  - `check_descriptions(path)` validates description attrs for AI-readability
+  - Detects missing, empty, short, placeholder, and duplicate descriptions
+  - `fd5 check-descriptions` CLI command exits non-zero on warnings
+
 ### Fixed
 
 - **CI lint job missing tool dependencies** ([#48](https://github.com/vig-os/fd5/issues/48))
