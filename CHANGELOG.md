@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Raw/numpy array ingest loader** ([#112](https://github.com/vig-os/fd5/issues/112))
+  - `ingest_array()` wraps data dicts into sealed fd5 files for any registered product type
+  - `ingest_binary()` reads raw binary files with specified dtype/shape and records SHA-256 provenance
+  - `RawLoader` class implementing the `Loader` protocol
+  - `Loader` protocol and `hash_source_files()` helper in `fd5.ingest._base`
+
 - **HDF5 dict round-trip helpers** ([#12](https://github.com/vig-os/fd5/issues/12))
   - `dict_to_h5(group, d)` writes nested Python dicts as HDF5 attrs/sub-groups
   - `h5_to_dict(group)` reads HDF5 attrs and sub-groups back to a Python dict
