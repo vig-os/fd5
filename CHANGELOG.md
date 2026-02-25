@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TOML manifest generation and parsing** ([#20](https://github.com/vig-os/fd5/issues/20))
+  - `build_manifest(directory)` scans `.h5` files and extracts root attrs
+  - `write_manifest(directory, output_path)` writes `manifest.toml`
+  - `read_manifest(path)` parses an existing `manifest.toml`
+
 ### Changed
 
 ### Removed
