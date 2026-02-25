@@ -38,6 +38,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/fd5"]
 
+[project.entry-points."fd5.schemas"]
+recon = "fd5.imaging.recon:ReconSchema"
+
 [dependency-groups]
 dev = [
     "hatchling>=1.25",
