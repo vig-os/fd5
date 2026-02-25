@@ -378,3 +378,48 @@ class TestRawLoader:
         assert result.exists()
         with h5py.File(result, "r") as f:
             assert f.attrs["product"] == "recon"
+
+
+class TestFd5Validate:
+    """Smoke tests: fd5.schema.validate() on sealed output."""
+
+    def test_ingest_array_passes_validate(self, tmp_path: Path):
+        from fd5.ingest.raw import ingest_array
+        from fd5.schema import validate
+
+        result = ingest_array(
+            _recon_data(),
+            tmp_path,
+            product="recon",
+            name="validate-array",
+            description="Validate smoke test",
+            timestamp="2025-01-01T00:00:00+00:00",
+        )
+        errors = validate(result)
+        assert errors == [], [e.message for e in errors]
+
+    def test_ingest_binary_passes_validate(self, tmp_path: Path):
+        from fd5.ingest.raw import ingest_binary
+        from fd5.schema import validate
+
+        shape = (8, 16, 16)
+        arr = np.random.default_rng(99).random(shape, dtype=np.float32)
+        bin_path = tmp_path / "volume.bin"
+        arr.tofile(bin_path)
+
+        out_dir = tmp_path / "output"
+        result = ingest_binary(
+            bin_path,
+            out_dir,
+            dtype="float32",
+            shape=shape,
+            product="recon",
+            name="validate-binary",
+            description="Validate smoke test",
+            timestamp="2025-01-01T00:00:00+00:00",
+            affine=np.eye(4, dtype=np.float64),
+            dimension_order="ZYX",
+            reference_frame="LPS",
+        )
+        errors = validate(result)
+        assert errors == [], [e.message for e in errors]

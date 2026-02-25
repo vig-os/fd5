@@ -414,3 +414,19 @@ class TestNibabelImportError:
                 import fd5.ingest.nifti as mod
 
                 importlib.reload(mod)
+
+
+class TestFd5Validate:
+    """Smoke test: fd5.schema.validate() on ingest_nifti output."""
+
+    def test_nifti_passes_validate(self, nifti_3d: Path, tmp_path: Path):
+        from fd5.schema import validate
+
+        result = ingest_nifti(
+            nifti_3d,
+            tmp_path / "out",
+            name="validate-nifti",
+            description="Validate smoke test",
+        )
+        errors = validate(result)
+        assert errors == [], [e.message for e in errors]

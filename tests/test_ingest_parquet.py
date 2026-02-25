@@ -505,3 +505,23 @@ class TestImportGuard:
             "pyarrow" in (mod.__doc__ or "").lower()
             or "parquet" in (mod.__doc__ or "").lower()
         )
+
+
+class TestFd5Validate:
+    """Smoke test: fd5.schema.validate() on ParquetLoader output."""
+
+    def test_spectrum_passes_validate(
+        self, loader: ParquetLoader, spectrum_parquet: Path, tmp_path: Path
+    ):
+        from fd5.schema import validate
+
+        result = loader.ingest(
+            spectrum_parquet,
+            tmp_path / "out",
+            product="spectrum",
+            name="Validate spectrum",
+            description="Validate smoke test",
+            timestamp="2026-02-25T12:00:00+00:00",
+        )
+        errors = validate(result)
+        assert errors == [], [e.message for e in errors]

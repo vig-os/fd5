@@ -506,3 +506,23 @@ class TestGenericProduct:
             assert "counts" in f
             counts = f["counts"][:]
             np.testing.assert_array_almost_equal(counts, [2.0, 5.0])
+
+
+class TestFd5Validate:
+    """Smoke test: fd5.schema.validate() on CsvLoader output."""
+
+    def test_spectrum_passes_validate(
+        self, loader: CsvLoader, spectrum_csv: Path, tmp_path: Path
+    ):
+        from fd5.schema import validate
+
+        result = loader.ingest(
+            spectrum_csv,
+            tmp_path / "out",
+            product="spectrum",
+            name="Validate spectrum",
+            description="Validate smoke test",
+            timestamp="2026-02-25T12:00:00+00:00",
+        )
+        errors = validate(result)
+        assert errors == [], [e.message for e in errors]
