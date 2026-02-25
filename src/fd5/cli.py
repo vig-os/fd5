@@ -125,7 +125,6 @@ def datacite(directory: str, output: str | None) -> None:
     click.echo(f"Wrote {out_path}")
 
 
-
 @cli.command()
 @click.argument("directory", type=click.Path(exists=True, file_okay=False))
 @click.option(
@@ -142,6 +141,29 @@ def rocrate(directory: str, output: str | None) -> None:
     write_rocrate(dir_path, out_path)
     written = out_path or dir_path / "ro-crate-metadata.json"
     click.echo(f"Wrote {written}")
+
+
+@cli.command()
+@click.argument("source", type=click.Path(exists=True, dir_okay=False))
+@click.argument("output", type=click.Path())
+@click.option(
+    "--target",
+    "-t",
+    type=int,
+    required=True,
+    help="Target schema version.",
+)
+def migrate(source: str, output: str, target: int) -> None:
+    """Migrate an fd5 file to a newer schema version (copy-on-write)."""
+    from fd5.migrate import MigrationError
+    from fd5.migrate import migrate as do_migrate
+
+    try:
+        dest = do_migrate(Path(source), Path(output), target_version=target)
+        click.echo(f"Migrated to version {target}: {dest}")
+    except (MigrationError, FileNotFoundError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
