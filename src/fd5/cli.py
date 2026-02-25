@@ -101,6 +101,29 @@ def manifest(directory: str, output: str | None) -> None:
     click.echo(f"Wrote {out_path}")
 
 
+@cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="Output path for datacite.yml (default: <directory>/datacite.yml).",
+)
+def datacite(directory: str, output: str | None) -> None:
+    """Generate datacite.yml from manifest.toml in a directory."""
+    from fd5.datacite import write as datacite_write
+
+    dir_path = Path(directory)
+    manifest_path = dir_path / "manifest.toml"
+    if not manifest_path.is_file():
+        click.echo(f"Error: {manifest_path} not found.", err=True)
+        sys.exit(1)
+    out_path = Path(output) if output else dir_path / "datacite.yml"
+    datacite_write(manifest_path, out_path)
+    click.echo(f"Wrote {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
