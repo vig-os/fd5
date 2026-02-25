@@ -8,20 +8,10 @@ provides a ``register_schema`` escape-hatch for testing.
 from __future__ import annotations
 
 import importlib.metadata
-from typing import Any, Protocol, runtime_checkable
 
+from fd5._types import ProductSchema
 
-@runtime_checkable
-class ProductSchema(Protocol):
-    """Structural interface every product schema must satisfy."""
-
-    product_type: str
-    schema_version: str
-
-    def json_schema(self) -> dict[str, Any]: ...
-    def required_root_attrs(self) -> dict[str, Any]: ...
-    def write(self, target: Any, data: Any) -> None: ...
-    def id_inputs(self) -> list[str]: ...
+__all__ = ["ProductSchema", "get_schema", "list_schemas", "register_schema"]
 
 
 _registry: dict[str, ProductSchema] = {}
