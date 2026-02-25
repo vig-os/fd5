@@ -9,7 +9,12 @@ from typing import Any
 import pytest
 
 from fd5._types import Fd5Path
-from fd5.ingest._base import Loader, discover_loaders, hash_source_files
+from fd5.ingest._base import (
+    Loader,
+    _load_loader_entry_points,
+    discover_loaders,
+    hash_source_files,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +208,54 @@ class TestDiscoverLoaders:
         monkeypatch.setattr(base_mod, "_load_loader_entry_points", _fake_eps)
         result = discover_loaders()
         assert "broken" not in result
+
+    def test_valid_loader_discovered(self, monkeypatch):
+        """A factory returning a valid Loader is included in the result."""
+        import fd5.ingest._base as base_mod
+
+        monkeypatch.setattr(
+            base_mod,
+            "_load_loader_entry_points",
+            lambda: {"good": _ValidLoader},
+        )
+        result = discover_loaders()
+        assert "good" in result
+        assert isinstance(result["good"], Loader)
+
+    def test_non_loader_object_excluded(self, monkeypatch):
+        """If a factory returns something that isn't a Loader, skip it."""
+        import fd5.ingest._base as base_mod
+
+        monkeypatch.setattr(
+            base_mod,
+            "_load_loader_entry_points",
+            lambda: {"bad": lambda: object()},
+        )
+        result = discover_loaders()
+        assert "bad" not in result
+
+
+class TestLoadLoaderEntryPoints:
+    """_load_loader_entry_points reads the fd5.loaders entry-point group."""
+
+    def test_returns_dict(self):
+        result = _load_loader_entry_points()
+        assert isinstance(result, dict)
+
+    def test_loads_entry_point_callables(self, monkeypatch):
+        """Each entry point's .load() result is stored by name."""
+        import importlib.metadata
+        from unittest.mock import MagicMock
+
+        ep = MagicMock()
+        ep.name = "mock_loader"
+        ep.load.return_value = _ValidLoader
+
+        monkeypatch.setattr(
+            importlib.metadata,
+            "entry_points",
+            lambda group: [ep] if group == "fd5.loaders" else [],
+        )
+        result = _load_loader_entry_points()
+        assert "mock_loader" in result
+        assert result["mock_loader"] is _ValidLoader
