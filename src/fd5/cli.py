@@ -225,7 +225,7 @@ def check_descriptions_cmd(file: str) -> None:
 # fd5 ingest — subcommand group
 # ---------------------------------------------------------------------------
 
-_ALL_LOADER_NAMES = ("raw", "csv", "nifti", "dicom")
+_ALL_LOADER_NAMES = ("raw", "csv", "nifti", "dicom", "parquet")
 
 
 def _ingest_binary(
@@ -251,6 +251,13 @@ def _get_dicom_loader():  # type: ignore[no-untyped-def]
     from fd5.ingest.dicom import DicomLoader  # type: ignore[import-not-found]
 
     return DicomLoader()
+
+
+def _get_parquet_loader():  # type: ignore[no-untyped-def]
+    """Lazy-import the ParquetLoader so missing pyarrow is caught at call time."""
+    from fd5.ingest.parquet import ParquetLoader
+
+    return ParquetLoader()
 
 
 @cli.group()
@@ -426,6 +433,59 @@ def ingest_dicom(
             name=name,
             description=description,
             timestamp=timestamp,
+        )
+        click.echo(f"Ingested {Path(source).name} \u2192 {result}")
+    except (ValueError, FileNotFoundError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@ingest.command("parquet")
+@click.argument("source", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--output", "-o", type=click.Path(), required=True, help="Output directory."
+)
+@click.option("--name", required=True, help="Human-readable name.")
+@click.option("--description", required=True, help="Description for AI-readability.")
+@click.option("--product", required=True, help="Product type (e.g. spectrum).")
+@click.option("--timestamp", default=None, help="Override ISO-8601 timestamp.")
+@click.option(
+    "--column-map",
+    default=None,
+    help="JSON string mapping source columns to fd5 columns.",
+)
+def ingest_parquet(
+    source: str,
+    output: str,
+    name: str,
+    description: str,
+    product: str,
+    timestamp: str | None,
+    column_map: str | None,
+) -> None:
+    """Ingest a Parquet file into a sealed fd5 file."""
+    try:
+        loader = _get_parquet_loader()
+    except ImportError:
+        click.echo(
+            "Error: pyarrow is not installed. Install with: pip install 'fd5[parquet]'",
+            err=True,
+        )
+        sys.exit(1)
+
+    parsed_map: dict[str, str] | None = None
+    if column_map is not None:
+        parsed_map = json.loads(column_map)
+
+    try:
+        result = loader.ingest(
+            Path(source),
+            Path(output),
+            product=product,
+            name=name,
+            description=description,
+            timestamp=timestamp,
+            column_map=parsed_map,
         )
         click.echo(f"Ingested {Path(source).name} \u2192 {result}")
     except (ValueError, FileNotFoundError) as exc:

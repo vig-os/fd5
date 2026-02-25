@@ -51,7 +51,7 @@ class TestIngestHelp:
 
     def test_ingest_help_lists_subcommands(self, runner: CliRunner):
         result = runner.invoke(cli, ["ingest", "--help"])
-        for sub in ("raw", "nifti", "csv", "list"):
+        for sub in ("raw", "nifti", "csv", "list", "parquet"):
             assert sub in result.output
 
     def test_ingest_appears_in_main_help(self, runner: CliRunner):
@@ -503,3 +503,170 @@ class TestIngestDicom:
             )
         assert result.exit_code != 0
         assert "pydicom" in result.output.lower() or "install" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# fd5 ingest parquet
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def parquet_file(tmp_path: Path) -> Path:
+    """Create a minimal Parquet file with energy + counts columns."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table({"energy": [1.0, 2.0, 3.0], "counts": [100, 200, 300]})
+    path = tmp_path / "spectrum.parquet"
+    pq.write_table(table, path)
+    return path
+
+
+class TestIngestParquet:
+    def test_exits_zero_with_mock(self, runner: CliRunner, tmp_path: Path):
+        mock_loader = MagicMock()
+        fake_h5 = tmp_path / "out" / "result.h5"
+        (tmp_path / "out").mkdir()
+        fake_h5.touch()
+        mock_loader.ingest.return_value = fake_h5
+
+        pq_file = tmp_path / "data.parquet"
+        pq_file.touch()
+
+        with patch("fd5.cli._get_parquet_loader", return_value=mock_loader):
+            result = runner.invoke(
+                cli,
+                [
+                    "ingest",
+                    "parquet",
+                    str(pq_file),
+                    "--output",
+                    str(tmp_path / "out"),
+                    "--name",
+                    "Gamma spectrum",
+                    "--description",
+                    "HPGe detector measurement",
+                    "--product",
+                    "spectrum",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+
+    def test_prints_confirmation(self, runner: CliRunner, tmp_path: Path):
+        mock_loader = MagicMock()
+        fake_h5 = tmp_path / "out" / "result.h5"
+        (tmp_path / "out").mkdir()
+        fake_h5.touch()
+        mock_loader.ingest.return_value = fake_h5
+
+        pq_file = tmp_path / "data.parquet"
+        pq_file.touch()
+
+        with patch("fd5.cli._get_parquet_loader", return_value=mock_loader):
+            result = runner.invoke(
+                cli,
+                [
+                    "ingest",
+                    "parquet",
+                    str(pq_file),
+                    "--output",
+                    str(tmp_path / "out"),
+                    "--name",
+                    "Test",
+                    "--description",
+                    "desc",
+                    "--product",
+                    "spectrum",
+                ],
+            )
+        assert "ingested" in result.output.lower() or ".h5" in result.output.lower()
+
+    def test_passes_column_map(self, runner: CliRunner, tmp_path: Path):
+        mock_loader = MagicMock()
+        fake_h5 = tmp_path / "out" / "result.h5"
+        (tmp_path / "out").mkdir()
+        fake_h5.touch()
+        mock_loader.ingest.return_value = fake_h5
+
+        pq_file = tmp_path / "data.parquet"
+        pq_file.touch()
+
+        col_map = '{"en": "energy", "ct": "counts"}'
+        with patch("fd5.cli._get_parquet_loader", return_value=mock_loader):
+            result = runner.invoke(
+                cli,
+                [
+                    "ingest",
+                    "parquet",
+                    str(pq_file),
+                    "--output",
+                    str(tmp_path / "out"),
+                    "--name",
+                    "Test",
+                    "--description",
+                    "desc",
+                    "--product",
+                    "spectrum",
+                    "--column-map",
+                    col_map,
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_loader.ingest.call_args
+        assert kwargs["column_map"] == {"en": "energy", "ct": "counts"}
+
+    def test_missing_pyarrow_shows_error(self, runner: CliRunner, tmp_path: Path):
+        pq_file = tmp_path / "data.parquet"
+        pq_file.touch()
+        out = tmp_path / "out"
+        out.mkdir()
+
+        with patch(
+            "fd5.cli._get_parquet_loader",
+            side_effect=ImportError("no pyarrow"),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "ingest",
+                    "parquet",
+                    str(pq_file),
+                    "--output",
+                    str(out),
+                    "--name",
+                    "Test",
+                    "--description",
+                    "desc",
+                    "--product",
+                    "spectrum",
+                ],
+            )
+        assert result.exit_code != 0
+        assert "pyarrow" in result.output.lower() or "install" in result.output.lower()
+
+    def test_nonexistent_source_exits_nonzero(self, runner: CliRunner, tmp_path: Path):
+        result = runner.invoke(
+            cli,
+            [
+                "ingest",
+                "parquet",
+                str(tmp_path / "ghost.parquet"),
+                "--output",
+                str(tmp_path),
+                "--name",
+                "x",
+                "--description",
+                "x",
+                "--product",
+                "spectrum",
+            ],
+        )
+        assert result.exit_code != 0
+
+    def test_ingest_list_shows_parquet(self, runner: CliRunner):
+        with patch(
+            "fd5.cli.discover_loaders",
+            return_value={"parquet": MagicMock()},
+        ):
+            result = runner.invoke(cli, ["ingest", "list"])
+            assert "parquet" in result.output
