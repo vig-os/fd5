@@ -163,12 +163,27 @@ elif command -v docker &>/dev/null; then
 else
     echo "RUNTIME="
 fi
-if (command -v podman &>/dev/null && podman compose version &>/dev/null) || \
-   (command -v docker &>/dev/null && docker compose version &>/dev/null); then
+COMPOSE_VER=""
+if command -v podman &>/dev/null && podman compose version &>/dev/null; then
+    COMPOSE_VER=$(podman compose version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+elif command -v docker &>/dev/null && docker compose version &>/dev/null; then
+    COMPOSE_VER=$(docker compose version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+fi
+if [ -n "$COMPOSE_VER" ]; then
     echo "COMPOSE_AVAILABLE=1"
+    echo "COMPOSE_VERSION=$COMPOSE_VER"
 else
     echo "COMPOSE_AVAILABLE=0"
+    echo "COMPOSE_VERSION="
 fi
+SOCK=""
+if command -v podman &>/dev/null; then
+    SOCK=$(podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null || true)
+    [ -z "$SOCK" ] && [ -S "/run/user/$(id -u)/podman/podman.sock" ] && SOCK="/run/user/$(id -u)/podman/podman.sock"
+elif [ -S "/var/run/docker.sock" ]; then
+    SOCK="/var/run/docker.sock"
+fi
+echo "CONTAINER_SOCKET_PATH=${SOCK:-}"
 if command -v git &>/dev/null; then
     echo "GIT_AVAILABLE=1"
 else
@@ -191,6 +206,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
 else
     echo "OS_TYPE=linux"
 fi
+# Resolve REPO_PATH to an absolute path (expand ~ and relative paths)
+ABS_REPO_PATH=$(cd "$REPO_PATH" 2>/dev/null && pwd || eval echo "$REPO_PATH")
+echo "ABS_REMOTE_PATH=$ABS_REPO_PATH"
 REMOTEEOF
     )
 
@@ -199,13 +217,21 @@ REMOTEEOF
         case "${BASH_REMATCH[1]}" in
             RUNTIME) RUNTIME="${BASH_REMATCH[2]}" ;;
             COMPOSE_AVAILABLE) COMPOSE_AVAILABLE="${BASH_REMATCH[2]}" ;;
+            COMPOSE_VERSION) COMPOSE_VERSION="${BASH_REMATCH[2]}" ;;
+            CONTAINER_SOCKET_PATH) CONTAINER_SOCKET_PATH="${BASH_REMATCH[2]}" ;;
             GIT_AVAILABLE) GIT_AVAILABLE="${BASH_REMATCH[2]}" ;;
             REPO_PATH_EXISTS) REPO_PATH_EXISTS="${BASH_REMATCH[2]}" ;;
             DEVCONTAINER_EXISTS) DEVCONTAINER_EXISTS="${BASH_REMATCH[2]}" ;;
             DISK_AVAILABLE_GB) DISK_AVAILABLE_GB="${BASH_REMATCH[2]}" ;;
             OS_TYPE) OS_TYPE="${BASH_REMATCH[2]}" ;;
+            ABS_REMOTE_PATH) ABS_REMOTE_PATH="${BASH_REMATCH[2]}" ;;
         esac
     done <<< "$preflight_output"
+
+    # Replace REMOTE_PATH with the resolved absolute path from the remote
+    if [[ -n "${ABS_REMOTE_PATH:-}" ]]; then
+        REMOTE_PATH="$ABS_REMOTE_PATH"
+    fi
 
     # Hard errors: runtime and compose are always required
     if [[ -z "${RUNTIME:-}" ]]; then
@@ -218,7 +244,19 @@ REMOTEEOF
         COMPOSE_CMD="docker compose"
     fi
     if [[ "${COMPOSE_AVAILABLE:-0}" != "1" ]]; then
-        log_error "Compose not available on $SSH_HOST. Install docker-compose or podman-compose."
+        log_error "Compose not available on $SSH_HOST. Install docker compose v2 (>= 2.0.0)."
+        exit 1
+    fi
+
+    # Reject docker-compose v1 (1.x.x) — it lacks socket API support and has
+    # incompatible CLI flags. Require v2.0.0+.
+    local compose_major
+    compose_major="${COMPOSE_VERSION%%.*}"
+    if [[ "${compose_major:-0}" -lt 2 ]]; then
+        log_error "docker-compose v${COMPOSE_VERSION} found on $SSH_HOST — this is the legacy v1 release (EOL June 2023)."
+        log_error "Please upgrade to Docker Compose v2 (>= 2.0.0):"
+        log_error "  sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \\"
+        log_error "    -o /usr/local/bin/docker-compose && sudo chmod +x /usr/local/bin/docker-compose"
         exit 1
     fi
 
@@ -276,20 +314,30 @@ remote_init_if_needed() {
 }
 
 remote_compose_up() {
-    local ps_output state health
+    local compose_opts env_prefix ps_output state health
+    compose_opts="-f docker-compose.yml -f docker-compose.project.yaml"
+    env_prefix=""
+    if [[ -n "${CONTAINER_SOCKET_PATH:-}" ]]; then
+        env_prefix="CONTAINER_SOCKET_PATH=$CONTAINER_SOCKET_PATH"
+    fi
+
     # shellcheck disable=SC2029
-    ps_output=$(ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD ps --format json 2>/dev/null" || true)
-    state=$(echo "$ps_output" | grep -o '"State":"[^"]*"' | head -1 | cut -d'"' -f4)
-    health=$(echo "$ps_output" | grep -o '"Health":"[^"]*"' | head -1 | cut -d'"' -f4)
+    ps_output=$(ssh "$SSH_HOST" "cd $REMOTE_PATH/.devcontainer && \
+        [ -f docker-compose.local.yaml ] && CO=\"$compose_opts -f docker-compose.local.yaml\" || CO=\"$compose_opts\"; \
+        $env_prefix $COMPOSE_CMD \$CO ps --format json 2>/dev/null" || true)
+    state=$(echo "$ps_output" | grep -o '"State":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+    health=$(echo "$ps_output" | grep -o '"Health":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
 
     if [[ "$state" == "running" && "${health:-}" == "healthy" ]]; then
         log_success "Devcontainer already running on $SSH_HOST. Opening..."
     else
         log_info "Starting devcontainer on $SSH_HOST..."
         # shellcheck disable=SC2029
-        if ! ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD up -d"; then
+        if ! ssh "$SSH_HOST" "cd $REMOTE_PATH/.devcontainer && \
+            [ -f docker-compose.local.yaml ] && CO=\"$compose_opts -f docker-compose.local.yaml\" || CO=\"$compose_opts\"; \
+            $env_prefix $COMPOSE_CMD \$CO up --detach"; then
             log_error "Failed to start devcontainer on $SSH_HOST."
-            log_error "Run 'ssh $SSH_HOST \"cd $REMOTE_PATH && $COMPOSE_CMD logs\"' for details."
+            log_error "Run 'ssh $SSH_HOST \"cd $REMOTE_PATH/.devcontainer && $COMPOSE_CMD logs\"' for details."
             exit 1
         fi
         sleep 2
@@ -344,6 +392,14 @@ main() {
 
     remote_clone_if_needed
     remote_init_if_needed
+
+    # Ensure git-ignored docker-compose.local.yaml exists on the remote — required
+    # by devcontainer.json but not created by git clone. initialize.sh handles this
+    # for the normal devcontainer flow; we handle it here for the remote path.
+    # shellcheck disable=SC2029
+    ssh "$SSH_HOST" "[ -f $REMOTE_PATH/.devcontainer/docker-compose.local.yaml ] || \
+        echo 'services: {}' > $REMOTE_PATH/.devcontainer/docker-compose.local.yaml"
+
     remote_compose_up
     open_editor
 

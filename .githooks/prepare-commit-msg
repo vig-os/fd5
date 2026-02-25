@@ -1,0 +1,6 @@
+#!/bin/bash
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    sed -i '' '/Co-authored-by:.*[Cc]ursor/d' "$1"
+else
+    sed -i '/Co-authored-by:.*[Cc]ursor/d' "$1"
+fi

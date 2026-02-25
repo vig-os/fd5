@@ -40,7 +40,8 @@
     },
     "containerEnv": {
         "CONTAINER_HOST": "unix:///var/run/docker.sock",
-        "DOCKER_HOST": "unix:///var/run/docker.sock"
+        "DOCKER_HOST": "unix:///var/run/docker.sock",
+        "CURSOR_API_KEY": "${localEnv:CURSOR_API_KEY}"
     },
     "runArgs": [
         "--cap-add=SYS_ADMIN",

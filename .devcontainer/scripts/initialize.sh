@@ -10,6 +10,12 @@ echo "Initializing devcontainer setup..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEVCONTAINER_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Ensure docker-compose.local.yaml exists (git-ignored but required by devcontainer.json)
+if [[ ! -f "$DEVCONTAINER_DIR/docker-compose.local.yaml" ]]; then
+    echo "services: {}" > "$DEVCONTAINER_DIR/docker-compose.local.yaml"
+    echo "Created docker-compose.local.yaml placeholder"
+fi
+
 # Copy host user configuration (git, ssh, gh)
 "$SCRIPT_DIR/copy-host-user-conf.sh"
 
