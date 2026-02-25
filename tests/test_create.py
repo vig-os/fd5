@@ -51,7 +51,10 @@ class _StubSchema:
 
 @pytest.fixture(autouse=True)
 def _register_stub():
+    import fd5.registry as reg
+
     register_schema("test/product", _StubSchema())
+    reg._ep_loaded = True
 
 
 @pytest.fixture()
