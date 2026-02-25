@@ -3,6 +3,9 @@
 Implements the ``listmode`` product schema per white-paper.md § listmode.
 Handles compound datasets for singles/coincidences/time_markers, mode attr,
 table_pos, duration, z_min, z_max, and metadata/daq/ group.
+
+Optional features (per white-paper.md § listmode):
+- ``device_data/``: embedded device streams (ECG, bellows) following NXlog pattern
 """
 
 from __future__ import annotations
@@ -74,6 +77,10 @@ class ListmodeSchema:
                     "type": "object",
                     "description": "Processed event datasets (compound)",
                 },
+                "device_data": {
+                    "type": "object",
+                    "description": "Embedded device streams (ECG, bellows) following NXlog pattern",
+                },
             },
             "required": ["_schema_version", "product", "name", "description"],
         }
@@ -104,6 +111,7 @@ class ListmodeSchema:
 
         Optional:
         - ``daq``: dict of DAQ parameters written to ``metadata/daq/``
+        - ``device_data``: dict of channel dicts for embedded device signals
         """
         target.attrs["default"] = "raw_data"
 
@@ -117,6 +125,9 @@ class ListmodeSchema:
 
         if "daq" in data:
             self._write_daq(target, data["daq"])
+
+        if "device_data" in data:
+            self._write_device_data(target, data["device_data"])
 
     # ------------------------------------------------------------------
     # Root attributes
@@ -174,3 +185,53 @@ class ListmodeSchema:
                 daq_grp.attrs[key] = value
             else:
                 daq_grp.attrs[key] = value
+
+    # ------------------------------------------------------------------
+    # Embedded device_data (optional, NXlog pattern)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_device_data(
+        target: h5py.File | h5py.Group,
+        channels: dict[str, dict[str, Any]],
+    ) -> None:
+        dd_grp = target.create_group("device_data")
+        dd_grp.attrs["description"] = "Device signals recorded during this acquisition"
+
+        for name, ch in channels.items():
+            ch_grp = dd_grp.create_group(name)
+            ch_grp.attrs["_type"] = ch.get("_type", name)
+            ch_grp.attrs["_version"] = np.int64(ch.get("_version", 1))
+            ch_grp.attrs["description"] = ch["description"]
+
+            if "model" in ch:
+                ch_grp.attrs["model"] = ch["model"]
+            if "measurement" in ch:
+                ch_grp.attrs["measurement"] = ch["measurement"]
+            if "run_control" in ch:
+                ch_grp.attrs["run_control"] = np.bool_(ch["run_control"])
+
+            sr_grp = ch_grp.create_group("sampling_rate")
+            sr_grp.attrs["value"] = np.float64(ch["sampling_rate"])
+            sr_grp.attrs["units"] = "Hz"
+            sr_grp.attrs["unitSI"] = np.float64(1.0)
+
+            sig_ds = ch_grp.create_dataset(
+                "signal",
+                data=np.asarray(ch["signal"], dtype=np.float64),
+                compression="gzip",
+                compression_opts=_GZIP_LEVEL,
+            )
+            sig_ds.attrs["units"] = ch["units"]
+            sig_ds.attrs["unitSI"] = np.float64(ch["unitSI"])
+
+            time_ds = ch_grp.create_dataset(
+                "time",
+                data=np.asarray(ch["time"], dtype=np.float64),
+                compression="gzip",
+                compression_opts=_GZIP_LEVEL,
+            )
+            time_ds.attrs["units"] = "s"
+            time_ds.attrs["unitSI"] = np.float64(1.0)
+            if "time_start" in ch:
+                time_ds.attrs["start"] = ch["time_start"]
