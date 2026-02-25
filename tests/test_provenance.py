@@ -68,13 +68,13 @@ class TestWriteSources:
     def test_subgroup_has_external_link(self, h5file):
         src = self._make_source()
         write_sources(h5file, [src])
-        link = h5file["sources"].get("emission", getlink=True)
+        link = h5file["sources/emission"].get("link", getlink=True)
         assert isinstance(link, h5py.ExternalLink)
 
     def test_external_link_uses_relative_path(self, h5file):
         src = self._make_source(file="subdir/some_file.h5")
         write_sources(h5file, [src])
-        link = h5file["sources"].get("emission", getlink=True)
+        link = h5file["sources/emission"].get("link", getlink=True)
         assert link.filename == "subdir/some_file.h5"
         assert link.path == "/"
 
