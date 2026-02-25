@@ -364,6 +364,27 @@ class TestErrors:
 # ---------------------------------------------------------------------------
 
 
+class TestIdempotency:
+    """Calling ingest twice with identical inputs produces two valid, independently sealed files."""
+
+    def test_deterministic(self, nifti_3d: Path, tmp_path: Path):
+        kwargs = dict(
+            name="idem-vol",
+            description="Idempotency test",
+            timestamp="2025-01-15T10:30:00Z",
+        )
+        r1 = ingest_nifti(nifti_3d, tmp_path / "a", **kwargs)
+        r2 = ingest_nifti(nifti_3d, tmp_path / "b", **kwargs)
+
+        assert r1.exists() and r2.exists()
+        assert r1.suffix == ".h5" and r2.suffix == ".h5"
+        with h5py.File(r1, "r") as f1, h5py.File(r2, "r") as f2:
+            assert f1.attrs["id"] == f2.attrs["id"]
+            assert "content_hash" in f1.attrs
+            assert "content_hash" in f2.attrs
+            np.testing.assert_array_equal(f1["volume"][:], f2["volume"][:])
+
+
 class TestNiftiLoaderIngest:
     def test_ingest_method(self, nifti_3d: Path, tmp_path: Path):
         loader = NiftiLoader()
@@ -393,3 +414,19 @@ class TestNibabelImportError:
                 import fd5.ingest.nifti as mod
 
                 importlib.reload(mod)
+
+
+class TestFd5Validate:
+    """Smoke test: fd5.schema.validate() on ingest_nifti output."""
+
+    def test_nifti_passes_validate(self, nifti_3d: Path, tmp_path: Path):
+        from fd5.schema import validate
+
+        result = ingest_nifti(
+            nifti_3d,
+            tmp_path / "out",
+            name="validate-nifti",
+            description="Validate smoke test",
+        )
+        errors = validate(result)
+        assert errors == [], [e.message for e in errors]
