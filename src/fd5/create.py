@@ -8,6 +8,8 @@ See white-paper.md § Immutability and write-once semantics.
 
 from __future__ import annotations
 
+import hashlib
+import itertools
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -18,7 +20,12 @@ import h5py
 import numpy as np
 
 from fd5.h5io import dict_to_h5
-from fd5.hash import compute_content_hash, compute_id
+from fd5.hash import (
+    ChunkHasher,
+    _CHUNK_HASHES_SUFFIX,
+    compute_content_hash,
+    compute_id,
+)
 from fd5.naming import generate_filename
 from fd5.provenance import write_ingest, write_original_files, write_sources
 from fd5.registry import get_schema
@@ -27,6 +34,72 @@ from fd5.schema import embed_schema
 
 class Fd5ValidationError(Exception):
     """Raised when required attributes are missing or empty before sealing."""
+
+
+# ---------------------------------------------------------------------------
+# Hash-tracking wrappers — intercept create_dataset to hash data inline
+# ---------------------------------------------------------------------------
+
+
+class _HashTrackingGroup:
+    """Wraps an ``h5py.Group`` to compute data hashes during ``create_dataset``.
+
+    Cached data hashes (``sha256(data.tobytes())``) and per-chunk digests are
+    stored in *_data_hash_cache* and *_chunk_digest_cache* respectively, keyed
+    by the dataset's absolute HDF5 path.
+    """
+
+    def __init__(
+        self,
+        group: h5py.Group,
+        data_hash_cache: dict[str, str],
+        chunk_digest_cache: dict[str, list[str]],
+    ) -> None:
+        object.__setattr__(self, "_group", group)
+        object.__setattr__(self, "_data_hash_cache", data_hash_cache)
+        object.__setattr__(self, "_chunk_digest_cache", chunk_digest_cache)
+
+    def create_dataset(self, name: str, **kwargs: Any) -> h5py.Dataset:
+        ds = self._group.create_dataset(name, **kwargs)
+        data = kwargs.get("data")
+        if data is not None and ds.chunks is not None:
+            arr = np.asarray(data)
+            self._data_hash_cache[ds.name] = hashlib.sha256(arr.tobytes()).hexdigest()
+
+            hasher = ChunkHasher()
+            chunk_shape = ds.chunks
+            _iter_chunks(arr, chunk_shape, hasher)
+            self._chunk_digest_cache[ds.name] = hasher.digests()
+        return ds
+
+    def create_group(self, name: str) -> "_HashTrackingGroup":
+        grp = self._group.create_group(name)
+        return _HashTrackingGroup(grp, self._data_hash_cache, self._chunk_digest_cache)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._group, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._group, name, value)
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._group
+
+    def __getitem__(self, key: str) -> Any:
+        return self._group[key]
+
+
+def _iter_chunks(
+    arr: np.ndarray, chunk_shape: tuple[int, ...], hasher: ChunkHasher
+) -> None:
+    """Feed *arr* to *hasher* in row-major chunk order matching *chunk_shape*."""
+    ranges = [range(0, s, c) for s, c in zip(arr.shape, chunk_shape)]
+    for starts in itertools.product(*ranges):
+        slices = tuple(
+            slice(st, min(st + cs, sh))
+            for st, cs, sh in zip(starts, chunk_shape, arr.shape)
+        )
+        hasher.update(arr[slices])
 
 
 class Fd5Builder:
@@ -53,6 +126,8 @@ class Fd5Builder:
         self._description = description
         self._timestamp = timestamp
         self._schema = get_schema(product_type)
+        self._data_hash_cache: dict[str, str] = {}
+        self._chunk_digest_cache: dict[str, list[str]] = {}
 
     @property
     def file(self) -> h5py.File:
@@ -115,8 +190,15 @@ class Fd5Builder:
         dict_to_h5(grp, data)
 
     def write_product(self, data: Any) -> None:
-        """Delegate product-specific writes to the registered ProductSchema."""
-        self._schema.write(self._file, data)
+        """Delegate product-specific writes to the registered ProductSchema.
+
+        The schema receives a hash-tracking wrapper so that chunked-dataset
+        data hashes are computed inline during the write.
+        """
+        tracking = _HashTrackingGroup(
+            self._file, self._data_hash_cache, self._chunk_digest_cache
+        )
+        self._schema.write(tracking, data)
 
     # -- sealing -----------------------------------------------------------
 
@@ -131,9 +213,25 @@ class Fd5Builder:
                     f"Required attribute {attr!r} is missing or empty"
                 )
 
+    def _write_chunk_hashes(self) -> None:
+        """Store ``_chunk_hashes`` datasets for every inline-hashed dataset."""
+        dt = h5py.special_dtype(vlen=str)
+        for ds_path, digests in self._chunk_digest_cache.items():
+            parent = self._file[ds_path].parent
+            ds_name = ds_path.rsplit("/", 1)[-1]
+            hashes_name = f"{ds_name}{_CHUNK_HASHES_SUFFIX}"
+            parent.create_dataset(
+                hashes_name,
+                data=np.array(digests, dtype=object),
+                dtype=dt,
+            )
+            parent[hashes_name].attrs["algorithm"] = "sha256"
+
     def _seal(self) -> Path:
         """Embed schema, compute hashes, write id, rename to final path."""
         self._validate()
+
+        self._write_chunk_hashes()
 
         schema_dict = self._schema.json_schema()
         embed_schema(self._file, schema_dict)
@@ -151,7 +249,9 @@ class Fd5Builder:
         self._file.attrs["id"] = file_id
         self._file.attrs["id_inputs"] = id_desc
 
-        content_hash = compute_content_hash(self._file)
+        content_hash = compute_content_hash(
+            self._file, data_hash_cache=self._data_hash_cache or None
+        )
         self._file.attrs["content_hash"] = content_hash
 
         self._file.close()

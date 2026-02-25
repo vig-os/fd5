@@ -135,6 +135,35 @@ def _group_hash(group: h5py.Group) -> str:
     return h.hexdigest()
 
 
+def _dataset_hash_cached(ds: h5py.Dataset, data_hash: str) -> str:
+    """Like :func:`_dataset_hash` but uses a pre-computed *data_hash*."""
+    attrs_h = _sorted_attrs_hash(ds)
+    return hashlib.sha256((attrs_h + data_hash).encode("utf-8")).hexdigest()
+
+
+def _group_hash_cached(group: h5py.Group, cache: dict[str, str]) -> str:
+    """Like :func:`_group_hash` but looks up dataset data hashes in *cache*."""
+    h = hashlib.sha256()
+    h.update(_sorted_attrs_hash(group).encode("utf-8"))
+
+    for key in sorted(group.keys()):
+        if _is_chunk_hashes_dataset(key):
+            continue
+        link = group.get(key, getlink=True)
+        if isinstance(link, h5py.ExternalLink):
+            continue
+        child = group[key]
+        if isinstance(child, h5py.Group):
+            h.update(_group_hash_cached(child, cache).encode("utf-8"))
+        elif isinstance(child, h5py.Dataset):
+            if child.name in cache:
+                h.update(_dataset_hash_cached(child, cache[child.name]).encode("utf-8"))
+            else:
+                h.update(_dataset_hash(child).encode("utf-8"))
+
+    return h.hexdigest()
+
+
 class MerkleTree:
     """Computes the Merkle root hash of an HDF5 file/group.
 
@@ -155,9 +184,22 @@ class MerkleTree:
 # ---------------------------------------------------------------------------
 
 
-def compute_content_hash(root: h5py.File | h5py.Group) -> str:
-    """Return the algorithm-prefixed content hash: ``sha256:<hex>``."""
-    return f"sha256:{MerkleTree(root).root_hash()}"
+def compute_content_hash(
+    root: h5py.File | h5py.Group,
+    data_hash_cache: dict[str, str] | None = None,
+) -> str:
+    """Return the algorithm-prefixed content hash: ``sha256:<hex>``.
+
+    When *data_hash_cache* is provided, datasets whose absolute HDF5 path
+    appears in the mapping use the cached ``sha256(data.tobytes())`` hex
+    digest instead of re-reading the dataset.  Datasets not in the cache
+    fall back to the standard full-read path.
+    """
+    if data_hash_cache:
+        root_h = _group_hash_cached(root, data_hash_cache)
+    else:
+        root_h = _group_hash(root)
+    return f"sha256:{hashlib.sha256(root_h.encode('utf-8')).hexdigest()}"
 
 
 def verify(path: Union[str, Path]) -> bool:
