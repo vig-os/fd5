@@ -353,7 +353,7 @@ Milestone: Phase 2: Recon Schema + CLI
 | #65 | README + CHANGELOG | Merged (PR #66) | — | — |
 | #80 | Coverage config + gaps | Merged (PR #83) | 791 pass | 98% |
 | #81 | Implementation audit | Closed (PR #82) | — | — |
-| #84 | Audit quick-fixes | In progress | — | — |
+| #84 | Audit quick-fixes | Merged (PR #94) | — | — |
 
 ### Phase 3: Medical Imaging Schemas — COMPLETE
 
@@ -383,26 +383,26 @@ Milestone: Phase 4: FAIR Export Layer
 
 CLI commands `fd5 rocrate` and `fd5 datacite` added.
 
-### Phase 5: Ecosystem & Tooling — PLANNED
+### Phase 5: Ecosystem & Tooling — COMPLETE
 
 Epic: #85 | Milestone: Phase 5: Ecosystem & Tooling
 
 | Issue | Feature | Status |
 |-------|---------|--------|
-| #86 | Streaming chunk hashing in create flow | Open |
-| #87 | Schema migration tool (`fd5.migrate`) | Open |
-| #88 | Optional schema features (MIPs, gate, embedded device_data) | Open |
-| #89 | `_types.py` shared types + `SourceRecord` dataclass | Open |
-| #90 | Performance benchmarks | Open |
-| #91 | Description quality validation | Open |
-| #92 | DataLad integration hooks | Open |
+| #86 | Streaming chunk hashing in create flow | Merged (PR #99) |
+| #87 | Schema migration tool (`fd5.migrate`) | Merged (PR #97) |
+| #88 | Optional schema features (MIPs, gate, embedded device_data) | Merged (PR #98) |
+| #89 | `_types.py` shared types + `SourceRecord` dataclass | Merged (PR #95) |
+| #90 | Performance benchmarks | Merged (PR #104) |
+| #91 | Description quality validation | Merged (PR #103) |
+| #92 | DataLad integration hooks | Merged (PR #101) |
 
 ### Overall Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total tests | 791 |
-| Overall coverage | 98% |
-| Modules at 100% | 13 of 23 |
-| Tags | `phase-1-complete`, `phase-2-complete`, `phase-3-complete`, `phase-4-complete` |
-| Audit | #81 (passed, deviations documented) |
+| Total tests | 974 |
+| Overall coverage | 99% |
+| Modules at 100% | 22 of 27 |
+| Tags | `phase-1-complete`, `phase-2-complete`, `phase-3-complete`, `phase-4-complete`, `phase-5-complete` |
+| Audit | #81 (passed, deviations documented and resolved in #84) |
