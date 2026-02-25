@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
 import h5py
 
 from fd5.hash import verify
+from fd5.ingest._base import discover_loaders
 from fd5.manifest import write_manifest
 from fd5.quality import check_descriptions
 from fd5.rocrate import write as write_rocrate
@@ -217,6 +219,218 @@ def check_descriptions_cmd(file: str) -> None:
 
     click.echo(f"\n{len(warnings)} warning(s) found.", err=True)
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# fd5 ingest — subcommand group
+# ---------------------------------------------------------------------------
+
+_ALL_LOADER_NAMES = ("raw", "csv", "nifti", "dicom")
+
+
+def _ingest_binary(
+    binary_path: Path,
+    output_dir: Path,
+    **kwargs: Any,
+) -> Path:
+    """Thin wrapper for lazy import — patchable in tests."""
+    from fd5.ingest.raw import ingest_binary
+
+    return ingest_binary(binary_path, output_dir, **kwargs)
+
+
+def _get_nifti_loader():  # type: ignore[no-untyped-def]
+    """Lazy-import the NiftiLoader so missing nibabel is caught at call time."""
+    from fd5.ingest.nifti import NiftiLoader
+
+    return NiftiLoader()
+
+
+def _get_dicom_loader():  # type: ignore[no-untyped-def]
+    """Lazy-import a DICOM loader (not yet implemented)."""
+    from fd5.ingest.dicom import DicomLoader  # type: ignore[import-not-found]
+
+    return DicomLoader()
+
+
+@cli.group()
+def ingest() -> None:
+    """Ingest external data formats into sealed fd5 files."""
+
+
+@ingest.command("list")
+def ingest_list() -> None:
+    """List available ingest loaders and their dependency status."""
+    available = discover_loaders()
+    click.echo("Available loaders:")
+    for name in _ALL_LOADER_NAMES:
+        if name in available:
+            click.echo(f"  {name:<10} \u2713")
+        else:
+            click.echo(f"  {name:<10} \u2717 (dependency not installed)")
+
+
+@ingest.command("raw")
+@click.argument("source", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--output", "-o", type=click.Path(), required=True, help="Output directory."
+)
+@click.option("--name", required=True, help="Human-readable name.")
+@click.option("--description", required=True, help="Description for AI-readability.")
+@click.option("--product", required=True, help="Product type (e.g. recon).")
+@click.option("--dtype", required=True, help="NumPy dtype (e.g. float32).")
+@click.option("--shape", required=True, help="Comma-separated shape (e.g. 128,128,64).")
+@click.option("--timestamp", default=None, help="Override ISO-8601 timestamp.")
+def ingest_raw(
+    source: str,
+    output: str,
+    name: str,
+    description: str,
+    product: str,
+    dtype: str,
+    shape: str,
+    timestamp: str | None,
+) -> None:
+    """Ingest a raw binary file into a sealed fd5 file."""
+    shape_tuple = tuple(int(s.strip()) for s in shape.split(","))
+    try:
+        result = _ingest_binary(
+            Path(source),
+            Path(output),
+            dtype=dtype,
+            shape=shape_tuple,
+            product=product,
+            name=name,
+            description=description,
+            timestamp=timestamp,
+        )
+        click.echo(f"Ingested {Path(source).name} \u2192 {result}")
+    except (ValueError, FileNotFoundError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@ingest.command("csv")
+@click.argument("source", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--output", "-o", type=click.Path(), required=True, help="Output directory."
+)
+@click.option("--name", required=True, help="Human-readable name.")
+@click.option("--description", required=True, help="Description for AI-readability.")
+@click.option("--product", required=True, help="Product type (e.g. spectrum).")
+@click.option("--delimiter", default=",", help="Column delimiter (default: comma).")
+@click.option("--timestamp", default=None, help="Override ISO-8601 timestamp.")
+def ingest_csv(
+    source: str,
+    output: str,
+    name: str,
+    description: str,
+    product: str,
+    delimiter: str,
+    timestamp: str | None,
+) -> None:
+    """Ingest a CSV/TSV file into a sealed fd5 file."""
+    from fd5.ingest.csv import CsvLoader
+
+    loader = CsvLoader()
+    try:
+        result = loader.ingest(
+            Path(source),
+            Path(output),
+            product=product,
+            name=name,
+            description=description,
+            timestamp=timestamp,
+            delimiter=delimiter,
+        )
+        click.echo(f"Ingested {Path(source).name} \u2192 {result}")
+    except (ValueError, FileNotFoundError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@ingest.command("nifti")
+@click.argument("source", type=click.Path(exists=True))
+@click.option(
+    "--output", "-o", type=click.Path(), required=True, help="Output directory."
+)
+@click.option("--name", required=True, help="Human-readable name.")
+@click.option("--description", required=True, help="Description for AI-readability.")
+@click.option("--product", default="recon", help="Product type (default: recon).")
+@click.option("--timestamp", default=None, help="Override ISO-8601 timestamp.")
+def ingest_nifti(
+    source: str,
+    output: str,
+    name: str,
+    description: str,
+    product: str,
+    timestamp: str | None,
+) -> None:
+    """Ingest a NIfTI file (.nii / .nii.gz) into a sealed fd5 file."""
+    try:
+        loader = _get_nifti_loader()
+    except ImportError:
+        click.echo(
+            "Error: nibabel is not installed. Install with: pip install 'fd5[nifti]'",
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        result = loader.ingest(
+            Path(source),
+            Path(output),
+            product=product,
+            name=name,
+            description=description,
+            timestamp=timestamp,
+        )
+        click.echo(f"Ingested {Path(source).name} \u2192 {result}")
+    except (ValueError, FileNotFoundError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@ingest.command("dicom")
+@click.argument("source", type=click.Path(exists=True))
+@click.option(
+    "--output", "-o", type=click.Path(), required=True, help="Output directory."
+)
+@click.option("--name", required=True, help="Human-readable name.")
+@click.option("--description", required=True, help="Description for AI-readability.")
+@click.option("--product", default="recon", help="Product type (default: recon).")
+@click.option("--timestamp", default=None, help="Override ISO-8601 timestamp.")
+def ingest_dicom(
+    source: str,
+    output: str,
+    name: str,
+    description: str,
+    product: str,
+    timestamp: str | None,
+) -> None:
+    """Ingest a DICOM series directory into a sealed fd5 file."""
+    try:
+        loader = _get_dicom_loader()
+    except ImportError:
+        click.echo(
+            "Error: pydicom is not installed. Install with: pip install 'fd5[dicom]'",
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        result = loader.ingest(
+            Path(source),
+            Path(output),
+            product=product,
+            name=name,
+            description=description,
+            timestamp=timestamp,
+        )
+        click.echo(f"Ingested {Path(source).name} \u2192 {result}")
+    except (ValueError, FileNotFoundError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
