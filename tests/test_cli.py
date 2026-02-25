@@ -295,6 +295,44 @@ class TestManifestCommand:
 
 
 # ---------------------------------------------------------------------------
+# fd5 rocrate
+# ---------------------------------------------------------------------------
+
+
+class TestRocrateCommand:
+    def test_exits_zero(self, runner: CliRunner, data_dir: Path):
+        result = runner.invoke(cli, ["rocrate", str(data_dir)])
+        assert result.exit_code == 0
+
+    def test_creates_rocrate_file(self, runner: CliRunner, data_dir: Path):
+        runner.invoke(cli, ["rocrate", str(data_dir)])
+        assert (data_dir / "ro-crate-metadata.json").exists()
+
+    def test_output_is_valid_json(self, runner: CliRunner, data_dir: Path):
+        runner.invoke(cli, ["rocrate", str(data_dir)])
+        content = (data_dir / "ro-crate-metadata.json").read_text()
+        parsed = json.loads(content)
+        assert "@context" in parsed
+
+    def test_custom_output_path(
+        self, runner: CliRunner, data_dir: Path, tmp_path: Path
+    ):
+        out = tmp_path / "custom" / "crate.json"
+        result = runner.invoke(cli, ["rocrate", str(data_dir), "--output", str(out)])
+        assert result.exit_code == 0
+        assert out.exists()
+
+    def test_nonexistent_dir_exits_nonzero(self, runner: CliRunner, tmp_path: Path):
+        result = runner.invoke(cli, ["rocrate", str(tmp_path / "nope")])
+        assert result.exit_code != 0
+
+    def test_empty_dir(self, runner: CliRunner, tmp_path: Path):
+        result = runner.invoke(cli, ["rocrate", str(tmp_path)])
+        assert result.exit_code == 0
+        assert (tmp_path / "ro-crate-metadata.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # fd5 --help
 # ---------------------------------------------------------------------------
 
@@ -306,5 +344,5 @@ class TestHelp:
 
     def test_help_lists_commands(self, runner: CliRunner):
         result = runner.invoke(cli, ["--help"])
-        for cmd in ("validate", "info", "schema-dump", "manifest"):
+        for cmd in ("validate", "info", "schema-dump", "manifest", "rocrate"):
             assert cmd in result.output

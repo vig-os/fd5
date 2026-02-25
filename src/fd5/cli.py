@@ -11,6 +11,7 @@ import h5py
 
 from fd5.hash import verify
 from fd5.manifest import write_manifest
+from fd5.rocrate import write as write_rocrate
 from fd5.schema import dump_schema, validate
 
 
@@ -99,6 +100,24 @@ def manifest(directory: str, output: str | None) -> None:
     out_path = Path(output) if output else dir_path / "manifest.toml"
     write_manifest(dir_path, out_path)
     click.echo(f"Wrote {out_path}")
+
+
+@cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--output",
+    "-o",
+    type=click.Path(),
+    default=None,
+    help="Output path for ro-crate-metadata.json (default: <directory>/ro-crate-metadata.json).",
+)
+def rocrate(directory: str, output: str | None) -> None:
+    """Generate ro-crate-metadata.json from fd5 files in a directory."""
+    dir_path = Path(directory)
+    out_path = Path(output) if output else None
+    write_rocrate(dir_path, out_path)
+    written = out_path or dir_path / "ro-crate-metadata.json"
+    click.echo(f"Wrote {written}")
 
 
 # ---------------------------------------------------------------------------
