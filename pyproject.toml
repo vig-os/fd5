@@ -31,11 +31,17 @@ science = [
     "pandas>=2.2",
     "matplotlib>=3.9",
 ]
+dicom = [
+    "pydicom>=2.4",
+]
 nifti = [
     "nibabel>=5.0",
 ]
+parquet = [
+    "pyarrow>=14.0",
+]
 all = [
-    "fd5[dev,science,nifti]",
+    "fd5[dev,science,dicom,nifti,parquet]",
 ]
 
 [build-system]
