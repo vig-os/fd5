@@ -48,12 +48,14 @@ class TestProductSchemaProtocol:
     def test_protocol_has_required_members(self):
         import inspect
 
-        members = {
+        methods = {
             name
             for name, _ in inspect.getmembers(ProductSchema)
             if not name.startswith("_")
         }
-        assert members >= {
+        annotations = set(ProductSchema.__protocol_attrs__)
+        all_members = methods | annotations
+        assert all_members >= {
             "product_type",
             "schema_version",
             "json_schema",
