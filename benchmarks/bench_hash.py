@@ -10,10 +10,9 @@ from typing import Any
 
 import h5py
 import numpy as np
-
 from fd5.hash import compute_content_hash
 
-SIZES_MB = [1, 10, 100]
+SIZES_MB = [1, 10, 100, 1000]
 REPEATS = 5
 FLOAT32_BYTES = 4
 

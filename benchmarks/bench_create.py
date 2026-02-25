@@ -10,11 +10,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from fd5.create import create
 from fd5.registry import register_schema
 
-SIZES_MB = [1, 10, 100]
+SIZES_MB = [1, 10, 100, 1000]
 REPEATS = 3
 FLOAT32_BYTES = 4
 
