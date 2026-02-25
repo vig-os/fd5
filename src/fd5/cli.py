@@ -166,6 +166,41 @@ def migrate(source: str, output: str, target: int) -> None:
         sys.exit(1)
 
 
+
+@cli.command("datalad-register")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--dataset",
+    "-d",
+    type=click.Path(exists=True, file_okay=False),
+    default=None,
+    help="Path to the DataLad dataset (default: parent directory of FILE).",
+)
+def datalad_register(file: str, dataset: str | None) -> None:
+    """Register an fd5 file with a DataLad dataset."""
+    from fd5.datalad import extract_metadata, register_with_datalad
+
+    path = Path(file)
+
+    try:
+        result = register_with_datalad(path, dataset)
+    except ImportError:
+        click.echo(
+            "Error: datalad is not installed. Install it with: pip install datalad",
+            err=True,
+        )
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(f"Error: {exc}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Registered {path.name} with dataset {result['dataset']}")
+    metadata = extract_metadata(path)
+    click.echo(f"  title: {metadata.get('title', 'N/A')}")
+    click.echo(f"  product: {metadata.get('product', 'N/A')}")
+    click.echo(f"  id: {metadata.get('id', 'N/A')}")
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
