@@ -282,6 +282,58 @@ class TestIngestBinary:
             )
 
 
+class TestIdempotency:
+    """Calling ingest twice with identical inputs produces two valid, independently sealed files."""
+
+    def test_ingest_array_deterministic(self, tmp_path: Path):
+        from fd5.ingest.raw import ingest_array
+
+        kwargs = dict(
+            product="recon",
+            name="idem-recon",
+            description="Idempotency test",
+            timestamp="2025-01-01T00:00:00+00:00",
+        )
+        r1 = ingest_array(_recon_data(), tmp_path / "a", **kwargs)
+        r2 = ingest_array(_recon_data(), tmp_path / "b", **kwargs)
+
+        assert r1.exists() and r2.exists()
+        assert r1.suffix == ".h5" and r2.suffix == ".h5"
+        with h5py.File(r1, "r") as f1, h5py.File(r2, "r") as f2:
+            assert f1.attrs["id"] == f2.attrs["id"]
+            assert f1.attrs["content_hash"] == f2.attrs["content_hash"]
+
+    def test_ingest_binary_produces_two_valid_sealed_files(self, tmp_path: Path):
+        from fd5.ingest.raw import ingest_binary
+
+        shape = (4, 8, 8)
+        arr = np.ones(shape, dtype=np.float32)
+        bin_path = tmp_path / "data.bin"
+        arr.tofile(bin_path)
+
+        common = dict(
+            dtype="float32",
+            shape=shape,
+            product="recon",
+            name="idem-binary",
+            description="Idempotency test",
+            timestamp="2025-01-01T00:00:00+00:00",
+            affine=np.eye(4, dtype=np.float64),
+            dimension_order="ZYX",
+            reference_frame="LPS",
+        )
+        r1 = ingest_binary(bin_path, tmp_path / "a", **common)
+        r2 = ingest_binary(bin_path, tmp_path / "b", **common)
+
+        assert r1.exists() and r2.exists()
+        assert r1.suffix == ".h5" and r2.suffix == ".h5"
+        with h5py.File(r1, "r") as f1, h5py.File(r2, "r") as f2:
+            assert f1.attrs["id"] == f2.attrs["id"]
+            assert "content_hash" in f1.attrs
+            assert "content_hash" in f2.attrs
+            np.testing.assert_array_equal(f1["volume"][:], f2["volume"][:])
+
+
 class TestRawLoader:
     """Tests for RawLoader protocol conformance."""
 

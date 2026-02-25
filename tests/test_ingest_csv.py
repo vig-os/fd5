@@ -463,6 +463,30 @@ class TestEdgeCases:
 # ---------------------------------------------------------------------------
 
 
+class TestIdempotency:
+    """Calling ingest twice with identical inputs produces two valid, independently sealed files."""
+
+    def test_deterministic(
+        self, loader: CsvLoader, spectrum_csv: Path, tmp_path: Path
+    ):
+        kwargs = dict(
+            product="spectrum",
+            name="idem-spectrum",
+            description="Idempotency test",
+            timestamp="2026-02-25T12:00:00+00:00",
+        )
+        r1 = loader.ingest(spectrum_csv, tmp_path / "a", **kwargs)
+        r2 = loader.ingest(spectrum_csv, tmp_path / "b", **kwargs)
+
+        assert r1.exists() and r2.exists()
+        assert r1.suffix == ".h5" and r2.suffix == ".h5"
+        with h5py.File(r1, "r") as f1, h5py.File(r2, "r") as f2:
+            assert f1.attrs["id"] == f2.attrs["id"]
+            assert "content_hash" in f1.attrs
+            assert "content_hash" in f2.attrs
+            np.testing.assert_array_equal(f1["counts"][:], f2["counts"][:])
+
+
 class TestGenericProduct:
     """Generic product: user specifies product type + column mapping."""
 

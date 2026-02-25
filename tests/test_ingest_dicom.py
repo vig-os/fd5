@@ -500,6 +500,30 @@ class TestFd5Validate:
 # ---------------------------------------------------------------------------
 
 
+class TestIdempotency:
+    """Calling ingest twice with identical inputs produces two valid, independently sealed files."""
+
+    def test_deterministic(self, tmp_path):
+        from fd5.ingest.dicom import ingest_dicom
+
+        dicom_dir = _make_dicom_series(tmp_path)
+        kwargs = dict(
+            name="idem-ct",
+            description="Idempotency test",
+            timestamp="2024-06-15T08:00:00",
+        )
+        r1 = ingest_dicom(dicom_dir, tmp_path / "a", **kwargs)
+        r2 = ingest_dicom(dicom_dir, tmp_path / "b", **kwargs)
+
+        assert r1.exists() and r2.exists()
+        assert r1.suffix == ".h5" and r2.suffix == ".h5"
+        with h5py.File(r1, "r") as f1, h5py.File(r2, "r") as f2:
+            assert f1.attrs["id"] == f2.attrs["id"]
+            assert "content_hash" in f1.attrs
+            assert "content_hash" in f2.attrs
+            np.testing.assert_array_equal(f1["volume"][:], f2["volume"][:])
+
+
 class TestDicomLoaderIngest:
     def test_loader_ingest_produces_file(self, tmp_path):
         from fd5.ingest.dicom import DicomLoader
