@@ -83,6 +83,8 @@ class SinogramSchema:
         - ``additive_correction``: numpy array (same shape as sinogram)
         - ``multiplicative_correction``: numpy array (same shape as sinogram)
         """
+        target.attrs["default"] = "sinogram"
+
         self._write_root_attrs(target, data)
         self._write_sinogram(target, data["sinogram"])
         self._write_metadata(target, data)

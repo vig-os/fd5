@@ -66,6 +66,8 @@ class SimSchema:
         - ``simulation``: dict with simulation parameters (written to
           ``metadata/simulation/``)
         """
+        target.attrs["default"] = "phantom"
+
         self._write_ground_truth(target, data["ground_truth"])
 
         if "events" in data:

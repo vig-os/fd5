@@ -565,6 +565,7 @@ dependencies = [
     { name = "h5py" },
     { name = "jsonschema" },
     { name = "numpy" },
+    { name = "pyyaml" },
     { name = "tomli-w" },
 ]
 
@@ -621,6 +622,7 @@ requires-dist = [
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "scipy", marker = "extra == 'science'", specifier = ">=1.14" },
     { name = "tomli-w", specifier = ">=1.0" },
 ]
