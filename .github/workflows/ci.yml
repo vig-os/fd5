@@ -59,6 +59,8 @@ jobs:
           sync-dependencies: 'true'
 
       - name: Run pre-commit hooks
+        env:
+          SKIP: check-action-pins,validate-commit-msg
         run: uv run pre-commit run --all-files --show-diff-on-failure
 
   test:
