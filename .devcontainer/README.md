@@ -71,6 +71,33 @@ Paths to other mounts can be absolute or relative to the main project folder.
    projects you want to see in the editor. The file is git-ignored, so your personal
    configuration stays local.
 
+## Tailscale SSH
+
+The devcontainer supports opt-in Tailscale SSH for direct mesh access — useful when
+the IDE's devcontainer protocol doesn't support agent shell execution (e.g. Cursor GUI).
+
+**Quick start:**
+
+1. Generate a Tailscale auth key (Reusable + Ephemeral) at https://login.tailscale.com/admin/settings/keys
+2. Add to `.devcontainer/docker-compose.local.yaml`:
+
+   ```yaml
+   services:
+     devcontainer:
+       environment:
+         - TAILSCALE_AUTHKEY=tskey-auth-XXXX
+         - TAILSCALE_HOSTNAME=fd5-devc-mybox  # optional
+   ```
+
+3. Rebuild the devcontainer. Tailscale installs on first create and connects on every start.
+4. Connect: `ssh root@<hostname>`
+
+When `TAILSCALE_AUTHKEY` is unset, the Tailscale scripts are a no-op — zero impact on
+normal devcontainer usage.
+
+For full details (architecture decisions, ACL config, git signing workarounds, upstream
+considerations), see [docs/tailscale-devcontainer.md](../docs/tailscale-devcontainer.md).
+
 ## Updating the template
 
 If you synchronize with a newer release of the vigOS devcontainer image,
