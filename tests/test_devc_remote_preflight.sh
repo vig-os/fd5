@@ -193,7 +193,7 @@ DEVCONTAINER_EXISTS=1
 DISK_AVAILABLE_GB=42
 OS_TYPE=linux
 CONTAINER_RUNNING=0
-SSH_AUTH_SOCK_FORWARDED=1"
+SSH_AGENT_FWD=1"
 
 MOCK_CONTAINER_RUNNING="RUNTIME=docker
 RUNTIME_VERSION=25.0.3
@@ -205,7 +205,7 @@ DEVCONTAINER_EXISTS=1
 DISK_AVAILABLE_GB=42
 OS_TYPE=linux
 CONTAINER_RUNNING=1
-SSH_AUTH_SOCK_FORWARDED=1"
+SSH_AGENT_FWD=1"
 
 MOCK_NO_RUNTIME="RUNTIME=
 RUNTIME_VERSION=
@@ -217,7 +217,7 @@ DEVCONTAINER_EXISTS=0
 DISK_AVAILABLE_GB=10
 OS_TYPE=linux
 CONTAINER_RUNNING=0
-SSH_AUTH_SOCK_FORWARDED=0"
+SSH_AGENT_FWD=0"
 
 MOCK_NO_SSH_AGENT="RUNTIME=podman
 RUNTIME_VERSION=4.9.3
@@ -229,7 +229,7 @@ DEVCONTAINER_EXISTS=1
 DISK_AVAILABLE_GB=42
 OS_TYPE=linux
 CONTAINER_RUNNING=0
-SSH_AUTH_SOCK_FORWARDED=0"
+SSH_AGENT_FWD=0"
 
 MOCK_LOW_DISK="RUNTIME=docker
 RUNTIME_VERSION=25.0.3
@@ -241,7 +241,7 @@ DEVCONTAINER_EXISTS=1
 DISK_AVAILABLE_GB=1
 OS_TYPE=linux
 CONTAINER_RUNNING=0
-SSH_AUTH_SOCK_FORWARDED=1"
+SSH_AGENT_FWD=1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST: Happy path — each check prints a status line
@@ -255,7 +255,7 @@ test_happy_path_prints_status_lines() {
     assert_contains "runtime version shown" "$output" "4.9.3"
     assert_contains "compose version shown" "$output" "2.24.5"
     assert_contains "no container running" "$output" "No existing container"
-    assert_contains "ssh agent OK" "$output" "SSH agent"
+    assert_contains "ssh agent OK" "$output" "SSH agent forwarding: working"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -286,7 +286,7 @@ test_no_ssh_agent_warns() {
     local output
     output=$(run_preflight "$MOCK_NO_SSH_AGENT") || true
 
-    assert_contains "ssh agent warning" "$output" "SSH agent"
+    assert_contains "ssh agent warning" "$output" "SSH agent forwarding: not available"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
