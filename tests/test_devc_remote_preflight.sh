@@ -97,6 +97,89 @@ run_preflight() {
     return $rc
 }
 
+# Helper: build a temp script that tests parse_args and globals set by it
+build_parse_args_script() {
+    local args="$1"
+    local tmpscript tmpsrc
+    tmpscript=$(mktemp "${TMPDIR:-/tmp}/devc_test.XXXXXX")
+    tmpsrc=$(mktemp "${TMPDIR:-/tmp}/devc_src.XXXXXX")
+
+    sed 's/^main "\$@"$/# main disabled/' "$DEVC_SCRIPT" > "$tmpsrc"
+    TMPFILES+=("$tmpsrc")
+
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'set -euo pipefail'
+        echo "source \"$tmpsrc\""
+        echo "git() { echo /fake/repo; }"
+        echo "parse_args $args"
+        # shellcheck disable=SC2016
+        echo 'echo "YES_MODE=${YES_MODE:-0}"'
+        # shellcheck disable=SC2016
+        echo 'echo "SSH_HOST=${SSH_HOST:-}"'
+        # shellcheck disable=SC2016
+        echo 'echo "REMOTE_PATH=${REMOTE_PATH:-}"'
+        # shellcheck disable=SC2016
+        echo 'echo "PATH_AUTO_DERIVED=${PATH_AUTO_DERIVED:-0}"'
+        # shellcheck disable=SC2016
+        echo 'echo "REPO_URL_SOURCE=${REPO_URL_SOURCE:-}"'
+    } > "$tmpscript"
+
+    echo "$tmpscript"
+}
+
+run_parse_args() {
+    local args="$1"
+    local tmpscript
+    tmpscript=$(build_parse_args_script "$args")
+    TMPFILES+=("$tmpscript")
+    local output rc=0
+    output=$(bash "$tmpscript" 2>&1) || rc=$?
+    echo "$output"
+    return $rc
+}
+
+# Helper: build a script that tests check_existing_container
+build_container_check_script() {
+    local mock_data="$1" yes_mode="${2:-0}"
+    local tmpscript tmpsrc
+    tmpscript=$(mktemp "${TMPDIR:-/tmp}/devc_test.XXXXXX")
+    tmpsrc=$(mktemp "${TMPDIR:-/tmp}/devc_src.XXXXXX")
+
+    sed 's/^main "\$@"$/# main disabled/' "$DEVC_SCRIPT" > "$tmpsrc"
+    TMPFILES+=("$tmpsrc")
+
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'set -euo pipefail'
+        echo "source \"$tmpsrc\""
+        echo 'ssh() {'
+        echo "    cat <<'MOCKEOF'"
+        echo "$mock_data"
+        echo 'MOCKEOF'
+        echo '}'
+        echo "YES_MODE=$yes_mode"
+        echo 'SSH_HOST="testhost"'
+        echo 'REMOTE_PATH="/home/user/repo"'
+        echo 'COMPOSE_CMD="podman compose"'
+        echo 'CONTAINER_RUNNING=1'
+        echo 'check_existing_container'
+    } > "$tmpscript"
+
+    echo "$tmpscript"
+}
+
+run_container_check() {
+    local mock_data="$1" yes_mode="${2:-0}"
+    local tmpscript
+    tmpscript=$(build_container_check_script "$mock_data" "$yes_mode")
+    TMPFILES+=("$tmpscript")
+    local output rc=0
+    output=$(bash "$tmpscript" 2>&1) || rc=$?
+    echo "$output"
+    return $rc
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Mock data sets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,7 +193,7 @@ DEVCONTAINER_EXISTS=1
 DISK_AVAILABLE_GB=42
 OS_TYPE=linux
 CONTAINER_RUNNING=0
-SSH_AUTH_SOCK_FORWARDED=1"
+SSH_AGENT_FWD=1"
 
 MOCK_CONTAINER_RUNNING="RUNTIME=docker
 RUNTIME_VERSION=25.0.3
@@ -122,7 +205,7 @@ DEVCONTAINER_EXISTS=1
 DISK_AVAILABLE_GB=42
 OS_TYPE=linux
 CONTAINER_RUNNING=1
-SSH_AUTH_SOCK_FORWARDED=1"
+SSH_AGENT_FWD=1"
 
 MOCK_NO_RUNTIME="RUNTIME=
 RUNTIME_VERSION=
@@ -134,7 +217,7 @@ DEVCONTAINER_EXISTS=0
 DISK_AVAILABLE_GB=10
 OS_TYPE=linux
 CONTAINER_RUNNING=0
-SSH_AUTH_SOCK_FORWARDED=0"
+SSH_AGENT_FWD=0"
 
 MOCK_NO_SSH_AGENT="RUNTIME=podman
 RUNTIME_VERSION=4.9.3
@@ -146,7 +229,7 @@ DEVCONTAINER_EXISTS=1
 DISK_AVAILABLE_GB=42
 OS_TYPE=linux
 CONTAINER_RUNNING=0
-SSH_AUTH_SOCK_FORWARDED=0"
+SSH_AGENT_FWD=0"
 
 MOCK_LOW_DISK="RUNTIME=docker
 RUNTIME_VERSION=25.0.3
@@ -158,7 +241,7 @@ DEVCONTAINER_EXISTS=1
 DISK_AVAILABLE_GB=1
 OS_TYPE=linux
 CONTAINER_RUNNING=0
-SSH_AUTH_SOCK_FORWARDED=1"
+SSH_AGENT_FWD=1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST: Happy path — each check prints a status line
@@ -172,7 +255,7 @@ test_happy_path_prints_status_lines() {
     assert_contains "runtime version shown" "$output" "4.9.3"
     assert_contains "compose version shown" "$output" "2.24.5"
     assert_contains "no container running" "$output" "No existing container"
-    assert_contains "ssh agent OK" "$output" "SSH agent"
+    assert_contains "ssh agent OK" "$output" "SSH agent forwarding: working"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,7 +286,7 @@ test_no_ssh_agent_warns() {
     local output
     output=$(run_preflight "$MOCK_NO_SSH_AGENT") || true
 
-    assert_contains "ssh agent warning" "$output" "SSH agent"
+    assert_contains "ssh agent warning" "$output" "SSH agent forwarding: not available"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +313,143 @@ test_low_disk_warns() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TEST: --yes flag is parsed and sets YES_MODE=1
+# ─────────────────────────────────────────────────────────────────────────────
+test_yes_flag_long() {
+    local output
+    output=$(run_parse_args "--yes myhost") || true
+
+    assert_contains "YES_MODE set to 1" "$output" "YES_MODE=1"
+    assert_contains "SSH_HOST set" "$output" "SSH_HOST=myhost"
+}
+
+test_yes_flag_short() {
+    local output
+    output=$(run_parse_args "-y myhost") || true
+
+    assert_contains "YES_MODE set to 1 (short)" "$output" "YES_MODE=1"
+}
+
+test_yes_flag_default() {
+    local output
+    output=$(run_parse_args "myhost") || true
+
+    assert_contains "YES_MODE default 0" "$output" "YES_MODE=0"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST: Path and repo URL feedback with auto-derived annotation
+# ─────────────────────────────────────────────────────────────────────────────
+test_path_auto_derived_annotation() {
+    local output
+    output=$(run_parse_args "myhost") || true
+
+    assert_contains "path auto-derived" "$output" "PATH_AUTO_DERIVED=1"
+}
+
+test_path_explicit_annotation() {
+    local output
+    output=$(run_parse_args "myhost:/opt/proj") || true
+
+    assert_contains "path explicit" "$output" "PATH_AUTO_DERIVED=0"
+}
+
+test_repo_url_source_local() {
+    local output
+    output=$(run_parse_args "myhost") || true
+
+    assert_contains "repo url source local" "$output" "REPO_URL_SOURCE=local"
+}
+
+test_repo_url_source_flag() {
+    local output
+    output=$(run_parse_args "--repo git@github.com:o/r.git myhost") || true
+
+    assert_contains "repo url source flag" "$output" "REPO_URL_SOURCE=flag"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST: Container-already-running with --yes auto-reuses
+# ─────────────────────────────────────────────────────────────────────────────
+MOCK_COMPOSE_PS_RUNNING='[{"State":"running","Health":"healthy"}]'
+# shellcheck disable=SC2034
+MOCK_COMPOSE_PS_EMPTY='[]'
+
+test_container_check_yes_reuses() {
+    local output
+    output=$(run_container_check "$MOCK_COMPOSE_PS_RUNNING" 1) || true
+
+    assert_contains "reuse msg" "$output" "Reusing existing container"
+}
+
+test_container_check_skip_when_not_running() {
+    local tmpscript tmpsrc
+    tmpscript=$(mktemp "${TMPDIR:-/tmp}/devc_test.XXXXXX")
+    tmpsrc=$(mktemp "${TMPDIR:-/tmp}/devc_src.XXXXXX")
+    sed 's/^main "\$@"$/# main disabled/' "$DEVC_SCRIPT" > "$tmpsrc"
+    TMPFILES+=("$tmpsrc" "$tmpscript")
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'set -euo pipefail'
+        echo "source \"$tmpsrc\""
+        echo 'ssh() { echo "[]"; }'
+        echo 'YES_MODE=0'
+        echo 'SSH_HOST="testhost"'
+        echo 'REMOTE_PATH="/home/user/repo"'
+        echo 'COMPOSE_CMD="podman compose"'
+        echo 'CONTAINER_RUNNING=0'
+        echo 'check_existing_container'
+    } > "$tmpscript"
+
+    local output rc=0
+    output=$(bash "$tmpscript" 2>&1) || rc=$?
+
+    assert_not_contains "no reuse when not running" "$output" "Reusing"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST: SSH agent check uses ssh-add -l output
+# ─────────────────────────────────────────────────────────────────────────────
+MOCK_SSH_ADD_OK="RUNTIME=podman
+RUNTIME_VERSION=4.9.3
+COMPOSE_AVAILABLE=1
+COMPOSE_VERSION=2.24.5
+GIT_AVAILABLE=1
+REPO_PATH_EXISTS=1
+DEVCONTAINER_EXISTS=1
+DISK_AVAILABLE_GB=42
+OS_TYPE=linux
+CONTAINER_RUNNING=0
+SSH_AGENT_FWD=1"
+
+MOCK_SSH_ADD_FAIL="RUNTIME=podman
+RUNTIME_VERSION=4.9.3
+COMPOSE_AVAILABLE=1
+COMPOSE_VERSION=2.24.5
+GIT_AVAILABLE=1
+REPO_PATH_EXISTS=1
+DEVCONTAINER_EXISTS=1
+DISK_AVAILABLE_GB=42
+OS_TYPE=linux
+CONTAINER_RUNNING=0
+SSH_AGENT_FWD=0"
+
+test_ssh_agent_fwd_ok() {
+    local output
+    output=$(run_preflight "$MOCK_SSH_ADD_OK") || true
+
+    assert_contains "ssh agent working" "$output" "SSH agent forwarding"
+}
+
+test_ssh_agent_fwd_fail() {
+    local output
+    output=$(run_preflight "$MOCK_SSH_ADD_FAIL") || true
+
+    assert_contains "ssh agent warning" "$output" "SSH agent"
+    assert_contains "ssh agent not available" "$output" "not available"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RUN ALL
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== devc-remote preflight tests ==="
@@ -239,6 +459,17 @@ test_no_runtime_errors
 test_no_ssh_agent_warns
 test_summary_dashboard
 test_low_disk_warns
+test_yes_flag_long
+test_yes_flag_short
+test_yes_flag_default
+test_path_auto_derived_annotation
+test_path_explicit_annotation
+test_repo_url_source_local
+test_repo_url_source_flag
+test_container_check_yes_reuses
+test_container_check_skip_when_not_running
+test_ssh_agent_fwd_ok
+test_ssh_agent_fwd_fail
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

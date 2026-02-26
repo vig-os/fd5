@@ -11,14 +11,19 @@
 # .devcontainer/ is missing, runs init-workspace via the container image.
 #
 # USAGE:
-#   ./scripts/devc-remote.sh [--repo <url>] <ssh-host>[:<remote-path>]
+#   ./scripts/devc-remote.sh [--yes|-y] [--repo <url>] <ssh-host>[:<remote-path>]
 #   ./scripts/devc-remote.sh --help
+#
+# Options:
+#   --yes, -y    Auto-accept all interactive prompts (reuse running containers)
+#   --repo URL   Specify the git remote URL for cloning
 #
 # Examples:
 #   ./scripts/devc-remote.sh myserver
 #   ./scripts/devc-remote.sh user@host:/opt/projects/myrepo
 #   ./scripts/devc-remote.sh myserver:/home/user/repo
 #   ./scripts/devc-remote.sh --repo git@github.com:org/repo.git myserver
+#   ./scripts/devc-remote.sh --yes myserver
 #
 # Part of #70. See issue #152 for design.
 ###############################################################################
@@ -68,11 +73,18 @@ parse_args() {
     SSH_HOST=""
     REMOTE_PATH=""
     REPO_URL=""
+    YES_MODE=0
+    PATH_AUTO_DERIVED=0
+    REPO_URL_SOURCE=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --help|-h)
                 show_help
+                ;;
+            --yes|-y)
+                YES_MODE=1
+                shift
                 ;;
             --repo)
                 shift
@@ -81,6 +93,7 @@ parse_args() {
                     log_error "--repo requires a URL argument"
                     exit 1
                 fi
+                REPO_URL_SOURCE="flag"
                 shift
                 ;;
             -*)
@@ -93,7 +106,6 @@ parse_args() {
                     log_error "Unexpected argument: $1"
                     exit 1
                 fi
-                # Parse SSH-style format: user@host:path or host:path
                 if [[ "$1" =~ ^([^:]+):(.+)$ ]]; then
                     SSH_HOST="${BASH_REMATCH[1]}"
                     REMOTE_PATH="${BASH_REMATCH[2]}"
@@ -111,7 +123,6 @@ parse_args() {
         exit 1
     fi
 
-    # Auto-derive REMOTE_PATH from local repo name when not explicitly given
     if [[ -z "$REMOTE_PATH" ]]; then
         local local_repo_name
         local_repo_name=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "")
@@ -119,15 +130,18 @@ parse_args() {
             # Tilde is intentional; expanded by the remote shell
             # shellcheck disable=SC2088
             REMOTE_PATH="~/${local_repo_name}"
+            PATH_AUTO_DERIVED=1
         else
             log_error "No remote path given and not inside a git repository."
             exit 1
         fi
     fi
 
-    # Auto-derive REPO_URL from local git remote when not explicitly given
     if [[ -z "$REPO_URL" ]]; then
         REPO_URL=$(git remote get-url origin 2>/dev/null || echo "")
+        if [[ -n "$REPO_URL" ]]; then
+            REPO_URL_SOURCE="local"
+        fi
     fi
 }
 
@@ -208,11 +222,11 @@ elif command -v docker &>/dev/null && cd "$REPO_PATH" 2>/dev/null && docker comp
 else
     echo "CONTAINER_RUNNING=0"
 fi
-# Check SSH agent socket forwarding
-if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
-    echo "SSH_AUTH_SOCK_FORWARDED=1"
+# Check SSH agent forwarding via ssh-add
+if ssh-add -l &>/dev/null; then
+    echo "SSH_AGENT_FWD=1"
 else
-    echo "SSH_AUTH_SOCK_FORWARDED=0"
+    echo "SSH_AGENT_FWD=0"
 fi
 REMOTEEOF
     )
@@ -230,7 +244,7 @@ REMOTEEOF
             DISK_AVAILABLE_GB)       DISK_AVAILABLE_GB="${BASH_REMATCH[2]}" ;;
             OS_TYPE)                 OS_TYPE="${BASH_REMATCH[2]}" ;;
             CONTAINER_RUNNING)       CONTAINER_RUNNING="${BASH_REMATCH[2]}" ;;
-            SSH_AUTH_SOCK_FORWARDED) SSH_AUTH_SOCK_FORWARDED="${BASH_REMATCH[2]}" ;;
+            SSH_AGENT_FWD)          SSH_AGENT_FWD="${BASH_REMATCH[2]}" ;;
         esac
     done <<< "$preflight_output"
 
@@ -263,10 +277,10 @@ REMOTEEOF
         log_success "No existing container running"
     fi
 
-    if [[ "${SSH_AUTH_SOCK_FORWARDED:-0}" == "1" ]]; then
-        log_success "SSH agent forwarding detected"
+    if [[ "${SSH_AGENT_FWD:-0}" == "1" ]]; then
+        log_success "SSH agent forwarding: working"
     else
-        log_warning "SSH agent not forwarded — git operations inside the container may fail"
+        log_warning "SSH agent forwarding: not available (git signing may fail inside container)"
     fi
 
     if [[ "${DISK_AVAILABLE_GB:-0}" -lt 2 ]] 2>/dev/null; then
@@ -332,25 +346,72 @@ remote_init_if_needed() {
     DEVCONTAINER_EXISTS=1
 }
 
-remote_compose_up() {
-    local ps_output state health
+compose_ps_json() {
     # shellcheck disable=SC2029
-    ps_output=$(ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD ps --format json 2>/dev/null" || true)
-    state=$(echo "$ps_output" | grep -o '"State":"[^"]*"' | head -1 | cut -d'"' -f4)
-    health=$(echo "$ps_output" | grep -o '"Health":"[^"]*"' | head -1 | cut -d'"' -f4)
+    ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD ps --format json 2>/dev/null" || true
+}
 
-    if [[ "$state" == "running" && "${health:-}" == "healthy" ]]; then
-        log_success "Devcontainer already running on $SSH_HOST. Opening..."
-    else
-        log_info "Starting devcontainer on $SSH_HOST..."
-        # shellcheck disable=SC2029
-        if ! ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD up -d"; then
-            log_error "Failed to start devcontainer on $SSH_HOST."
-            log_error "Run 'ssh $SSH_HOST \"cd $REMOTE_PATH && $COMPOSE_CMD logs\"' for details."
-            exit 1
-        fi
-        sleep 2
+check_existing_container() {
+    [[ "${CONTAINER_RUNNING:-0}" != "1" ]] && return 0
+
+    local ps_output state
+    ps_output=$(compose_ps_json)
+    state=$(echo "$ps_output" | grep -o '"State":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    if [[ "$state" != "running" ]]; then
+        return 0
     fi
+
+    if [[ "${YES_MODE:-0}" == "1" ]]; then
+        log_info "Reusing existing container (--yes)"
+        SKIP_COMPOSE_UP=1
+        return 0
+    fi
+
+    echo ""
+    log_info "Container for $REMOTE_PATH is already running on $SSH_HOST."
+    echo "  [R]euse (default)  [r]ecreate  [a]bort"
+    local choice
+    read -r -n 1 -p "  > " choice </dev/tty || choice="R"
+    echo ""
+
+    case "${choice:-R}" in
+        R|r)
+            if [[ "${choice:-R}" == "r" ]]; then
+                log_info "Recreating container..."
+                # shellcheck disable=SC2029
+                ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD down" || true
+                SKIP_COMPOSE_UP=0
+            else
+                log_info "Reusing existing container"
+                SKIP_COMPOSE_UP=1
+            fi
+            ;;
+        a|A)
+            log_info "Aborted by user."
+            exit 0
+            ;;
+        *)
+            log_info "Reusing existing container"
+            SKIP_COMPOSE_UP=1
+            ;;
+    esac
+}
+
+remote_compose_up() {
+    if [[ "${SKIP_COMPOSE_UP:-0}" == "1" ]]; then
+        log_success "Devcontainer already running on $SSH_HOST. Opening..."
+        return 0
+    fi
+
+    log_info "Starting devcontainer on $SSH_HOST..."
+    # shellcheck disable=SC2029
+    if ! ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD up -d"; then
+        log_error "Failed to start devcontainer on $SSH_HOST."
+        log_error "Run 'ssh $SSH_HOST \"cd $REMOTE_PATH && $COMPOSE_CMD logs\"' for details."
+        exit 1
+    fi
+    sleep 2
 }
 
 open_editor() {
@@ -387,6 +448,16 @@ open_editor() {
 main() {
     parse_args "$@"
 
+    local path_annotation="explicit"
+    [[ "${PATH_AUTO_DERIVED:-0}" == "1" ]] && path_annotation="auto-derived from local repo"
+    log_success "Remote path: $REMOTE_PATH ($path_annotation)"
+
+    if [[ -n "${REPO_URL:-}" ]]; then
+        log_success "Repo URL: $REPO_URL (from ${REPO_URL_SOURCE:-unknown})"
+    else
+        log_warning "Repo URL: not available (clone will fail if repo missing on remote)"
+    fi
+
     log_info "Detecting local editor CLI..."
     detect_editor_cli
     log_success "Using $EDITOR_CLI"
@@ -401,6 +472,8 @@ main() {
 
     remote_clone_if_needed
     remote_init_if_needed
+    SKIP_COMPOSE_UP=0
+    check_existing_container
     remote_compose_up
     open_editor
 
