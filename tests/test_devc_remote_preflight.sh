@@ -171,7 +171,7 @@ test_happy_path_prints_status_lines() {
     assert_contains "runtime detected" "$output" "podman"
     assert_contains "runtime version shown" "$output" "4.9.3"
     assert_contains "compose version shown" "$output" "2.24.5"
-    assert_contains "no container running" "$output" "no existing container"
+    assert_contains "no container running" "$output" "No existing container"
     assert_contains "ssh agent OK" "$output" "SSH agent"
 }
 
