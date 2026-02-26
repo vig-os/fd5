@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each preflight check now prints a success/warning/error status line as it completes
   - New checks: container-already-running, runtime version, compose version, SSH agent forwarding
   - Summary dashboard printed before proceeding to compose up
+  - `--yes`/`-y` flag to auto-accept interactive prompts
+  - Path and repo URL feedback with auto-derived annotation
+  - Interactive Reuse/Recreate/Abort prompt when a container is already running
+  - SSH agent forwarding check improved to use `ssh-add -l`
 
 - **HDF5 dict round-trip helpers** ([#12](https://github.com/vig-os/fd5/issues/12))
   - `dict_to_h5(group, d)` writes nested Python dicts as HDF5 attrs/sub-groups
