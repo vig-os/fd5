@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Preflight feedback and status dashboard for devc-remote** ([#149](https://github.com/vig-os/fd5/issues/149))
+  - Each preflight check now prints a success/warning/error status line as it completes
+  - New checks: container-already-running, runtime version, compose version, SSH agent forwarding
+  - Summary dashboard printed before proceeding to compose up
+
 - **HDF5 dict round-trip helpers** ([#12](https://github.com/vig-os/fd5/issues/12))
   - `dict_to_h5(group, d)` writes nested Python dicts as HDF5 attrs/sub-groups
   - `h5_to_dict(group)` reads HDF5 attrs and sub-groups back to a Python dict

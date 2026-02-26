@@ -158,16 +158,25 @@ remote_preflight() {
 REPO_PATH="${1:-$HOME}"
 if command -v podman &>/dev/null; then
     echo "RUNTIME=podman"
+    VER=$(podman --version 2>/dev/null | awk '{print $NF}')
+    echo "RUNTIME_VERSION=${VER:-unknown}"
 elif command -v docker &>/dev/null; then
     echo "RUNTIME=docker"
+    VER=$(docker --version 2>/dev/null | sed 's/.*version \([^,]*\).*/\1/')
+    echo "RUNTIME_VERSION=${VER:-unknown}"
 else
     echo "RUNTIME="
+    echo "RUNTIME_VERSION="
 fi
 if (command -v podman &>/dev/null && podman compose version &>/dev/null) || \
    (command -v docker &>/dev/null && docker compose version &>/dev/null); then
     echo "COMPOSE_AVAILABLE=1"
+    CVER=$(podman compose version 2>/dev/null || docker compose version 2>/dev/null)
+    CVER=$(echo "$CVER" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    echo "COMPOSE_VERSION=${CVER:-unknown}"
 else
     echo "COMPOSE_AVAILABLE=0"
+    echo "COMPOSE_VERSION="
 fi
 if command -v git &>/dev/null; then
     echo "GIT_AVAILABLE=1"
@@ -191,27 +200,52 @@ if [ "$(uname -s)" = "Darwin" ]; then
 else
     echo "OS_TYPE=linux"
 fi
+# Check for a running devcontainer (compose project in REPO_PATH)
+if command -v podman &>/dev/null && cd "$REPO_PATH" 2>/dev/null && podman compose ps --format json 2>/dev/null | grep -q '"running"'; then
+    echo "CONTAINER_RUNNING=1"
+elif command -v docker &>/dev/null && cd "$REPO_PATH" 2>/dev/null && docker compose ps --format json 2>/dev/null | grep -q '"running"'; then
+    echo "CONTAINER_RUNNING=1"
+else
+    echo "CONTAINER_RUNNING=0"
+fi
+# Check SSH agent socket forwarding
+if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    echo "SSH_AUTH_SOCK_FORWARDED=1"
+else
+    echo "SSH_AUTH_SOCK_FORWARDED=0"
+fi
 REMOTEEOF
     )
 
     while IFS= read -r line; do
         [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || continue
         case "${BASH_REMATCH[1]}" in
-            RUNTIME) RUNTIME="${BASH_REMATCH[2]}" ;;
-            COMPOSE_AVAILABLE) COMPOSE_AVAILABLE="${BASH_REMATCH[2]}" ;;
-            GIT_AVAILABLE) GIT_AVAILABLE="${BASH_REMATCH[2]}" ;;
-            REPO_PATH_EXISTS) REPO_PATH_EXISTS="${BASH_REMATCH[2]}" ;;
-            DEVCONTAINER_EXISTS) DEVCONTAINER_EXISTS="${BASH_REMATCH[2]}" ;;
-            DISK_AVAILABLE_GB) DISK_AVAILABLE_GB="${BASH_REMATCH[2]}" ;;
-            OS_TYPE) OS_TYPE="${BASH_REMATCH[2]}" ;;
+            RUNTIME)                 RUNTIME="${BASH_REMATCH[2]}" ;;
+            RUNTIME_VERSION)         RUNTIME_VERSION="${BASH_REMATCH[2]}" ;;
+            COMPOSE_AVAILABLE)       COMPOSE_AVAILABLE="${BASH_REMATCH[2]}" ;;
+            COMPOSE_VERSION)         COMPOSE_VERSION="${BASH_REMATCH[2]}" ;;
+            GIT_AVAILABLE)           GIT_AVAILABLE="${BASH_REMATCH[2]}" ;;
+            REPO_PATH_EXISTS)        REPO_PATH_EXISTS="${BASH_REMATCH[2]}" ;;
+            DEVCONTAINER_EXISTS)     DEVCONTAINER_EXISTS="${BASH_REMATCH[2]}" ;;
+            DISK_AVAILABLE_GB)       DISK_AVAILABLE_GB="${BASH_REMATCH[2]}" ;;
+            OS_TYPE)                 OS_TYPE="${BASH_REMATCH[2]}" ;;
+            CONTAINER_RUNNING)       CONTAINER_RUNNING="${BASH_REMATCH[2]}" ;;
+            SSH_AUTH_SOCK_FORWARDED) SSH_AUTH_SOCK_FORWARDED="${BASH_REMATCH[2]}" ;;
         esac
     done <<< "$preflight_output"
+
+    # ── Per-check status lines ──────────────────────────────────────────
+    local repo_status="missing"
+    [[ "${REPO_PATH_EXISTS:-0}" == "1" ]] && repo_status="found"
+    log_info "Repo path: $REMOTE_PATH ($repo_status)"
 
     # Hard errors: runtime and compose are always required
     if [[ -z "${RUNTIME:-}" ]]; then
         log_error "No container runtime found on $SSH_HOST. Install podman or docker."
         exit 1
     fi
+    log_success "Container runtime: $RUNTIME ${RUNTIME_VERSION:-}"
+
     if [[ "$RUNTIME" == "podman" ]]; then
         COMPOSE_CMD="podman compose"
     else
@@ -221,14 +255,37 @@ REMOTEEOF
         log_error "Compose not available on $SSH_HOST. Install docker-compose or podman-compose."
         exit 1
     fi
+    log_success "Compose: ${COMPOSE_VERSION:-available}"
 
-    # Soft checks: repo and devcontainer are handled by clone/init steps
+    if [[ "${CONTAINER_RUNNING:-0}" == "1" ]]; then
+        log_warning "A container already running in $REMOTE_PATH"
+    else
+        log_success "No existing container running"
+    fi
+
+    if [[ "${SSH_AUTH_SOCK_FORWARDED:-0}" == "1" ]]; then
+        log_success "SSH agent forwarding detected"
+    else
+        log_warning "SSH agent not forwarded — git operations inside the container may fail"
+    fi
+
     if [[ "${DISK_AVAILABLE_GB:-0}" -lt 2 ]] 2>/dev/null; then
         log_warning "Low disk space on $SSH_HOST (${DISK_AVAILABLE_GB:-0}GB). At least 2GB recommended."
     fi
     if [[ "${OS_TYPE:-}" == "macos" ]]; then
         log_warning "Remote host is macOS. Devcontainer support may be limited."
     fi
+
+    # ── Summary dashboard ───────────────────────────────────────────────
+    echo ""
+    echo -e "${BLUE}═══ Preflight Summary ═══${NC}"
+    echo -e "  Host:      $SSH_HOST"
+    echo -e "  Repo:      $REMOTE_PATH"
+    echo -e "  Runtime:   $RUNTIME ${RUNTIME_VERSION:-}"
+    echo -e "  Compose:   ${COMPOSE_VERSION:-available}"
+    echo -e "  Disk:      ${DISK_AVAILABLE_GB:-?}GB available"
+    echo -e "${BLUE}═════════════════════════${NC}"
+    echo ""
 }
 
 remote_clone_if_needed() {
