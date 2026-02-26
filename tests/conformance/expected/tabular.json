@@ -1,0 +1,36 @@
+{
+  "description": "Compound dataset (event table) — tabular data tests",
+  "root_attrs": {
+    "product": "test/conformance",
+    "name": "tabular-conformance",
+    "description": "Tabular conformance fixture",
+    "timestamp": "2026-01-01T00:00:00Z",
+    "_schema_version": 1
+  },
+  "root_attrs_prefixed": {
+    "id": "sha256:",
+    "content_hash": "sha256:"
+  },
+  "datasets": [
+    {
+      "path": "/volume",
+      "shape": [4, 4],
+      "dtype": "float32"
+    },
+    {
+      "path": "/events",
+      "shape": [5],
+      "columns": ["time", "energy", "detector_id"]
+    }
+  ],
+  "verify": true,
+  "tabular": {
+    "row_count": 5,
+    "column_names": ["time", "energy", "detector_id"],
+    "column_dtypes": {
+      "time": "float64",
+      "energy": "float32",
+      "detector_id": "int32"
+    }
+  }
+}

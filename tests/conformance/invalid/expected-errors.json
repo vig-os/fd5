@@ -1,0 +1,16 @@
+{
+  "missing-id.fd5": {
+    "description": "Missing required root 'id' attribute",
+    "error_type": "KeyError",
+    "error_pattern": "id"
+  },
+  "bad-hash.fd5": {
+    "description": "Content hash does not match actual content",
+    "verify_returns": false
+  },
+  "no-schema.fd5": {
+    "description": "Missing _schema attribute",
+    "error_type": "KeyError",
+    "error_pattern": "_schema"
+  }
+}
