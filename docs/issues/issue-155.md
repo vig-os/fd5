@@ -2,17 +2,17 @@
 type: issue
 state: open
 created: 2026-02-26T01:04:00Z
-updated: 2026-02-26T01:04:00Z
+updated: 2026-02-26T10:09:09Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/fd5/issues/155
-comments: 0
+comments: 3
 labels: priority:high, area:testing, effort:medium, area:core
-assignees: none
+assignees: gerchowl
 milestone: none
 projects: none
 relationship: none
-synced: 2026-02-26T04:15:42.619Z
+synced: 2026-02-27T04:11:40.452Z
 ---
 
 # [Issue 155]: [[TEST] Cross-language conformance test suite for fd5 format](https://github.com/vig-os/fd5/issues/155)
@@ -86,3 +86,115 @@ This is a black-box test — it doesn't test internal APIs, only the format cont
 - Depends on the format spec document (see prerequisite issue) for normative requirements
 - Fixture files should be small (KBs, not MBs) to keep the repo lightweight
 - Inspired by JSON Schema Test Suite: https://github.com/json-schema-org/JSON-Schema-Test-Suite
+---
+
+# [Comment #1]() by [gerchowl]()
+
+_Posted on February 26, 2026 at 09:47 AM_
+
+## Design
+
+### Overview
+
+A Python script (`tests/conformance/generate_fixtures.py`) will use the existing `fd5.create()` API and direct `h5py` calls to generate canonical fixture files and corresponding expected-result JSON files. A pytest-based conformance runner (`tests/conformance/test_conformance.py`) will validate that the Python implementation passes all cases. The suite is designed so any future language binding can load the same fixtures + JSON and assert equivalence.
+
+### Architecture
+
+```
+tests/conformance/
+├── README.md                     # How to use the suite
+├── generate_fixtures.py          # Script that creates all .fd5 + .json files
+├── fixtures/                     # Generated .fd5 files (gitignored, regenerated in CI)
+├── expected/                     # Expected-result JSON files (checked in)
+├── invalid/                      # Invalid .fd5 files + expected-errors.json
+└── test_conformance.py           # Pytest runner that validates fixtures vs expected
+```
+
+### Design Decisions
+
+1. **Fixtures are generated, not checked in.** HDF5 is binary; checking in binaries is fragile and bloats the repo. Instead, `generate_fixtures.py` regenerates them deterministically. The expected JSON files ARE checked in since they define the contract. A conftest fixture runs the generator before tests.
+
+2. **Use a test/conformance product schema.** Register a minimal `ConformanceSchema` via `register_schema()` in the generator and test module. This avoids coupling to imaging-specific schemas (recon) while exercising the full fd5 create/seal pipeline.
+
+3. **Expected JSON format.** Each expected JSON file is a dict with keys matching the test categories from the issue: `root_attrs`, `datasets`, `groups`, `content_hash_prefix`, `verify`, plus fixture-specific keys like `provenance`, `metadata_tree`, etc.
+
+4. **Test categories mapped to fixtures:** minimal.fd5 (structure), with-provenance.fd5 (provenance DAG), multiscale.fd5 (pyramid levels), tabular.fd5 (compound dataset), complex-metadata.fd5 (nested metadata), sealed.fd5 (hash verification).
+
+5. **Invalid fixtures.** Created with direct h5py: missing-id.fd5, bad-hash.fd5, no-schema.fd5, with expected-errors.json.
+
+6. **Multiscale fixture uses ReconSchema.** Only fixture needing a real product schema with pyramid support. All others use the simple conformance schema.
+
+### Testing Strategy
+
+The conformance tests ARE the tests. `test_conformance.py` covers structure, round-trip, hash verification, provenance, schema validation, and negative tests. No separate unit tests for the generator.
+
+### Constraints
+
+- Fixture files stay small (< 10 KB each)
+- No new dependencies
+- Generator uses only public fd5 API where possible, h5py directly for invalid fixtures
+
+---
+
+# [Comment #2]() by [gerchowl]()
+
+_Posted on February 26, 2026 at 09:47 AM_
+
+## Implementation Plan
+
+Issue: #155
+Branch: feature/155-cross-language-conformance-tests
+
+### Tasks
+
+- [ ] Task 1: Create conformance directory structure and README — `tests/conformance/README.md`, `tests/conformance/__init__.py` — verify: files exist
+- [ ] Task 2: Write expected JSON files for valid fixtures — `tests/conformance/expected/minimal.json`, `with-provenance.json`, `multiscale.json`, `tabular.json`, `complex-metadata.json`, `sealed.json` — verify: valid JSON, all test categories covered
+- [ ] Task 3: Write expected-errors JSON for invalid fixtures — `tests/conformance/invalid/expected-errors.json` — verify: valid JSON with error patterns for missing-id, bad-hash, no-schema
+- [ ] Task 4: Write failing conformance tests for structure tests (minimal fixture) — `tests/conformance/test_conformance.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k structure -v` fails (no fixtures yet)
+- [ ] Task 5: Write fixture generator for minimal.fd5 — `tests/conformance/generate_fixtures.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k structure -v` passes
+- [ ] Task 6: Write failing tests for hash verification (sealed fixture) — `tests/conformance/test_conformance.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k hash -v` fails
+- [ ] Task 7: Write fixture generator for sealed.fd5 — `tests/conformance/generate_fixtures.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k hash -v` passes
+- [ ] Task 8: Write failing tests for provenance (with-provenance fixture) — `tests/conformance/test_conformance.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k provenance -v` fails
+- [ ] Task 9: Write fixture generator for with-provenance.fd5 — `tests/conformance/generate_fixtures.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k provenance -v` passes
+- [ ] Task 10: Write failing tests for multiscale fixture — `tests/conformance/test_conformance.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k multiscale -v` fails
+- [ ] Task 11: Write fixture generator for multiscale.fd5 — `tests/conformance/generate_fixtures.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k multiscale -v` passes
+- [ ] Task 12: Write failing tests for tabular and complex-metadata fixtures — `tests/conformance/test_conformance.py` — verify: fails
+- [ ] Task 13: Write fixture generators for tabular.fd5 and complex-metadata.fd5 — `tests/conformance/generate_fixtures.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k "tabular or complex" -v` passes
+- [ ] Task 14: Write failing tests for invalid/negative fixtures — `tests/conformance/test_conformance.py` — verify: fails
+- [ ] Task 15: Write fixture generators for invalid files (missing-id, bad-hash, no-schema) — `tests/conformance/generate_fixtures.py` — verify: `uv run pytest tests/conformance/test_conformance.py -k invalid -v` passes
+- [ ] Task 16: Wire conformance tests into full test suite and add .gitignore for fixtures/ — verify: `just test` passes including conformance
+
+---
+
+# [Comment #3]() by [gerchowl]()
+
+_Posted on February 26, 2026 at 10:09 AM_
+
+## Implementation Complete — PR #157
+
+**PR**: https://github.com/vig-os/fd5/pull/157
+
+### What was implemented
+
+A cross-language conformance test suite for the `fd5` format, comprising:
+
+**Fixture generator** (`tests/conformance/generate_fixtures.py`):
+- Generates 6 valid `.fd5` fixture files: `minimal`, `sealed`, `with-provenance`, `multiscale`, `tabular`, `complex-metadata`
+- Generates 3 invalid fixtures: `invalid-missing-id`, `invalid-bad-hash`, `invalid-no-schema`
+- Uses a dedicated `_ConformanceSchema` to avoid polluting the global schema registry
+
+**Expected results** (`tests/conformance/expected/`):
+- JSON files defining expected structure, metadata, hash verification, and schema validation results for each fixture
+- `invalid/expected-errors.json` for invalid fixture error expectations
+
+**Conformance tests** (`tests/conformance/test_conformance.py`):
+- 40 parameterized pytest tests across 6 categories: structure, metadata, content hash, verification, schema validation, and invalid file handling
+- Session-scoped fixture generation with proper registry cleanup
+
+**Documentation** (`tests/conformance/README.md`):
+- Describes the suite's purpose, fixture inventory, JSON contract format, and how other language implementations can use the fixtures
+
+### CI Note
+
+CI failures are pre-existing across all repo branches (missing optional deps `pydicom`/`nibabel`/`pyarrow` in CI environment). See PR comment for details. All conformance tests pass locally.
+

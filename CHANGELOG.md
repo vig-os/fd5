@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-language conformance test suite** ([#155](https://github.com/vig-os/fd5/issues/155))
+  - 6 canonical fixture generators: minimal, sealed, with-provenance, multiscale, tabular, complex-metadata
+  - 3 invalid fixture generators: missing-id, bad-hash, no-schema
+  - Expected-result JSON files defining the format contract for any language binding
+  - 39 pytest conformance tests covering structure, hash verification, provenance, multiscale, tabular, metadata, schema validation, and negative tests
+  - README documenting how to use the suite and add new cases
+
 - **Preflight feedback and status dashboard for devc-remote** ([#149](https://github.com/vig-os/fd5/issues/149))
   - Each preflight check now prints a success/warning/error status line as it completes
   - New checks: container-already-running, runtime version, compose version, SSH agent forwarding

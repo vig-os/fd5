@@ -242,7 +242,7 @@ class TestIngestBinary:
             reference_frame="LPS",
         )
 
-        expected_sha = hashlib.sha256(bin_path.read_bytes()).hexdigest()
+        expected_sha = f"sha256:{hashlib.sha256(bin_path.read_bytes()).hexdigest()}"
         with h5py.File(result, "r") as f:
             assert "provenance" in f
             assert "original_files" in f["provenance"]
