@@ -466,9 +466,7 @@ class TestEdgeCases:
 class TestIdempotency:
     """Calling ingest twice with identical inputs produces two valid, independently sealed files."""
 
-    def test_deterministic(
-        self, loader: CsvLoader, spectrum_csv: Path, tmp_path: Path
-    ):
+    def test_deterministic(self, loader: CsvLoader, spectrum_csv: Path, tmp_path: Path):
         kwargs = dict(
             product="spectrum",
             name="idem-spectrum",

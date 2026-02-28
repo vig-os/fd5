@@ -260,7 +260,7 @@ class TestProvenance:
             assert "original_files" in f["provenance"]
             rec = f["provenance/original_files"][0]
             assert str(nifti_3d) in rec["path"].decode()
-            sha = hashlib.sha256(nifti_3d.read_bytes()).hexdigest()
+            sha = f"sha256:{hashlib.sha256(nifti_3d.read_bytes()).hexdigest()}"
             assert rec["sha256"].decode() == sha
 
     def test_provenance_ingest_group(self, nifti_3d: Path, tmp_path: Path):
