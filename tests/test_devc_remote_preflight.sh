@@ -180,6 +180,43 @@ run_container_check() {
     return $rc
 }
 
+# Helper: build a script that tests resolve_remote_path_absolute
+build_resolve_path_script() {
+    local input_path="$1" home_path="$2"
+    local tmpscript tmpsrc
+    tmpscript=$(mktemp "${TMPDIR:-/tmp}/devc_test.XXXXXX")
+    tmpsrc=$(mktemp "${TMPDIR:-/tmp}/devc_src.XXXXXX")
+
+    sed 's/^main "\$@"$/# main disabled/' "$DEVC_SCRIPT" > "$tmpsrc"
+    TMPFILES+=("$tmpsrc")
+
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'set -euo pipefail'
+        echo "source \"$tmpsrc\""
+        echo 'ssh() {'
+        echo "    printf '%s' \"$1\" >/dev/null"
+        echo "    printf '%s' \"$2\" >/dev/null"
+        echo "    echo \"$home_path\""
+        echo '}'
+        echo 'SSH_HOST="testhost"'
+        echo "resolve_remote_path_absolute \"$input_path\""
+    } > "$tmpscript"
+
+    echo "$tmpscript"
+}
+
+run_resolve_path() {
+    local input_path="$1" home_path="$2"
+    local tmpscript
+    tmpscript=$(build_resolve_path_script "$input_path" "$home_path")
+    TMPFILES+=("$tmpscript")
+    local output rc=0
+    output=$(bash "$tmpscript" 2>&1) || rc=$?
+    echo "$output"
+    return $rc
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Mock data sets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -450,6 +487,38 @@ test_ssh_agent_fwd_fail() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TEST: Tilde paths are resolved for editor URI construction
+# ─────────────────────────────────────────────────────────────────────────────
+test_resolve_remote_path_tilde_prefix() {
+    local output
+    # shellcheck disable=SC2088
+    output=$(run_resolve_path "~/fd5" "/home/user") || true
+
+    assert_contains "tilde prefix resolved" "$output" "/home/user/fd5"
+}
+
+test_resolve_remote_path_tilde_only() {
+    local output
+    output=$(run_resolve_path "~" "/home/user") || true
+
+    assert_contains "tilde only resolved" "$output" "/home/user"
+}
+
+test_resolve_remote_path_absolute_passthrough() {
+    local output
+    output=$(run_resolve_path "/opt/fd5" "/home/user") || true
+
+    assert_contains "absolute path unchanged" "$output" "/opt/fd5"
+}
+
+test_resolve_remote_path_relative_prefix() {
+    local output
+    output=$(run_resolve_path "fd5" "/home/user") || true
+
+    assert_contains "relative path resolved under home" "$output" "/home/user/fd5"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # RUN ALL
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== devc-remote preflight tests ==="
@@ -470,6 +539,10 @@ test_container_check_yes_reuses
 test_container_check_skip_when_not_running
 test_ssh_agent_fwd_ok
 test_ssh_agent_fwd_fail
+test_resolve_remote_path_tilde_prefix
+test_resolve_remote_path_tilde_only
+test_resolve_remote_path_absolute_passthrough
+test_resolve_remote_path_relative_prefix
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

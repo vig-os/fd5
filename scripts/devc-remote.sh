@@ -215,9 +215,9 @@ else
     echo "OS_TYPE=linux"
 fi
 # Check for a running devcontainer (compose project in REPO_PATH)
-if command -v podman &>/dev/null && cd "$REPO_PATH" 2>/dev/null && podman compose ps --format json 2>/dev/null | grep -q '"running"'; then
+if command -v podman &>/dev/null && cd "$REPO_PATH/.devcontainer" 2>/dev/null && podman compose ps --format json 2>/dev/null | grep -q '"running"'; then
     echo "CONTAINER_RUNNING=1"
-elif command -v docker &>/dev/null && cd "$REPO_PATH" 2>/dev/null && docker compose ps --format json 2>/dev/null | grep -q '"running"'; then
+elif command -v docker &>/dev/null && cd "$REPO_PATH/.devcontainer" 2>/dev/null && docker compose ps --format json 2>/dev/null | grep -q '"running"'; then
     echo "CONTAINER_RUNNING=1"
 else
     echo "CONTAINER_RUNNING=0"
@@ -348,7 +348,31 @@ remote_init_if_needed() {
 
 compose_ps_json() {
     # shellcheck disable=SC2029
-    ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD ps --format json 2>/dev/null" || true
+    ssh "$SSH_HOST" "cd $REMOTE_PATH/.devcontainer && $COMPOSE_CMD ps --format json 2>/dev/null" || true
+}
+
+resolve_remote_path_absolute() {
+    local path="$1"
+    local remote_home=""
+
+    # shellcheck disable=SC2088
+    if [[ "$path" == "~" || "$path" == "~/"* || "$path" != /* ]]; then
+        # shellcheck disable=SC2029
+        remote_home=$(ssh "$SSH_HOST" 'printf %s "$HOME"')
+    fi
+
+    # shellcheck disable=SC2088
+    if [[ "$path" == "~" || "$path" == "~/"* ]]; then
+        if [[ "$path" == "~" ]]; then
+            path="$remote_home"
+        else
+            path="${remote_home}/${path#\~/}"
+        fi
+    elif [[ "$path" != /* ]]; then
+        path="${remote_home}/${path#./}"
+    fi
+
+    echo "$path"
 }
 
 check_existing_container() {
@@ -380,7 +404,7 @@ check_existing_container() {
             if [[ "${choice:-R}" == "r" ]]; then
                 log_info "Recreating container..."
                 # shellcheck disable=SC2029
-                ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD down" || true
+                ssh "$SSH_HOST" "cd $REMOTE_PATH/.devcontainer && $COMPOSE_CMD down" || true
                 SKIP_COMPOSE_UP=0
             else
                 log_info "Reusing existing container"
@@ -406,21 +430,23 @@ remote_compose_up() {
 
     log_info "Starting devcontainer on $SSH_HOST..."
     # shellcheck disable=SC2029
-    if ! ssh "$SSH_HOST" "cd $REMOTE_PATH && $COMPOSE_CMD up -d"; then
+    if ! ssh "$SSH_HOST" "cd $REMOTE_PATH/.devcontainer && $COMPOSE_CMD up -d"; then
         log_error "Failed to start devcontainer on $SSH_HOST."
-        log_error "Run 'ssh $SSH_HOST \"cd $REMOTE_PATH && $COMPOSE_CMD logs\"' for details."
+        log_error "Run 'ssh $SSH_HOST \"cd $REMOTE_PATH/.devcontainer && $COMPOSE_CMD logs\"' for details."
         exit 1
     fi
     sleep 2
 }
 
 open_editor() {
-    local container_workspace uri
+    local container_workspace uri remote_workspace_path
+    remote_workspace_path=$(resolve_remote_path_absolute "$REMOTE_PATH")
+
     # Read workspaceFolder from devcontainer.json on remote host
     # shellcheck disable=SC2029
     container_workspace=$(ssh "$SSH_HOST" \
         "grep -o '\"workspaceFolder\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' \
-         ${REMOTE_PATH}/.devcontainer/devcontainer.json 2>/dev/null" \
+         ${remote_workspace_path}/.devcontainer/devcontainer.json 2>/dev/null" \
         | sed 's/.*: *"//;s/"//' || echo "/workspace")
 
     # Default to /workspace if workspaceFolder not found
@@ -428,7 +454,7 @@ open_editor() {
 
     # Build URI using Python helper
     if ! uri=$(python3 "$SCRIPT_DIR/devc_remote_uri.py" \
-        "$REMOTE_PATH" \
+        "$remote_workspace_path" \
         "$SSH_HOST" \
         "$container_workspace"); then
         log_error "Failed to build editor URI. Is devc_remote_uri.py present in $SCRIPT_DIR?"
