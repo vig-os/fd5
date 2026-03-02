@@ -1,0 +1,45 @@
+{
+  "description": "File with pyramid/multiscale datasets — multiscale tests",
+  "root_attrs": {
+    "product": "recon",
+    "name": "multiscale-conformance",
+    "description": "Multiscale conformance fixture",
+    "timestamp": "2026-01-01T00:00:00Z",
+    "_schema_version": 1
+  },
+  "root_attrs_prefixed": {
+    "id": "sha256:",
+    "content_hash": "sha256:"
+  },
+  "groups": [
+    "/",
+    "/pyramid",
+    "/pyramid/level_1",
+    "/pyramid/level_2"
+  ],
+  "pyramid": {
+    "n_levels": 2,
+    "scale_factors": [2, 4],
+    "level_shapes": {
+      "level_1": [4, 4, 4],
+      "level_2": [2, 2, 2]
+    }
+  },
+  "datasets": [
+    {
+      "path": "/volume",
+      "shape": [8, 8, 8],
+      "dtype": "float32"
+    },
+    {
+      "path": "/mip_coronal",
+      "dtype": "float32"
+    },
+    {
+      "path": "/mip_sagittal",
+      "dtype": "float32"
+    }
+  ],
+  "verify": true,
+  "schema_valid": true
+}

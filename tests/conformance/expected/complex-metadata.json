@@ -1,0 +1,46 @@
+{
+  "description": "Deeply nested metadata groups — metadata tree tests",
+  "root_attrs": {
+    "product": "test/conformance",
+    "name": "complex-metadata-conformance",
+    "description": "Complex metadata conformance fixture",
+    "timestamp": "2026-01-01T00:00:00Z",
+    "_schema_version": 1
+  },
+  "root_attrs_prefixed": {
+    "id": "sha256:",
+    "content_hash": "sha256:"
+  },
+  "datasets": [
+    {
+      "path": "/volume",
+      "shape": [4, 4],
+      "dtype": "float32"
+    }
+  ],
+  "groups": [
+    "/",
+    "/metadata",
+    "/metadata/acquisition",
+    "/metadata/reconstruction",
+    "/metadata/reconstruction/parameters"
+  ],
+  "verify": true,
+  "metadata_tree": {
+    "metadata": {
+      "version": 2,
+      "acquisition": {
+        "modality": "PET",
+        "duration_sec": 300.0,
+        "isotope": "F-18"
+      },
+      "reconstruction": {
+        "algorithm": "osem",
+        "parameters": {
+          "iterations": 4,
+          "subsets": 21
+        }
+      }
+    }
+  }
+}

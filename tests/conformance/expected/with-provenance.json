@@ -1,0 +1,46 @@
+{
+  "description": "File with source links — provenance tests",
+  "root_attrs": {
+    "product": "test/conformance",
+    "name": "provenance-conformance",
+    "description": "Provenance conformance fixture",
+    "timestamp": "2026-01-01T00:00:00Z",
+    "_schema_version": 1
+  },
+  "root_attrs_prefixed": {
+    "id": "sha256:",
+    "content_hash": "sha256:"
+  },
+  "datasets": [
+    {
+      "path": "/volume",
+      "shape": [4, 4],
+      "dtype": "float32"
+    }
+  ],
+  "groups": [
+    "/",
+    "/sources",
+    "/sources/upstream",
+    "/provenance",
+    "/provenance/ingest"
+  ],
+  "verify": false,
+  "provenance": {
+    "sources": [
+      {
+        "name": "upstream",
+        "id": "sha256:aaa111",
+        "product": "raw",
+        "role": "input_data",
+        "description": "Upstream raw data"
+      }
+    ],
+    "has_original_files": true,
+    "original_files_count": 1,
+    "ingest": {
+      "tool": "conformance_generator",
+      "tool_version": "1.0.0"
+    }
+  }
+}

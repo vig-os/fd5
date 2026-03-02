@@ -30,7 +30,7 @@ This command:
 - Sets up the environment (`uv sync`, `pre-commit install`)
 - Captures the local gh user as the reviewer (`gh api user --jq '.login'`)
 - Launches a tmux session running `cursor-agent` with `--yolo` mode
-- Passes `/worktree-solve-and-pr` as the initial prompt
+- Passes `/worktree_solve-and-pr` as the initial prompt
 
 ### 3. Report back to the user
 

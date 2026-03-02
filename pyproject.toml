@@ -3,7 +3,17 @@ name = "fd5"
 version = "0.1.0"
 description = "fd5 project"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "h5py>=3.10",
+    "numpy>=2.0",
+    "jsonschema>=4.20",
+    "pyyaml>=6.0",
+    "tomli-w>=1.0",
+    "click>=8.0",
+]
+
+[project.scripts]
+fd5 = "fd5.cli:cli"
 
 [project.optional-dependencies]
 dev = [
@@ -11,6 +21,9 @@ dev = [
     "pytest-cov>=4.0",
     "ipykernel>=6.0",
     "jupyter>=1.0",
+    "pre-commit>=4.0",
+    "bandit>=1.7",
+    "pip-licenses>=5.0",
 ]
 science = [
     "numpy>=2.0",
@@ -18,8 +31,17 @@ science = [
     "pandas>=2.2",
     "matplotlib>=3.9",
 ]
+dicom = [
+    "pydicom>=2.4",
+]
+nifti = [
+    "nibabel>=5.0",
+]
+parquet = [
+    "pyarrow>=14.0",
+]
 all = [
-    "fd5[dev,science]",
+    "fd5[dev,science,dicom,nifti,parquet]",
 ]
 
 [build-system]
@@ -29,7 +51,26 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/fd5"]
 
+[project.entry-points."fd5.schemas"]
+recon = "fd5.imaging.recon:ReconSchema"
+listmode = "fd5.imaging.listmode:ListmodeSchema"
+sinogram = "fd5.imaging.sinogram:SinogramSchema"
+sim = "fd5.imaging.sim:SimSchema"
+transform = "fd5.imaging.transform:TransformSchema"
+calibration = "fd5.imaging.calibration:CalibrationSchema"
+spectrum = "fd5.imaging.spectrum:SpectrumSchema"
+roi = "fd5.imaging.roi:RoiSchema"
+device_data = "fd5.imaging.device_data:DeviceDataSchema"
+
+[tool.coverage.run]
+source = ["src/fd5"]
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
+
 [dependency-groups]
 dev = [
     "hatchling>=1.25",
+    "rich>=13.0.0",
 ]
