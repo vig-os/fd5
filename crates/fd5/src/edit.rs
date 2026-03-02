@@ -8,9 +8,41 @@ use std::path::{Path, PathBuf};
 use hdf5_metno::types::VarLenUnicode;
 use hdf5_metno::File;
 
-use crate::audit::{self, AuditEntry, Author, Change, AUDIT_LOG_ATTR};
+use crate::audit::{self, AuditEntry, Author, Change};
 use crate::error::Fd5Result;
 use crate::hash::compute_content_hash;
+
+/// Return the current UTC time as an ISO 8601 string.
+///
+/// Uses only `std::time` to avoid adding chrono as a dependency.
+fn now_utc() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Convert epoch seconds to date/time components
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Civil date from days since epoch (algorithm from Howard Hinnant)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hours, minutes, seconds)
+}
 
 /// How the edit should be applied.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -102,7 +134,30 @@ impl EditPlan {
             write_attr(&target_group, &self.attr_name, &self.new_value)?;
         }
 
-        // Recompute and write new content_hash
+        // Build the new-value string for the audit trail
+        let new_value_str = match &self.new_value {
+            AttrValue::String(s) => s.clone(),
+            AttrValue::Int64(v) => v.to_string(),
+            AttrValue::Float64(v) => v.to_string(),
+        };
+
+        // Create and append audit entry
+        let entry = AuditEntry {
+            parent_hash: old_hash.clone(),
+            timestamp: now_utc(),
+            author: self.author.clone(),
+            message: self.message.clone().unwrap_or_default(),
+            changes: vec![Change {
+                action: "edit".to_string(),
+                path: self.attr_path.clone(),
+                attr: self.attr_name.clone(),
+                old: Some(self.old_value.clone()),
+                new: Some(new_value_str),
+            }],
+        };
+        audit::append_audit_entry(&file, &entry)?;
+
+        // Recompute and write new content_hash (now covers audit log too)
         let new_hash = compute_content_hash(&file)?;
         // Delete old content_hash and write new
         if root_group.attr("content_hash").is_ok() {
@@ -157,6 +212,7 @@ fn write_attr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AUDIT_LOG_ATTR;
     use tempfile::TempDir;
 
     /// Helper: create a minimal fd5 file with a content_hash and a string attribute.

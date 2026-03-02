@@ -22,27 +22,53 @@ pub struct Identity {
 impl Identity {
     /// Create an anonymous identity (default when no config exists).
     pub fn anonymous() -> Self {
-        todo!("Identity::anonymous not yet implemented")
+        Self {
+            identity_type: "anonymous".to_string(),
+            id: String::new(),
+            name: "Anonymous".to_string(),
+        }
     }
 
     /// Load identity from the default location (`~/.fd5/identity.toml`).
     pub fn load() -> Fd5Result<Self> {
-        todo!("Identity::load not yet implemented")
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        let path = Path::new(&home).join(".fd5").join("identity.toml");
+        Self::load_from(&path)
     }
 
     /// Load identity from a specific TOML file.
-    pub fn load_from(_path: &Path) -> Fd5Result<Self> {
-        todo!("Identity::load_from not yet implemented")
+    ///
+    /// Returns [`Identity::anonymous()`] if the file does not exist.
+    pub fn load_from(path: &Path) -> Fd5Result<Self> {
+        if !path.exists() {
+            return Ok(Self::anonymous());
+        }
+        let content = std::fs::read_to_string(path)?;
+        let identity: Identity = toml::from_str(&content)
+            .map_err(|e| crate::error::Fd5Error::Other(format!("Invalid identity TOML: {e}")))?;
+        Ok(identity)
     }
 
     /// Save identity to a specific TOML file.
-    pub fn save_to(&self, _path: &Path) -> Fd5Result<()> {
-        todo!("Identity::save_to not yet implemented")
+    pub fn save_to(&self, path: &Path) -> Fd5Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| crate::error::Fd5Error::Other(format!("Failed to serialize identity: {e}")))?;
+        std::fs::write(path, content)?;
+        Ok(())
     }
 
     /// Convert to an [`Author`] for use in audit entries.
     pub fn to_author(&self) -> Author {
-        todo!("Identity::to_author not yet implemented")
+        Author {
+            author_type: self.identity_type.clone(),
+            id: self.id.clone(),
+            name: self.name.clone(),
+        }
     }
 }
 

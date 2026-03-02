@@ -49,13 +49,46 @@ pub struct AuditEntry {
 /// Read the audit log from an fd5 file.
 ///
 /// Returns an empty `Vec` if the `_fd5_audit_log` attribute does not exist.
-pub fn read_audit_log(_file: &File) -> Fd5Result<Vec<AuditEntry>> {
-    todo!("read_audit_log not yet implemented")
+pub fn read_audit_log(file: &File) -> Fd5Result<Vec<AuditEntry>> {
+    let root = file.as_group()?;
+    let attr = match root.attr(AUDIT_LOG_ATTR) {
+        Ok(a) => a,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let raw: String = attr
+        .read_scalar::<VarLenUnicode>()
+        .map(|v| v.as_str().to_string())
+        .map_err(|e| Fd5Error::Other(format!("Failed to read {AUDIT_LOG_ATTR}: {e}")))?;
+
+    let entries: Vec<AuditEntry> = serde_json::from_str(&raw)?;
+    Ok(entries)
 }
 
 /// Append an audit entry to the log, preserving existing entries.
-pub fn append_audit_entry(_file: &File, _entry: &AuditEntry) -> Fd5Result<()> {
-    todo!("append_audit_entry not yet implemented")
+pub fn append_audit_entry(file: &File, entry: &AuditEntry) -> Fd5Result<()> {
+    let root = file.as_group()?;
+
+    // Read existing entries (or start with empty vec)
+    let mut entries = read_audit_log(file)?;
+    entries.push(entry.clone());
+
+    let json = serde_json::to_string(&entries)?;
+    let vlu: VarLenUnicode = json
+        .parse()
+        .map_err(|_| Fd5Error::Other("audit JSON contains null bytes".to_string()))?;
+
+    // Delete old attribute if present, then write new
+    if root.attr(AUDIT_LOG_ATTR).is_ok() {
+        root.delete_attr(AUDIT_LOG_ATTR)?;
+    }
+    root.new_attr::<VarLenUnicode>()
+        .shape(())
+        .create(AUDIT_LOG_ATTR)?
+        .write_scalar(&vlu)?;
+
+    file.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -83,12 +83,124 @@ pub enum ChainStatus {
     Error(String),
 }
 
+/// Helper: write a VarLenUnicode attribute, deleting any existing one first.
+fn write_vlu_attr(
+    root: &hdf5_metno::Group,
+    path: &str,
+    attr_name: &str,
+    vlu: &hdf5_metno::types::VarLenUnicode,
+) -> Fd5Result<()> {
+    if path == "/" {
+        // Delete and recreate on root
+        let _ = root.delete_attr(attr_name);
+        root.new_attr::<hdf5_metno::types::VarLenUnicode>()
+            .shape(())
+            .create(attr_name)?
+            .write_scalar(vlu)?;
+    } else {
+        let group = root.group(path)
+            .map_err(|e| Fd5Error::Other(format!(
+                "Cannot open group '{}': {e}", path
+            )))?;
+        let _ = group.delete_attr(attr_name);
+        group
+            .new_attr::<hdf5_metno::types::VarLenUnicode>()
+            .shape(())
+            .create(attr_name)?
+            .write_scalar(vlu)?;
+    }
+    Ok(())
+}
+
 /// Verify the audit chain integrity.
 ///
-/// Each entry's `parent_hash` must match the `content_hash` at the time
-/// of the previous entry, forming a hash chain.
-pub fn verify_chain(_file: &File) -> Fd5Result<ChainStatus> {
-    todo!("verify_chain not yet implemented")
+/// Reconstructs each intermediate file state by reversing attribute edits
+/// recorded in the audit entries, then checks that each entry's
+/// `parent_hash` matches the Merkle hash of the reconstructed state.
+///
+/// This works by copying the file to a temporary location and
+/// iteratively undoing changes to verify each link in the chain.
+pub fn verify_chain(file: &File) -> Fd5Result<ChainStatus> {
+    let entries = match audit::read_audit_log(file) {
+        Ok(entries) if entries.is_empty() => return Ok(ChainStatus::NoLog),
+        Ok(entries) => entries,
+        Err(e) => return Ok(ChainStatus::Error(format!("{e}"))),
+    };
+
+    // We need a writable copy to reconstruct intermediate states.
+    let src_path = file.filename();
+    // Use a unique counter to avoid collisions between parallel calls.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = std::env::temp_dir().join(format!(
+        "fd5_chain_verify_{}_{}.fd5",
+        std::process::id(),
+        unique,
+    ));
+    std::fs::copy(&src_path, &tmp_path)?;
+
+    let tmp_file = File::open_rw(&tmp_path)?;
+    let root = tmp_file.as_group()?;
+
+    // Verify from the last entry backwards to the first.
+    // At each step, we undo the entry's changes and check the parent_hash.
+    // We iterate in reverse: verify entry[n-1] first (current state minus
+    // entry[n-1]'s changes), then entry[n-2], etc.
+    for i in (0..entries.len()).rev() {
+        let entry = &entries[i];
+
+        // Undo this entry's attribute changes
+        for change in &entry.changes {
+            if let Some(ref old_val) = change.old {
+                let attr_name = change.attr.as_str();
+                let vlu: hdf5_metno::types::VarLenUnicode = old_val
+                    .parse()
+                    .map_err(|_| Fd5Error::Other("null byte in attr value".to_string()))?;
+
+                write_vlu_attr(&root, &change.path, attr_name, &vlu)?;
+            }
+        }
+
+        // Set audit log to entries[0..i] (before this entry was appended)
+        let prefix = &entries[..i];
+        if root.attr(audit::AUDIT_LOG_ATTR).is_ok() {
+            root.delete_attr(audit::AUDIT_LOG_ATTR)?;
+        }
+        if !prefix.is_empty() {
+            let json = serde_json::to_string(prefix)?;
+            let vlu: hdf5_metno::types::VarLenUnicode = json
+                .parse()
+                .map_err(|_| Fd5Error::Other("null byte in JSON".to_string()))?;
+            root.new_attr::<hdf5_metno::types::VarLenUnicode>()
+                .shape(())
+                .create(audit::AUDIT_LOG_ATTR)?
+                .write_scalar(&vlu)?;
+        }
+
+        // Remove content_hash (it's excluded from Merkle but let's be clean)
+        if root.attr("content_hash").is_ok() {
+            root.delete_attr("content_hash")?;
+        }
+
+        tmp_file.flush()?;
+        let computed = compute_content_hash(&tmp_file)?;
+
+        if computed != entry.parent_hash {
+            drop(tmp_file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Ok(ChainStatus::BrokenChain {
+                index: i,
+                expected: computed,
+                actual: entry.parent_hash.clone(),
+            });
+        }
+    }
+
+    drop(tmp_file);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    Ok(ChainStatus::Valid(entries.len()))
 }
 
 #[cfg(test)]
