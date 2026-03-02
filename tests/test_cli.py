@@ -439,3 +439,338 @@ class TestHelp:
         result = runner.invoke(cli, ["--help"])
         for cmd in ("validate", "info", "schema-dump", "manifest", "migrate"):
             assert cmd in result.output
+
+
+# ---------------------------------------------------------------------------
+# Helpers for edit/log tests
+# ---------------------------------------------------------------------------
+
+
+def _make_sealed_h5(path: Path) -> Path:
+    """Create a minimal sealed fd5 file with a group attribute to edit."""
+    schema_dict = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "_schema_version": {"type": "integer"},
+            "product": {"type": "string"},
+        },
+        "required": ["_schema_version", "product"],
+    }
+    with h5py.File(path, "w") as f:
+        embed_schema(f, schema_dict)
+        f.attrs["product"] = "test/recon"
+        f.attrs["name"] = "original_name"
+        f.attrs["id"] = "sha256:abc123"
+        f.attrs["timestamp"] = "2026-01-15T10:00:00Z"
+        g = f.create_group("calibration")
+        g.attrs["factor"] = "1.0"
+        g.attrs["description"] = "Calibration parameters"
+        f.create_dataset("volume", data=np.zeros((4, 4), dtype=np.float32))
+        f.attrs["content_hash"] = compute_content_hash(f)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# fd5 edit
+# ---------------------------------------------------------------------------
+
+
+class TestEditCommand:
+    def test_edit_in_place(self, runner: CliRunner, tmp_path: Path):
+        """fd5 edit --in-place modifies the file directly and reseals."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        result = runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "Updated cal factor",
+                "--in-place",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # Verify the attribute was changed
+        with h5py.File(src, "r") as f:
+            assert f["calibration"].attrs["factor"] == "1.05"
+
+    def test_edit_creates_audit_entry(self, runner: CliRunner, tmp_path: Path):
+        """fd5 edit should create an audit log entry."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "Updated cal factor",
+                "--in-place",
+            ],
+        )
+        with h5py.File(src, "r") as f:
+            assert "_fd5_audit_log" in f.attrs
+            raw = f.attrs["_fd5_audit_log"]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            log = json.loads(raw)
+            assert len(log) == 1
+            assert log[0]["message"] == "Updated cal factor"
+            assert log[0]["changes"][0]["old"] == "1.0"
+            assert log[0]["changes"][0]["new"] == "1.05"
+
+    def test_edit_preserves_existing_log(self, runner: CliRunner, tmp_path: Path):
+        """A second edit should append to the existing audit log, not overwrite."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "First edit",
+                "--in-place",
+            ],
+        )
+        runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.10",
+                "-m",
+                "Second edit",
+                "--in-place",
+            ],
+        )
+        with h5py.File(src, "r") as f:
+            raw = f.attrs["_fd5_audit_log"]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            log = json.loads(raw)
+            assert len(log) == 2
+            assert log[0]["message"] == "First edit"
+            assert log[1]["message"] == "Second edit"
+
+    def test_edit_copy_on_write(self, runner: CliRunner, tmp_path: Path):
+        """Without --in-place, edit creates a new file."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        out = tmp_path / "edited.h5"
+        result = runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "Copy edit",
+                "-o",
+                str(out),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert out.exists()
+        # Source should be unchanged
+        with h5py.File(src, "r") as f:
+            assert f["calibration"].attrs["factor"] == "1.0"
+        # Output should have the new value
+        with h5py.File(out, "r") as f:
+            assert f["calibration"].attrs["factor"] == "1.05"
+
+    def test_edit_reseals_content_hash(self, runner: CliRunner, tmp_path: Path):
+        """After edit, the content_hash should be recomputed and valid."""
+        from fd5.hash import verify
+
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "Reseal test",
+                "--in-place",
+            ],
+        )
+        assert verify(src) is True
+
+    def test_edit_records_parent_hash(self, runner: CliRunner, tmp_path: Path):
+        """The audit entry should record the content_hash BEFORE the edit."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        with h5py.File(src, "r") as f:
+            original_hash = f.attrs["content_hash"]
+            if isinstance(original_hash, bytes):
+                original_hash = original_hash.decode("utf-8")
+
+        runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "Parent hash test",
+                "--in-place",
+            ],
+        )
+        with h5py.File(src, "r") as f:
+            raw = f.attrs["_fd5_audit_log"]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            log = json.loads(raw)
+            assert log[0]["parent_hash"] == original_hash
+
+    def test_edit_root_attr(self, runner: CliRunner, tmp_path: Path):
+        """Editing a root-level attribute works with '/' path."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        result = runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/.name",
+                "new_name",
+                "-m",
+                "Rename",
+                "--in-place",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        with h5py.File(src, "r") as f:
+            assert f.attrs["name"] == "new_name"
+
+    def test_edit_nonexistent_file_exits_nonzero(
+        self, runner: CliRunner, tmp_path: Path
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "edit",
+                str(tmp_path / "ghost.h5"),
+                "/.name",
+                "val",
+                "-m",
+                "msg",
+                "--in-place",
+            ],
+        )
+        assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# fd5 log
+# ---------------------------------------------------------------------------
+
+
+class TestLogCommand:
+    def test_log_empty(self, runner: CliRunner, tmp_path: Path):
+        """fd5 log on a file with no audit log prints informative message."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        result = runner.invoke(cli, ["log", str(src)])
+        assert result.exit_code == 0
+        assert "no audit" in result.output.lower() or "empty" in result.output.lower()
+
+    def test_log_output_format(self, runner: CliRunner, tmp_path: Path):
+        """fd5 log shows human-readable entries after an edit."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "Updated cal factor",
+                "--in-place",
+            ],
+        )
+        result = runner.invoke(cli, ["log", str(src)])
+        assert result.exit_code == 0
+        assert "Updated cal factor" in result.output
+
+    def test_log_json_flag(self, runner: CliRunner, tmp_path: Path):
+        """fd5 log --json outputs valid JSON."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "JSON test",
+                "--in-place",
+            ],
+        )
+        result = runner.invoke(cli, ["log", str(src), "--json"])
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 1
+        assert parsed[0]["message"] == "JSON test"
+
+    def test_log_nonexistent_file_exits_nonzero(
+        self, runner: CliRunner, tmp_path: Path
+    ):
+        result = runner.invoke(cli, ["log", str(tmp_path / "ghost.h5")])
+        assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# fd5 validate with chain verification
+# ---------------------------------------------------------------------------
+
+
+class TestValidateChainIntegration:
+    def test_validate_shows_chain_status(self, runner: CliRunner, tmp_path: Path):
+        """fd5 validate on a file with valid audit chain should report chain OK."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        # Make an edit to create an audit log
+        runner.invoke(
+            cli,
+            [
+                "edit",
+                str(src),
+                "/calibration.factor",
+                "1.05",
+                "-m",
+                "Chain test",
+                "--in-place",
+            ],
+        )
+        result = runner.invoke(cli, ["validate", str(src)])
+        assert result.exit_code == 0
+        assert "chain" in result.output.lower() or "audit" in result.output.lower()
+
+    def test_validate_broken_chain_exits_one(self, runner: CliRunner, tmp_path: Path):
+        """fd5 validate on a file with broken audit chain should exit 1."""
+        src = _make_sealed_h5(tmp_path / "src.h5")
+        # Manually inject a broken audit log
+        with h5py.File(src, "a") as f:
+            log = [
+                {
+                    "parent_hash": "sha256:totally_wrong_hash",
+                    "timestamp": "2026-03-02T14:30:00Z",
+                    "author": {"type": "anonymous", "id": "", "name": "Anonymous"},
+                    "message": "broken",
+                    "changes": [],
+                }
+            ]
+            f.attrs["_fd5_audit_log"] = json.dumps(log)
+            f.attrs["content_hash"] = compute_content_hash(f)
+        result = runner.invoke(cli, ["validate", str(src)])
+        assert result.exit_code == 1
+        assert "chain" in result.output.lower() or "audit" in result.output.lower()
