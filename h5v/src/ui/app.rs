@@ -22,7 +22,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
-use ratatouille_image::picker::Picker;
+use ratatui_image::picker::Picker;
 
 use crate::{
     config::Config,

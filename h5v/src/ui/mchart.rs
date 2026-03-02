@@ -12,7 +12,7 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders},
 };
-use ratatouille_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
 
 use crate::{color_consts, error::log_error};
 

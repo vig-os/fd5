@@ -3,7 +3,7 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 
 use arboard::Clipboard;
-use ratatouille_image::picker::Picker;
+use ratatui_image::picker::Picker;
 
 use crate::config::Config;
 use crate::h5f::{H5F, Node};

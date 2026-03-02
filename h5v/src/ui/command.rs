@@ -12,6 +12,13 @@ pub enum Command {
         value: String,
         in_place: bool,
     },
+    Log,
+    Identity,
+    IdentitySet {
+        identity_type: String,
+        id: String,
+        name: String,
+    },
     Quit,
     Help,
     Noop,
@@ -43,7 +50,37 @@ impl CommandState {
                 self.last_command = Command::Verify;
                 return Ok(Command::Verify);
             }
+            "log" | "l" => {
+                self.last_command = Command::Log;
+                return Ok(Command::Log);
+            }
+            "identity" | "id" => {
+                self.last_command = Command::Identity;
+                return Ok(Command::Identity);
+            }
             _ => {}
+        }
+        // :identity set <type> <id> <name>
+        if let Some(rest) = command.strip_prefix("identity set").or_else(|| command.strip_prefix("id set")) {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                return Err(AppError::InvalidCommand(
+                    "Usage: :identity set <type> <id> <name>".to_string(),
+                ));
+            }
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+            if parts.len() < 3 {
+                return Err(AppError::InvalidCommand(
+                    "Usage: :identity set <type> <id> <name>".to_string(),
+                ));
+            }
+            let cmd = Command::IdentitySet {
+                identity_type: parts[0].to_string(),
+                id: parts[1].to_string(),
+                name: parts[2].to_string(),
+            };
+            self.last_command = cmd.clone();
+            return Ok(cmd);
         }
         // :edit attr_name value  OR  :edit! attr_name value
         if let Some(rest) = command.strip_prefix("edit!").or_else(|| command.strip_prefix("edit")) {

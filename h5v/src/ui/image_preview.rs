@@ -12,7 +12,7 @@ use ratatui::{
     style::Style,
     Frame,
 };
-use ratatouille_image::{
+use ratatui_image::{
     picker::Picker,
     thread::{ResizeRequest, ResizeResponse, ThreadProtocol},
     Resize, StatefulImage,

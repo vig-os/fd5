@@ -193,7 +193,7 @@ mod tests {
         state.mode = Mode::Command;
         let groups = hints_for_state(&state);
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].len(), 9);
+        assert_eq!(groups[0].len(), 11);
     }
 
     #[test]

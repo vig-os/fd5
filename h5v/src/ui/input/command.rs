@@ -14,6 +14,8 @@ static HINTS: &[KeyHint] = &[
     KeyHint::new("set", "Config"),
     KeyHint::new("v", "Verify fd5"),
     KeyHint::new("edit", "Edit attr"),
+    KeyHint::new("log", "Audit log"),
+    KeyHint::new("id", "Identity"),
     KeyHint::new("q", "Quit"),
     KeyHint::new("?", "Help"),
 ];
@@ -28,7 +30,7 @@ mod tests {
 
     #[test]
     fn hints_count() {
-        assert_eq!(hints().len(), 9);
+        assert_eq!(hints().len(), 11);
     }
 }
 

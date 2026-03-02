@@ -13,7 +13,7 @@ use ratatui::{
     widgets::{Axis, Chart, Dataset, GraphType},
     Frame,
 };
-use ratatouille_image::StatefulImage;
+use ratatui_image::StatefulImage;
 
 use crate::{
     color_consts,

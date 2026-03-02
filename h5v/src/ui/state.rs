@@ -752,6 +752,33 @@ impl AppState<'_> {
                 };
                 match plan.apply() {
                     Ok(result) => {
+                        // Append audit entry to the edited file
+                        let author = fd5::identity::Identity::load()
+                            .unwrap_or_else(|_| fd5::identity::Identity::anonymous())
+                            .to_author();
+                        let change = fd5::audit::Change {
+                            action: "set".into(),
+                            path: "/".into(),
+                            attr: attr_name.clone(),
+                            old: None,
+                            new: Some(value.clone()),
+                        };
+                        let timestamp = {
+                            let dur = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default();
+                            format!("{}Z", dur.as_secs())
+                        };
+                        let entry = fd5::audit::AuditEntry {
+                            parent_hash: result.old_content_hash.clone(),
+                            timestamp,
+                            author,
+                            message: format!("edit {} = {}", attr_name, value),
+                            changes: vec![change],
+                        };
+                        if let Ok(file) = hdf5_metno::File::open_rw(&result.output_path) {
+                            let _ = fd5::audit::append_audit_entry(&file, &entry);
+                        }
                         let msg = format!(
                             "Edited '{}' on {}\nHash: {} -> {}",
                             attr_name,
@@ -762,6 +789,73 @@ impl AppState<'_> {
                         Ok(EventResult::Info(msg))
                     }
                     Err(e) => Ok(EventResult::Error(format!("Edit failed: {}", e))),
+                }
+            }
+            super::command::Command::Log => {
+                let Some(ref fp) = self.fd5_file_path else {
+                    return Ok(EventResult::Error("No file path available".to_string()));
+                };
+                match hdf5_metno::File::open(fp) {
+                    Ok(file) => match fd5::audit::read_audit_log(&file) {
+                        Ok(entries) => {
+                            if entries.is_empty() {
+                                Ok(EventResult::Info("No audit log".to_string()))
+                            } else {
+                                let mut lines = Vec::new();
+                                for (i, entry) in entries.iter().enumerate().rev() {
+                                    lines.push(format!(
+                                        "[{}] {} by {} ({})\n  parent: {}\n  changes: {}",
+                                        i,
+                                        entry.message,
+                                        entry.author.name,
+                                        entry.timestamp,
+                                        &entry.parent_hash[..16.min(entry.parent_hash.len())],
+                                        entry.changes.len(),
+                                    ));
+                                }
+                                Ok(EventResult::Info(lines.join("\n")))
+                            }
+                        }
+                        Err(e) => Ok(EventResult::Error(format!("Failed to read audit log: {}", e))),
+                    },
+                    Err(e) => Ok(EventResult::Error(format!("Failed to open file: {}", e))),
+                }
+            }
+            super::command::Command::Identity => {
+                match fd5::identity::Identity::load() {
+                    Ok(id) => {
+                        let msg = format!(
+                            "Identity: {} ({}: {})",
+                            id.name, id.identity_type, id.id
+                        );
+                        Ok(EventResult::Info(msg))
+                    }
+                    Err(e) => Ok(EventResult::Error(format!("Failed to load identity: {}", e))),
+                }
+            }
+            super::command::Command::IdentitySet {
+                identity_type,
+                id,
+                name,
+            } => {
+                let identity = fd5::identity::Identity {
+                    identity_type: identity_type.clone(),
+                    id: id.clone(),
+                    name: name.clone(),
+                };
+                let path = fd5::identity::Identity::config_path();
+                match identity.save_to(&path) {
+                    Ok(()) => {
+                        let msg = format!(
+                            "Identity saved: {} ({}: {}) -> {}",
+                            name,
+                            identity_type,
+                            id,
+                            path.display()
+                        );
+                        Ok(EventResult::Info(msg))
+                    }
+                    Err(e) => Ok(EventResult::Error(format!("Failed to save identity: {}", e))),
                 }
             }
             super::command::Command::Quit => Ok(EventResult::Quit),

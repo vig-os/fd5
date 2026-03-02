@@ -27,7 +27,7 @@ pub fn render_string<T: ToString>(
     }
 }
 
-fn syntect_to_ratatouille_style(style: syntect::highlighting::Style) -> ratatui::style::Style {
+fn syntect_to_ratatui_style(style: syntect::highlighting::Style) -> ratatui::style::Style {
     // let bg = style.background;
     let fg = style.foreground;
     ratatui::style::Style::default()
@@ -106,7 +106,7 @@ pub fn render_hl_string<T: ToString>(
             h.highlight_line(line, &ps).unwrap();
         let mut spans = vec![];
         for (style, text) in ranges {
-            let style = syntect_to_ratatouille_style(style);
+            let style = syntect_to_ratatui_style(style);
             let mut span = Span::raw(text);
             span.style = style;
             spans.push(span);
