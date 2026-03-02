@@ -357,7 +357,11 @@ class TestVerifyChain:
         assert status.status == "broken"
 
     def test_valid_chain_multiple_entries(self, tmp_path: Path):
-        """A chain of two edits with correct parent hashes is valid."""
+        """A chain of two edits with correct parent hashes is valid.
+
+        Chain verification undoes recorded attribute changes to reconstruct
+        intermediate states and verify each entry's parent_hash.
+        """
         from fd5.audit import AuditEntry, append_audit_entry, verify_chain
 
         path = tmp_path / "multi.h5"

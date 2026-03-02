@@ -10,7 +10,7 @@ from typing import Any
 import click
 import h5py
 
-from fd5.hash import verify
+from fd5.hash import compute_content_hash, verify
 from fd5.ingest._base import discover_loaders
 from fd5.manifest import write_manifest
 from fd5.quality import check_descriptions
@@ -28,6 +28,8 @@ def cli() -> None:
 @click.argument("file", type=click.Path(exists=True, dir_okay=False))
 def validate_cmd(file: str) -> None:
     """Validate an fd5 file against its embedded schema and content_hash."""
+    from fd5.audit import verify_chain
+
     path = Path(file)
     errors: list[str] = []
 
@@ -43,16 +45,185 @@ def validate_cmd(file: str) -> None:
     if not verify(path):
         errors.append("Integrity: content_hash mismatch or missing.")
 
+    # Audit chain verification
+    chain_status = verify_chain(path)
+    if chain_status.status == "broken":
+        errors.append(f"Audit chain: broken. {chain_status.detail}")
+
     if errors:
         for msg in errors:
             click.echo(msg, err=True)
         sys.exit(1)
 
-    click.echo("OK – schema valid, content_hash verified.")
+    parts = ["OK – schema valid, content_hash verified."]
+    if chain_status.status == "valid":
+        parts.append("Audit chain verified.")
+    click.echo(" ".join(parts))
 
 
 # click registers the command name from the function; override with the decorator
 validate_cmd.name = "validate"
+
+
+# ---------------------------------------------------------------------------
+# fd5 edit
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("path_attr")
+@click.argument("value")
+@click.option("-m", "--message", required=True, help="Audit log message.")
+@click.option(
+    "--in-place", is_flag=True, default=False, help="Modify the file in place."
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    default=None,
+    help="Output path for copy-on-write (default: required unless --in-place).",
+)
+def edit(
+    file: str,
+    path_attr: str,
+    value: str,
+    message: str,
+    in_place: bool,
+    output: str | None,
+) -> None:
+    """Edit an HDF5 attribute and record an audit log entry.
+
+    PATH_ATTR is ``/<group_path>.<attr_name>`` (e.g. ``/calibration.factor``
+    or ``/.name`` for a root attribute).
+    """
+    import shutil
+    from datetime import datetime, timezone
+
+    from fd5.audit import AuditEntry, append_audit_entry
+    from fd5.identity import load_identity
+
+    src = Path(file)
+
+    if not in_place and output is None:
+        click.echo("Error: provide --output or --in-place.", err=True)
+        sys.exit(1)
+
+    # Parse path_attr into group path and attribute name
+    dot_idx = path_attr.rfind(".")
+    if dot_idx < 0:
+        click.echo(
+            "Error: PATH_ATTR must be /<group>.<attr> (e.g. /calibration.factor).",
+            err=True,
+        )
+        sys.exit(1)
+
+    group_path = path_attr[:dot_idx]
+    attr_name = path_attr[dot_idx + 1 :]
+
+    if not group_path:
+        group_path = "/"
+
+    # Copy-on-write: copy the file first if not in-place
+    target = src
+    if not in_place:
+        target = Path(output)  # type: ignore[arg-type]
+        shutil.copy2(src, target)
+
+    # Read the current content_hash (parent_hash for the audit entry)
+    with h5py.File(target, "r") as f:
+        parent_hash = f.attrs.get("content_hash", "")
+        if isinstance(parent_hash, bytes):
+            parent_hash = parent_hash.decode("utf-8")
+
+    # Perform the edit
+    with h5py.File(target, "a") as f:
+        # Navigate to the group
+        if group_path == "/":
+            obj = f
+        else:
+            obj = f[group_path]
+
+        old_value = ""
+        if attr_name in obj.attrs:
+            old_val = obj.attrs[attr_name]
+            if isinstance(old_val, bytes):
+                old_value = old_val.decode("utf-8")
+            else:
+                old_value = str(old_val)
+
+        # Set the new value
+        obj.attrs[attr_name] = value
+
+        # Build the audit entry
+        identity = load_identity()
+        entry = AuditEntry(
+            parent_hash=parent_hash,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            author=identity.to_dict(),
+            message=message,
+            changes=[
+                {
+                    "action": "edit",
+                    "path": group_path,
+                    "attr": attr_name,
+                    "old": old_value,
+                    "new": value,
+                }
+            ],
+        )
+
+        # Append to audit log
+        append_audit_entry(f, entry)
+
+        # Reseal with new content_hash
+        f.attrs["content_hash"] = compute_content_hash(f)
+
+    click.echo(f"Edited {path_attr} in {target.name}")
+
+
+# ---------------------------------------------------------------------------
+# fd5 log
+# ---------------------------------------------------------------------------
+
+
+@cli.command("log")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output as JSON.")
+def log_cmd(file: str, as_json: bool) -> None:
+    """Show the audit log of an fd5 file."""
+    from fd5.audit import read_audit_log
+
+    path = Path(file)
+
+    with h5py.File(path, "r") as f:
+        entries = read_audit_log(f)
+
+    if not entries:
+        click.echo("No audit log entries.")
+        return
+
+    if as_json:
+        click.echo(json.dumps([e.to_dict() for e in entries], indent=2))
+        return
+
+    # Human-readable format
+    for i, entry in enumerate(entries):
+        click.echo(f"[{i}] {entry.timestamp}")
+        author_name = entry.author.get("name", "Unknown")
+        author_type = entry.author.get("type", "unknown")
+        click.echo(f"    Author: {author_name} ({author_type})")
+        click.echo(f"    Message: {entry.message}")
+        click.echo(f"    Parent: {entry.parent_hash}")
+        if entry.changes:
+            for c in entry.changes:
+                click.echo(
+                    f"    Change: {c.get('action', '?')} "
+                    f"{c.get('path', '/')}.{c.get('attr', '?')} "
+                    f"{c.get('old', '')} -> {c.get('new', '')}"
+                )
+        click.echo()
 
 
 @cli.command()

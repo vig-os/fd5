@@ -117,8 +117,13 @@ class TestIdentityValidation:
         """Known types should not raise."""
         from fd5.identity import Identity, validate_identity
 
+        ids = {
+            "orcid": "0000-0001-2345-6789",
+            "anonymous": "",
+            "local": "user@host",
+        }
         for t in ("orcid", "anonymous", "local"):
-            ident = Identity(type=t, id="test", name="Test")
+            ident = Identity(type=t, id=ids[t], name="Test")
             validate_identity(ident)  # should not raise
 
     def test_orcid_format_validation(self):
