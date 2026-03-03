@@ -2,17 +2,17 @@
 type: issue
 state: open
 created: 2026-02-12T16:39:35Z
-updated: 2026-02-16T09:57:02Z
+updated: 2026-03-02T16:21:10Z
 author: gerchowl
 author_url: https://github.com/gerchowl
 url: https://github.com/vig-os/fd5/issues/1
-comments: 1
+comments: 2
 labels: question
 assignees: irenecortinovis, c-vigo
 milestone: none
 projects: none
 relationship: none
-synced: 2026-02-25T04:19:57.918Z
+synced: 2026-03-03T04:13:34.718Z
 ---
 
 # [Issue 1]: [Review fd5](https://github.com/vig-os/fd5/issues/1)
@@ -30,4 +30,16 @@ Want sth. that i can ingest the scanner-crap to that is actually usable and then
 _Posted on February 16, 2026 at 09:57 AM_
 
 Add support to sign files (both optionally and mandatory)
+
+---
+
+# [Comment #2]() by [c-vigo]()
+
+_Posted on March 2, 2026 at 04:21 PM_
+
+### Comments
+
+- [Additive schema](https://github.com/vig-os/fd5/blob/0901bb16b7c9ff7335974a0c7fa6d5bd74d24272/white-paper.md#L126-L128). Add a `deprecated` flag to any field so that users get a warning.
+- [Products without lifetime](https://github.com/vig-os/fd5/blob/0901bb16b7c9ff7335974a0c7fa6d5bd74d24272/white-paper.md#L220). Should this be allowed? How can a product not have at least a creation date, i.e. the moment you execute the software that generates the `fd5`?
+- [What manifest?](https://github.com/vig-os/fd5/blob/0901bb16b7c9ff7335974a0c7fa6d5bd74d24272/white-paper.md#L428)  I see now that manifest is explained later, but at this point it is not clear what this means.
 
