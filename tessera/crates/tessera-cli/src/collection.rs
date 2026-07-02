@@ -64,6 +64,7 @@ pub fn inspect(file: &Path, out: &mut dyn Write) -> Result<()> {
     let c = load(file)?;
     w(out, format_args!("collection {}\n", c.name))?;
     w(out, format_args!("id            {}\n", c.id))?;
+    w(out, format_args!("schema        {}\n", c.collection_schema))?;
     w(out, format_args!("timestamp     {}\n", c.timestamp))?;
     if let Some(s) = &c.study {
         w(out, format_args!("study         {s}\n"))?;
