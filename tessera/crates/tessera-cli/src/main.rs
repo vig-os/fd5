@@ -762,6 +762,11 @@ enum IngestSrc {
         /// Attach metadata `key=value` (value parsed as JSON, else string). Repeatable.
         #[arg(long = "meta", value_name = "KEY=VALUE")]
         meta: Vec<String>,
+        /// Per-slice-rescale handling (#300): `bit-exact` (default) rejects a series whose slices
+        /// carry different RescaleSlopes; `global-int16` requantizes them to one int16 scale
+        /// (GE quantitative PET) + records the original per-slice slopes in metadata.
+        #[arg(long, default_value = "bit-exact", value_parser = ["bit-exact", "global-int16"])]
+        rescale_mode: String,
     },
     /// GE listmode HDF5 → `listmode` product (compound → columnar).
     ///
@@ -1587,6 +1592,7 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
             deidentify,
             source_label,
             meta,
+            rescale_mode,
         } => (
             IngestSpec {
                 collection: CollectionMeta {
@@ -1604,7 +1610,16 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
-                    options: FormatOptions::DicomSeries { inputs, deidentify },
+                    options: FormatOptions::DicomSeries {
+                        inputs,
+                        deidentify,
+                        // Validated to one of these two by clap's `value_parser`.
+                        rescale_mode: if rescale_mode == "global-int16" {
+                            tessera_ingest::dicom::RescaleMode::GlobalInt16
+                        } else {
+                            tessera_ingest::dicom::RescaleMode::BitExact
+                        },
+                    },
                 }],
             },
             out,
@@ -2066,6 +2081,7 @@ streaming = "batch"
                 deidentify: true,
                 source_label: None,
                 meta: vec![],
+                rescale_mode: "bit-exact".into(),
             }),
         })
         .unwrap_err();
@@ -2157,6 +2173,7 @@ streaming = "batch"
                 deidentify: true,
                 source_label: Some("DUPLET-07/CT".into()),
                 meta: vec![],
+                rescale_mode: "bit-exact".into(),
             }),
         })
         .unwrap();

@@ -289,17 +289,19 @@ fn dispatch(
             let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
             Ok((m, ()))
         }
-        FormatOptions::DicomSeries { inputs, deidentify } => {
-            // PS3.15 de-id for a series is per-file on the raw object; we route to
-            // `read_series_deidentified`, which opens each slice, applies `deidentify` in memory,
-            // then decodes — so PHI never reaches the stacked volume. The pixels are identical to
-            // the non-de-id path (de-id only touches metadata).
-            let img = if *deidentify {
-                crate::dicom::read_series_deidentified(inputs)?
-            } else {
+        FormatOptions::DicomSeries {
+            inputs,
+            deidentify,
+            rescale_mode,
+        } => {
+            // PS3.15 de-id for a series is per-file on the raw object; `read_series_rescaled` opens
+            // each slice, applies `deidentify` in memory, then decodes — so PHI never reaches the
+            // stacked volume. `rescale_mode` (#300) controls per-slice-rescale handling: `bit-exact`
+            // rejects differing slopes, `global-int16` requantizes them to one int16 scale.
+            if !*deidentify {
                 warn_dicom_not_deidentified();
-                crate::dicom::read_series(inputs)?
-            };
+            }
+            let img = crate::dicom::read_series_rescaled(inputs, *deidentify, *rescale_mode)?;
             // With a `source_label`, recording N paths joined with commas is exactly what the label
             // exists to suppress (an 890-slice series would embed each path verbatim). When no label
             // is given, the joined paths are kept as the v0 behavior.

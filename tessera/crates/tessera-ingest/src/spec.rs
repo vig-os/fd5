@@ -144,6 +144,10 @@ pub enum FormatOptions {
         inputs: Vec<PathBuf>,
         #[serde(default)]
         deidentify: bool,
+        /// How to encode a per-slice-rescaled series (#300): `bit-exact` (default) rejects differing
+        /// `RescaleSlope`s; `global-int16` requantizes them to one int16 scale (GE quantitative PET).
+        #[serde(default)]
+        rescale_mode: crate::dicom::RescaleMode,
     },
     HdfCompound {
         input: PathBuf,
