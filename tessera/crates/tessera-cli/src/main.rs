@@ -752,6 +752,11 @@ enum IngestSrc {
         /// Attach metadata `key=value` (value parsed as JSON, else string). Repeatable.
         #[arg(long = "meta", value_name = "KEY=VALUE")]
         meta: Vec<String>,
+        /// Opt-in GEDDF transform (#310): annotate columns (unit/description) + requantize the
+        /// reconstructed float columns (`en`/`vtx`/`lt`) to int16 at the physical resolution
+        /// (physical = raw × scale) — ~2× smaller, physically lossless. Default off → byte-identical.
+        #[arg(long)]
+        quantize: bool,
     },
     /// Preserve an un-parsed file as an opaque `blob` product (the "junk" tier).
     ///
@@ -1569,6 +1574,7 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
             dataset,
             source_label,
             meta,
+            quantize,
         } => (
             IngestSpec {
                 collection: CollectionMeta {
@@ -1593,6 +1599,7 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                         block_prefix: DEFAULT_BLOCK_PREFIX.into(),
                         streaming: StreamingMode::Auto,
                         slab_rows: DEFAULT_SLAB_ROWS,
+                        quantize,
                     },
                 }],
             },
@@ -1811,6 +1818,7 @@ mod tests {
                 dataset: "events_3p".into(),
                 source_label: None,
                 meta: vec![],
+                quantize: false,
             }),
         })
         .unwrap();

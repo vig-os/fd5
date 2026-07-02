@@ -793,6 +793,34 @@ pub fn to_listmode_product(
         block_prefix,
         row_index,
         extra_sources,
+        None,
+    )
+}
+
+/// Like [`to_listmode_product`], but the caller supplies the sealed column schema — the
+/// annotated / requantized `Vec<Column>` from the opt-in GEDDF transform ([`apply_geddf_dictionary`],
+/// #310). `columns` MUST match `cols` in count, order, and dtype (the transform guarantees this).
+#[allow(clippy::too_many_arguments)]
+pub fn to_listmode_product_with_schema(
+    cols: &TableData,
+    name: &str,
+    timestamp: &str,
+    source: &str,
+    block_prefix: &str,
+    row_index: &str,
+    extra_sources: &[tessera_core::provenance::Source],
+    columns: Vec<Column>,
+) -> Result<(Manifest, Vec<BlockPayload>)> {
+    to_listmode_product_partitioned(
+        cols,
+        name,
+        timestamp,
+        source,
+        tessera_io::BLOCK_ROWS as u64,
+        block_prefix,
+        row_index,
+        extra_sources,
+        Some(columns),
     )
 }
 
@@ -815,20 +843,25 @@ pub(crate) fn to_listmode_product_partitioned(
     block_prefix: &str,
     row_index: &str,
     extra_sources: &[tessera_core::provenance::Source],
+    // `Some` = caller-supplied sealed column schema (annotated / requantized by the opt-in GEDDF
+    // transform, #310); `None` = build it from `cols` (name + dtype only — the byte-identical
+    // default). The overriding schema MUST match `cols` in count, order, and dtype.
+    column_overrides: Option<Vec<Column>>,
 ) -> Result<(Manifest, Vec<BlockPayload>)> {
     if block_rows == 0 {
         return Err(he("to_listmode_product: block_rows must be positive"));
     }
     let total_rows = u64::try_from(cols.first().map(|(_, c)| c.len()).unwrap_or(0)).map_err(he)?;
-    let columns: Vec<Column> = cols
-        .iter()
-        .map(|(n, c)| Column {
-            name: n.clone(),
-            dtype: c.numpy_code().into(),
-            codec: None,
-            ..Default::default()
-        })
-        .collect();
+    let columns: Vec<Column> = column_overrides.unwrap_or_else(|| {
+        cols.iter()
+            .map(|(n, c)| Column {
+                name: n.clone(),
+                dtype: c.numpy_code().into(),
+                codec: None,
+                ..Default::default()
+            })
+            .collect()
+    });
     // Partition through the format SSoT — every block carries `block_rows` rows except the trailing
     // one (which may be partial). The same helpers the streamed path uses, so the per-block split
     // matches → identical content_hash for the same `block_rows`.
@@ -953,6 +986,42 @@ mod tests {
         assert_eq!(cols[0].dtype, "f4");
         assert!(cols[0].scale.is_none());
         assert_eq!(cols[0].unit.as_deref(), Some("ns"));
+    }
+
+    #[test]
+    fn quantized_product_seals_annotated_int16_columns() {
+        // End-to-end: the opt-in transform's annotated/requantized schema reaches the SEALED
+        // manifest's block spec (this is what the `--quantize` ingest path relies on).
+        let mut data: TableData = vec![
+            ("ms".into(), ColumnData::U32(vec![1, 2])),
+            ("en_0".into(), ColumnData::F32(vec![511.0, 425.0])),
+            ("lt".into(), ColumnData::F32(vec![1.5, -2.0])),
+        ];
+        let schema = apply_geddf_dictionary("events_3p", &mut data, true);
+        let (m, _payloads) = to_listmode_product_with_schema(
+            &data,
+            "DP",
+            "2024-01-01T00:00:00Z",
+            "src.h5",
+            "events",
+            "ms",
+            &[],
+            schema,
+        )
+        .unwrap();
+        let cols = m.blocks[0].spec["columns"].as_array().unwrap();
+        let col = |name: &str| cols.iter().find(|c| c["name"] == name).unwrap();
+        // en_0: float → int16, unit keV, scale 0.1.
+        assert_eq!(col("en_0")["dtype"], "i2");
+        assert_eq!(col("en_0")["unit"], "keV");
+        assert_eq!(col("en_0")["scale"], 0.1);
+        // lt: → int16 at 1 ps.
+        assert_eq!(col("lt")["dtype"], "i2");
+        assert_eq!(col("lt")["scale"], 0.001);
+        // ms: integer column untouched, annotated `ms`.
+        assert_eq!(col("ms")["dtype"], "u4");
+        assert_eq!(col("ms")["unit"], "ms");
+        assert!(col("ms").get("scale").is_none());
     }
 
     // Fixture-write only: writing a synthetic .h5 with a compound dataset legitimately needs a
@@ -1314,6 +1383,7 @@ mod tests {
             "events",
             "ms",
             &[],
+            None,
         )
         .unwrap();
 
@@ -1526,6 +1596,7 @@ mod tests {
             "coin_3p",
             "time_ps",
             &[],
+            None,
         )
         .unwrap();
         assert!(

@@ -46,7 +46,7 @@ pub const DEFAULT_BLOCK_PREFIX: &str = "events";
 pub const DEFAULT_ROW_INDEX: &str = "ms";
 
 /// The default per-slab read unit for `hdf-compound` streaming — the GE-HDF5 reader uses the same
-/// constant. Spec-overrideable so wide-row datasets can shrink the per-slab RAM footprint.
+/// constant. Spec-overridable so wide-row datasets can shrink the per-slab RAM footprint.
 pub const DEFAULT_SLAB_ROWS: usize = crate::ge_hdf5::STREAM_SLAB_ROWS;
 
 /// One declarative ingest spec — typically loaded from `.toml` via [`parse`].
@@ -156,6 +156,11 @@ pub enum FormatOptions {
         streaming: StreamingMode,
         #[serde(default = "default_slab_rows")]
         slab_rows: usize,
+        /// Opt-in GEDDF transform (#310): annotate columns (unit/description/short_name) + requantize
+        /// float columns to int16 at the physical resolution (physical = raw × scale). Default off →
+        /// byte-identical output. Forces the batch path (the transform needs the whole table).
+        #[serde(default)]
+        quantize: bool,
     },
     Nifti {
         input: PathBuf,
