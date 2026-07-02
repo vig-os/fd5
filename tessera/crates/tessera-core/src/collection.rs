@@ -137,6 +137,14 @@ pub struct Collection {
     pub description: String,
     /// RFC 3339 timestamp, normalized to UTC.
     pub timestamp: String,
+    /// The declared **collection level schema** — the product/`schema` analogue for collections
+    /// (#294). Resolves a registered, versioned [`CollectionSchema`] whose `member_rule` the engine
+    /// validates at seal + verify. Defaults to the generic, permissive `"collection"`; `"dataset"`
+    /// (products only) / `"project"` (sub-collections, recursive) are the built-in stricter levels,
+    /// and a **domain** may register its own (`exam`/`cohort`/… ) — taxonomy is data, not an engine
+    /// enum. Sealed (part of `manifest_hash`). An unknown schema is permitted (open-world).
+    #[serde(default = "default_collection_schema")]
+    pub collection_schema: String,
     /// Optional study/grouping id (fd5 `study`) — ties this collection to other products of the
     /// same exam. Same field as on [`crate::manifest::Manifest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +164,12 @@ pub struct Collection {
     /// The seal: blake3 over canonical-JSON of this collection with `manifest_hash` omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_hash: Option<String>,
+}
+
+/// The generic, permissive default collection schema (accepts product *and* sub-collection members).
+/// `dataset`/`project` (and domain-registered levels) are the opt-in stricter schemas.
+pub fn default_collection_schema() -> String {
+    "collection".to_string()
 }
 
 /// Build the default identity-input map for a collection — mirrors
@@ -190,6 +204,7 @@ impl Collection {
             name,
             description,
             timestamp,
+            collection_schema: default_collection_schema(),
             study: None,
             level: None,
             members: Vec::new(),
@@ -279,7 +294,16 @@ impl Collection {
         if let Some(mh) = &self.manifest_hash {
             check("manifest_hash", mh, &self.compute_manifest_hash()?)?;
         }
+        // Structural validation: the members satisfy the declared level schema's `member_rule` (#294).
+        self.validate_schema()?;
         Ok(())
+    }
+
+    /// Validate this collection's members against its declared [`collection_schema`](Self::collection_schema)'s
+    /// `member_rule`, using the built-in [`CollectionSchemaRegistry`]. An unknown level id is permitted
+    /// (open-world — a domain-registered level this binary doesn't ship is not an error). #294.
+    pub fn validate_schema(&self) -> crate::Result<()> {
+        CollectionSchemaRegistry::builtin().validate(self)
     }
 
     /// Error if `tessera_version`'s major exceeds [`SUPPORTED_MAJOR`] (forward-incompat), or if it
@@ -303,6 +327,123 @@ impl Collection {
             )));
         }
         Ok(())
+    }
+}
+
+/// The structural rule a [`CollectionSchema`] imposes on a collection's members (#294): which member
+/// **kinds** the level permits (`dataset` ⇒ products only; `project` ⇒ sub-collections only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemberRule {
+    /// Member kinds this level permits; a member whose `kind` is not listed fails validation.
+    pub allowed_member_kinds: Vec<MemberKind>,
+    /// Whether sub-collection members are expected to nest further — records the level's intent
+    /// (recursion is a *mechanism* property the engine always supports; this is the schema's stance).
+    #[serde(default)]
+    pub recursive: bool,
+}
+
+/// A collection **level schema** — the collection analogue of [`crate::schema::ProductSchema`],
+/// registered + versioned so "what a `dataset` / `project` / `cohort` IS" is domain *data*, not an
+/// engine enum (#294). The engine validates the `member_rule` at seal + verify; the taxonomy (the set
+/// of level ids and their rules) is registered, additive, and extensible per domain — core stays
+/// generic (two structural types + recursion), all opinion lives in registered schemas.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectionSchema {
+    /// The level id — the value a [`Collection::collection_schema`] carries (e.g. `"dataset"`).
+    pub collection_schema: String,
+    /// Schema version (additive evolution; the id never changes meaning — stable-id discipline).
+    pub version: String,
+    pub description: String,
+    pub member_rule: MemberRule,
+}
+
+impl CollectionSchema {
+    /// Validate a collection's members against this level's `member_rule` — a typed
+    /// [`crate::Error::Invalid`] naming the first member whose `kind` the level does not permit.
+    pub fn validate(&self, c: &Collection) -> crate::Result<()> {
+        for (i, m) in c.members.iter().enumerate() {
+            if !self.member_rule.allowed_member_kinds.contains(&m.kind) {
+                return Err(crate::Error::Invalid(format!(
+                    "collection schema '{}' does not permit a {:?} member (member {i} '{}')",
+                    self.collection_schema, m.kind, m.reference
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Registry of built-in collection level schemas (mirrors [`crate::schema::SchemaRegistry`]). Core
+/// ships the permissive generic `collection` + the two structural levels `dataset` / `project`; a
+/// **domain** registers its own opinionated levels (`exam`/`cohort`/…). An unknown level id →
+/// permissive (open-world: a level this binary doesn't ship is allowed, not an error).
+#[derive(Debug, Clone)]
+pub struct CollectionSchemaRegistry {
+    schemas: BTreeMap<String, CollectionSchema>,
+}
+
+impl CollectionSchemaRegistry {
+    /// The built-in levels: `collection` (generic, any kind), `dataset` (products only), `project`
+    /// (sub-collections only, recursive).
+    pub fn builtin() -> Self {
+        let schemas = [
+            CollectionSchema {
+                collection_schema: "collection".into(),
+                version: "1.0".into(),
+                description: "A generic catalog — any member kind (the permissive default).".into(),
+                member_rule: MemberRule {
+                    allowed_member_kinds: vec![MemberKind::Product, MemberKind::Collection],
+                    recursive: true,
+                },
+            },
+            CollectionSchema {
+                collection_schema: "dataset".into(),
+                version: "1.0".into(),
+                description: "A collection of products (acq + derived) from one physical setup."
+                    .into(),
+                member_rule: MemberRule {
+                    allowed_member_kinds: vec![MemberKind::Product],
+                    recursive: false,
+                },
+            },
+            CollectionSchema {
+                collection_schema: "project".into(),
+                version: "1.0".into(),
+                description: "A recursive collection of datasets or projects.".into(),
+                member_rule: MemberRule {
+                    allowed_member_kinds: vec![MemberKind::Collection],
+                    recursive: true,
+                },
+            },
+        ];
+        CollectionSchemaRegistry {
+            schemas: schemas
+                .into_iter()
+                .map(|s| (s.collection_schema.clone(), s))
+                .collect(),
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<&CollectionSchema> {
+        self.schemas.get(id)
+    }
+
+    pub fn levels(&self) -> impl Iterator<Item = &str> {
+        self.schemas.keys().map(String::as_str)
+    }
+
+    /// Validate a collection against its declared level schema. Unknown level → `Ok` (open-world).
+    pub fn validate(&self, c: &Collection) -> crate::Result<()> {
+        match self.get(&c.collection_schema) {
+            Some(s) => s.validate(c),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Default for CollectionSchemaRegistry {
+    fn default() -> Self {
+        Self::builtin()
     }
 }
 
@@ -398,6 +539,14 @@ impl CollectionBuilder {
         }
     }
 
+    /// Declare the collection **level schema** (#294) — e.g. `"dataset"` (products only) or
+    /// `"project"` (sub-collections, recursive), or a domain-registered level. `seal` validates the
+    /// members against its `member_rule`. Defaults to the permissive `"collection"`.
+    pub fn with_collection_schema(&mut self, collection_schema: impl Into<String>) -> &mut Self {
+        self.collection.collection_schema = collection_schema.into();
+        self
+    }
+
     /// Set the study/grouping id (ties this collection to the products of the same exam).
     pub fn with_study(&mut self, study: impl Into<String>) -> &mut Self {
         self.collection.study = Some(study.into());
@@ -474,6 +623,10 @@ impl CollectionBuilder {
                 ));
             }
         }
+        // Fail-fast: the members satisfy the declared level schema's `member_rule` *before* we seal
+        // (#294) — a `dataset` can't seal with a sub-collection member, a `project` can't with a
+        // product member. Unknown level → permitted (open-world).
+        self.collection.validate_schema()?;
         self.collection.content_hash = Some(self.collection.recompute_content_hash());
         // Computed last, over the canonical bytes with `manifest_hash` excluded, so the seal
         // transitively commits to id_inputs, study, members + their pinned manifest_hashes, and
@@ -788,5 +941,99 @@ mod tests {
         let mut b = CollectionBuilder::new("c", "d", TS);
         b.with_level(crate::schema::Coded::new("", ""));
         assert!(b.seal().is_err());
+    }
+
+    // ---- #294 CollectionSchema: levels as registered, versioned schemas ----
+
+    fn a_sealed_product() -> Manifest {
+        ProductBuilder::new("recon", "p", "d", TS).seal().unwrap()
+    }
+    fn a_sealed_collection() -> Collection {
+        let p = a_sealed_product();
+        let mut cb = CollectionBuilder::new("child", "d", TS);
+        cb.add_product(&ProductHandle::of(&p).unwrap(), Role::Raw, Vec::new());
+        cb.seal().unwrap()
+    }
+
+    #[test]
+    fn builtin_registry_has_the_three_core_levels() {
+        let r = CollectionSchemaRegistry::builtin();
+        for id in ["collection", "dataset", "project"] {
+            assert!(r.get(id).is_some(), "missing built-in level '{id}'");
+        }
+        assert!(r.get("exam").is_none(), "domain levels are NOT built in");
+    }
+
+    #[test]
+    fn dataset_accepts_products_and_rejects_sub_collections() {
+        let p = a_sealed_product();
+        let child = a_sealed_collection();
+        // dataset + a product member → OK.
+        let mut ok = CollectionBuilder::new("ds", "d", TS);
+        ok.with_collection_schema("dataset").add_product(
+            &ProductHandle::of(&p).unwrap(),
+            Role::Raw,
+            Vec::new(),
+        );
+        ok.seal().unwrap().validate_schema().unwrap();
+        // dataset + a sub-collection member → refused at seal.
+        let mut bad = CollectionBuilder::new("ds", "d", TS);
+        bad.with_collection_schema("dataset").add_subcollection(
+            &CollectionHandle::of(&child).unwrap(),
+            Role::Derived,
+            Vec::new(),
+        );
+        assert!(bad.seal().is_err(), "dataset must reject a sub-collection");
+    }
+
+    #[test]
+    fn project_accepts_sub_collections_and_rejects_products() {
+        let p = a_sealed_product();
+        let child = a_sealed_collection();
+        let mut ok = CollectionBuilder::new("pr", "d", TS);
+        ok.with_collection_schema("project").add_subcollection(
+            &CollectionHandle::of(&child).unwrap(),
+            Role::Derived,
+            Vec::new(),
+        );
+        ok.seal().unwrap().validate_schema().unwrap();
+        let mut bad = CollectionBuilder::new("pr", "d", TS);
+        bad.with_collection_schema("project").add_product(
+            &ProductHandle::of(&p).unwrap(),
+            Role::Raw,
+            Vec::new(),
+        );
+        assert!(bad.seal().is_err(), "project must reject a product member");
+    }
+
+    #[test]
+    fn generic_and_unknown_levels_are_permissive_and_schema_is_sealed() {
+        let p = a_sealed_product();
+        let child = a_sealed_collection();
+        // Default generic "collection": both kinds allowed.
+        let mut c = CollectionBuilder::new("mix", "d", TS);
+        c.add_product(&ProductHandle::of(&p).unwrap(), Role::Raw, Vec::new())
+            .add_subcollection(
+                &CollectionHandle::of(&child).unwrap(),
+                Role::Derived,
+                Vec::new(),
+            );
+        let sealed = c.seal().unwrap();
+        assert_eq!(sealed.collection_schema, "collection");
+
+        // Unknown (domain) level → permissive (open-world), and the schema round-trips + is sealed.
+        let mut d = CollectionBuilder::new("cohort-1", "d", TS);
+        d.with_collection_schema("exam").add_product(
+            &ProductHandle::of(&p).unwrap(),
+            Role::Raw,
+            Vec::new(),
+        );
+        let e = d.seal().unwrap();
+        assert_eq!(e.collection_schema, "exam");
+        let json = e.to_json().unwrap();
+        assert!(json.contains("\"collection_schema\": \"exam\""));
+        // The schema is bound in the seal: flipping it on-disk breaks manifest_hash verification.
+        let tampered = json.replace("\"exam\"", "\"dataset\"");
+        assert!(Collection::from_json_verified(&tampered).is_err());
     }
 }
