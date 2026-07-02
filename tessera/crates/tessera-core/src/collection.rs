@@ -64,12 +64,13 @@ impl MemberKind {
         matches!(self, MemberKind::Product)
     }
 
-    /// The tag folded into the `content_hash` leaf preimage so inclusion proofs are **kind-bound**
-    /// and `kind` cannot be flipped without moving the MMR (ADR-0049 §2).
-    fn leaf_tag(self) -> &'static str {
+    /// A fixed **1-byte** content-hash leaf tag — unambiguous for any current *or future* kind (a
+    /// byte tag can't collide or prefix-alias the way a string separator could). The exhaustive match
+    /// forces a new variant to declare its own tag at compile time. ADR-0049 §2.
+    fn leaf_tag(self) -> u8 {
         match self {
-            MemberKind::Product => "product",
-            MemberKind::Collection => "collection",
+            MemberKind::Product => 0x00,
+            MemberKind::Collection => 0x01,
         }
     }
 }
@@ -225,16 +226,22 @@ impl Collection {
     /// content-addressed in the exact same idiom as a product (and gets the same inclusion +
     /// consistency proofs as a free corollary).
     pub fn recompute_content_hash(&self) -> String {
-        // Domain-separate the leaf by `kind` (ADR-0049 §2): the leaf preimage is `"<kind>:<mh>"`, so
-        // an MMR inclusion proof is **kind-bound** (product-`H` and collection-`H` fold to different
-        // leaves) and `kind` cannot be flipped in the JSON without moving `content_hash`. The
-        // `merkle_root` construction (its own `0x00` leaf / `0x01` node domains, ADR-0028) is
-        // unchanged. Pre-1.0 with no pinned collection goldens, this construction is adopted
-        // outright — no bare-`manifest_hash`-leaf compat shim is needed.
+        // Domain-separate the leaf by `kind` (ADR-0049 §2): each leaf is `BLAKE3(leaf-domain ‖
+        // kind_byte ‖ manifest_hash)`, so an MMR inclusion proof is **kind-bound** (product-`H` and
+        // collection-`H` fold to different leaves) and `kind` cannot be flipped in the JSON without
+        // moving `content_hash`. A fixed 1-byte `kind_byte` is unambiguous for any future kind — no
+        // string-separator prefix-collision. `merkle_root`'s own leaf/node domains (ADR-0028) are
+        // unchanged. Pre-1.0 with no pinned collection goldens, adopted outright (no compat shim).
         let leaves: Vec<String> = self
             .members
             .iter()
-            .map(|m| format!("{}:{}", m.kind.leaf_tag(), m.manifest_hash))
+            .map(|m| {
+                let mut pre = Vec::with_capacity(m.manifest_hash.len() + 32);
+                pre.extend_from_slice(b"tessera-collection-member-v1");
+                pre.push(m.kind.leaf_tag());
+                pre.extend_from_slice(m.manifest_hash.as_bytes());
+                crate::hash::digest(&pre)
+            })
             .collect();
         crate::hash::merkle_root(&leaves)
     }
@@ -316,11 +323,22 @@ fn check(what: &'static str, expected: &str, actual: &str) -> crate::Result<()> 
 /// unit, so a caller can't pair the wrong reference with the wrong hash (ADR-0049 §4).
 #[derive(Debug, Clone)]
 pub struct ProductHandle {
-    pub reference: String,
-    pub manifest_hash: String,
+    // Private so `of()` is the ONLY construction path — a caller cannot pair a wrong reference with
+    // a wrong hash (ADR-0049 §4). Read via `reference()` / `manifest_hash()`.
+    pub(crate) reference: String,
+    pub(crate) manifest_hash: String,
 }
 
 impl ProductHandle {
+    /// The pinned product reference (its logical `id`).
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+    /// The pinned product `manifest_hash`.
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+
     /// Build from a sealed product manifest (errors if it isn't sealed yet).
     pub fn of(m: &crate::manifest::Manifest) -> crate::Result<Self> {
         Ok(ProductHandle {
@@ -336,11 +354,20 @@ impl ProductHandle {
 /// A resolved reference to a sealed **sub-collection** — the recursion analogue of [`ProductHandle`].
 #[derive(Debug, Clone)]
 pub struct CollectionHandle {
-    pub reference: String,
-    pub manifest_hash: String,
+    pub(crate) reference: String,
+    pub(crate) manifest_hash: String,
 }
 
 impl CollectionHandle {
+    /// The pinned child-collection reference (its logical `id`).
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+    /// The pinned child-collection `manifest_hash`.
+    pub fn manifest_hash(&self) -> &str {
+        &self.manifest_hash
+    }
+
     /// Build from a sealed child collection (errors if it isn't sealed yet).
     pub fn of(c: &Collection) -> crate::Result<Self> {
         Ok(CollectionHandle {
@@ -415,9 +442,13 @@ impl CollectionBuilder {
         self
     }
 
-    /// Append a member. Order is preserved — the seal folds members' `manifest_hash`es in this
-    /// exact order, so two builders that add the same members in different orders seal to
-    /// different `content_hash`es (intentional: order is part of the catalog's identity).
+    /// Low-level append (pins `kind = Product`). Order is preserved — the seal folds members'
+    /// `manifest_hash`es in this exact order, so two builders that add the same members in different
+    /// orders seal to different `content_hash`es (order is part of the catalog's identity).
+    ///
+    /// **Prefer the typed [`add_product`](Self::add_product) / [`add_subcollection`](Self::add_subcollection)** —
+    /// this raw form cannot express a sub-collection (using it to add a nested collection would silently
+    /// seal a *product*-kind leaf and the wrong `content_hash`).
     pub fn add_member(
         &mut self,
         reference: impl Into<String>,
@@ -434,6 +465,15 @@ impl CollectionBuilder {
     /// Seal: compute the MMR root over the members, then the canonical-JSON seal. Mirrors
     /// [`crate::ProductBuilder::seal`] — the same input always yields byte-identical bytes.
     pub fn seal(mut self) -> crate::Result<Collection> {
+        // Structural well-formedness of the open `level` tag (the engine still never *interprets* it,
+        // ADR-0049 §5): an empty vocabulary or code is malformed, same class as an empty `name`.
+        if let Some(level) = &self.collection.level {
+            if level.vocabulary.is_empty() || level.code.is_empty() {
+                return Err(crate::Error::Invalid(
+                    "collection level tag must have a non-empty _vocabulary and _code".into(),
+                ));
+            }
+        }
         self.collection.content_hash = Some(self.collection.recompute_content_hash());
         // Computed last, over the canonical bytes with `manifest_hash` excluded, so the seal
         // transitively commits to id_inputs, study, members + their pinned manifest_hashes, and
@@ -684,5 +724,69 @@ mod tests {
         let parsed = Collection::from_json_verified(&sealed.to_json().unwrap()).unwrap();
         assert_eq!(parsed.members[1].kind, MemberKind::Collection);
         assert_eq!(parsed.content_hash, sealed.content_hash);
+    }
+
+    /// The property leaf domain-separation exists for: a **kind-flip on a *sealed document***
+    /// (collection→product) is caught by `verify` as a `content_hash` mismatch — not merely builder
+    /// divergence (round-2 review). ADR-0049 §2.
+    #[test]
+    fn kind_flip_on_a_sealed_doc_is_caught_by_verify() {
+        let child = CollectionHandle {
+            reference: "exam-1".into(),
+            manifest_hash: "blake3:abc".into(),
+        };
+        let mut b = CollectionBuilder::new("cohort", "d", TS);
+        b.add_subcollection(&child, Role::Derived, Vec::new());
+        let sealed = b.seal().unwrap();
+        let tampered = sealed
+            .to_json()
+            .unwrap()
+            .replace("\"kind\": \"collection\"", "\"kind\": \"product\"");
+        let parsed = Collection::from_json(&tampered).unwrap(); // product is a valid kind → parses
+        match parsed.verify() {
+            Err(crate::Error::Integrity { what, .. }) => assert_eq!(what, "content_hash"),
+            other => panic!("expected content_hash integrity error on kind-flip, got {other:?}"),
+        }
+    }
+
+    /// The `add_member` footgun is detectable: adding a sub-collection via the raw `add_member`
+    /// (product-kind) seals a DIFFERENT `content_hash` than `add_subcollection`. ADR-0049 §4.
+    #[test]
+    fn add_member_and_add_subcollection_seal_different_content_hash() {
+        let child = CollectionHandle {
+            reference: "x".into(),
+            manifest_hash: "blake3:z".into(),
+        };
+        let mut raw = CollectionBuilder::new("c", "d", TS);
+        raw.add_member(
+            child.reference(),
+            child.manifest_hash(),
+            Role::Derived,
+            Vec::new(),
+        );
+        let mut typed = CollectionBuilder::new("c", "d", TS);
+        typed.add_subcollection(&child, Role::Derived, Vec::new());
+        assert_ne!(
+            raw.seal().unwrap().content_hash,
+            typed.seal().unwrap().content_hash
+        );
+    }
+
+    /// An explicit `"kind": "product"` from another writer parses to the default (serde compat).
+    #[test]
+    fn explicit_product_kind_parses_to_default() {
+        let m: CollectionMember = serde_json::from_str(
+            r#"{"reference":"r","manifest_hash":"blake3:h","role":"raw","kind":"product"}"#,
+        )
+        .unwrap();
+        assert_eq!(m.kind, MemberKind::Product);
+    }
+
+    /// A malformed (empty) level tag is refused at seal — structural well-formedness (round-2 review).
+    #[test]
+    fn empty_level_tag_is_refused_at_seal() {
+        let mut b = CollectionBuilder::new("c", "d", TS);
+        b.with_level(crate::schema::Coded::new("", ""));
+        assert!(b.seal().is_err());
     }
 }
