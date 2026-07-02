@@ -140,6 +140,18 @@ pub fn read_image_deidentified(path: &std::path::Path) -> Result<DicomImage> {
 
 /// Decode an already-parsed DICOM object (testable without touching the filesystem).
 pub fn read_object(obj: &FileDicomObject<InMemDicomObject>) -> Result<DicomImage> {
+    // #301: not every DICOM object is an image. Raw sinogram/projection objects (e.g. GE
+    // `GEMS_PET_RAW`), structured reports, and exam reports carry no pixel grid. Detect that up
+    // front and point the operator at the blob (cold/archival) tier, instead of failing deep in the
+    // decoder with a cryptic "No such data element with tag (0028,0010)".
+    if obj.element(ROWS).is_err() || obj.element(PIXEL_DATA).is_err() {
+        return Err(Error::Invalid(
+            "dicom: non-image DICOM object (no Rows/PixelData — e.g. a raw sinogram/projection, \
+             structured report, or exam report). Preserve it bit-faithfully with \
+             `tessera ingest blob` (the cold/archival tier), not the recon path (#301)."
+                .into(),
+        ));
+    }
     let modality = obj
         .element(MODALITY)
         .map_err(de)?
@@ -666,6 +678,31 @@ mod tests {
     }
 
     /// Synthesize a minimal uncompressed CT DICOM, write it, read it back, ingest — fully hermetic.
+    #[test]
+    fn non_image_dicom_object_gives_actionable_blob_guidance() {
+        // A DICOM object with no pixel grid (raw sinogram / SR / report — e.g. GE `GEMS_PET_RAW`).
+        let obj = InMemDicomObject::from_element_iter([
+            DataElement::new(MODALITY, VR::CS, PrimitiveValue::from("PT")),
+            // deliberately NO Rows / Columns / PixelData.
+        ]);
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2")
+            .media_storage_sop_instance_uid("1.2.3.4.5.6.7.8.9.1")
+            .implementation_class_uid("1.2.826.0.1.3680043.tessera")
+            .build()
+            .unwrap();
+        let file_obj = obj.with_exact_meta(meta);
+
+        let err = read_object(&file_obj).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("non-image DICOM"), "not actionable: {msg}");
+        assert!(
+            msg.contains("tessera ingest blob"),
+            "no blob-tier guidance: {msg}"
+        );
+    }
+
     #[test]
     fn roundtrip_synthetic_dicom_file() {
         let (rows, cols) = (8u16, 8u16);
