@@ -714,6 +714,7 @@ mod tests {
                     name: "radius".into(),
                     dtype: "f4".into(),
                     codec: None,
+                    ..Default::default()
                 }],
                 rows: 1,
                 row_index: None,
@@ -784,6 +785,7 @@ mod tests {
                     name: "start_s".into(),
                     dtype: "f8".into(),
                     codec: None,
+                    ..Default::default()
                 }],
                 rows: 4,
                 row_index: None,
@@ -835,6 +837,7 @@ mod tests {
                     name: "start_s".into(),
                     dtype: "f8".into(),
                     codec: None,
+                    ..Default::default()
                 }],
                 rows: 4,
                 row_index: None,

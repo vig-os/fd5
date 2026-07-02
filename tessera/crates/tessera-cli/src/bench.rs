@@ -156,6 +156,7 @@ fn listmode_columns() -> Vec<Column> {
             name: (*n).into(),
             dtype: d.into(),
             codec: None,
+            ..Default::default()
         })
         .collect()
 }

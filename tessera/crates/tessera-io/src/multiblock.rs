@@ -398,6 +398,7 @@ mod tests {
             name: name.into(),
             dtype: dtype.into(),
             codec: None,
+            ..Default::default()
         }
     }
 

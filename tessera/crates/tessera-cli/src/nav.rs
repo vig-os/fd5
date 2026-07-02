@@ -159,6 +159,27 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
+/// Trailing self-description for a table column line: `  · <unit> · ×<scale> · <description>`
+/// (fd5 I1/I2, #307). Empty when the column carries no annotation, so legacy columns render
+/// exactly as before (`name  dtype`).
+fn column_annotation(c: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(u) = c.get("unit").and_then(Value::as_str) {
+        parts.push(u.to_string());
+    }
+    if let Some(s) = c.get("scale").and_then(Value::as_f64) {
+        parts.push(format!("×{s}"));
+    }
+    if let Some(d) = c.get("description").and_then(Value::as_str) {
+        parts.push(d.to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("  · {}", parts.join(" · "))
+    }
+}
+
 /// Child lines for a block: column `name dtype` rows for tables, spec detail for arrays.
 fn block_children(kind: &BlockKind, spec: &Value) -> Vec<String> {
     match kind {
@@ -188,7 +209,7 @@ fn block_children(kind: &BlockKind, spec: &Value) -> Vec<String> {
                     .map(|c| {
                         let n = c.get("name").and_then(Value::as_str).unwrap_or("?");
                         let d = c.get("dtype").and_then(Value::as_str).unwrap_or("?");
-                        format!("{n:<10} {d}")
+                        format!("{n:<10} {d}{}", column_annotation(c))
                     })
                     .collect()
             })
@@ -1420,11 +1441,13 @@ mod tests {
                     name: "ms".into(),
                     dtype: "u4".into(),
                     codec: None,
+                    ..Default::default()
                 },
                 Column {
                     name: "en".into(),
                     dtype: "f4".into(),
                     codec: None,
+                    ..Default::default()
                 },
             ],
             rows: 4,
@@ -1442,6 +1465,49 @@ mod tests {
         b.with_field("modality", serde_json::json!("PT"));
         let sealed = b.seal().unwrap();
         pack(&sealed, &[payload], path).unwrap();
+    }
+
+    #[test]
+    fn column_annotation_renders_unit_scale_description() {
+        // Annotated column → self-describing suffix (fd5 I1/I2, #307).
+        let annotated = serde_json::json!({
+            "name": "en", "dtype": "i2", "unit": "keV", "scale": 0.1,
+            "description": "Calibrated per-photon energy"
+        });
+        assert_eq!(
+            column_annotation(&annotated),
+            "  · keV · ×0.1 · Calibrated per-photon energy"
+        );
+        // Bare column → empty suffix, so legacy columns render exactly as before.
+        let bare = serde_json::json!({ "name": "ms", "dtype": "u4" });
+        assert_eq!(column_annotation(&bare), "");
+        // Unit-only is fine (no scale/description).
+        let unit_only = serde_json::json!({ "name": "ax", "dtype": "u1", "unit": "1" });
+        assert_eq!(column_annotation(&unit_only), "  · 1");
+    }
+
+    #[test]
+    fn annotated_column_shows_in_block_children() {
+        let spec = serde_json::json!({
+            "columns": [
+                { "name": "en", "dtype": "i2", "unit": "keV",
+                  "description": "energy", "scale": 0.1 },
+                { "name": "ms", "dtype": "u4" }
+            ],
+            "rows": 4
+        });
+        let lines = block_children(&BlockKind::Table, &spec);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].contains("keV") && lines[0].contains("×0.1"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains('·'),
+            "bare column stays plain: {}",
+            lines[1]
+        );
     }
 
     #[test]

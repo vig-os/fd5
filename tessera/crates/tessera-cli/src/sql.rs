@@ -186,11 +186,13 @@ mod tests {
                     name: "ms".into(),
                     dtype: "u4".into(),
                     codec: None,
+                    ..Default::default()
                 },
                 Column {
                     name: "en".into(),
                     dtype: "f4".into(),
                     codec: None,
+                    ..Default::default()
                 },
             ],
             rows: 4,

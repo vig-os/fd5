@@ -592,7 +592,7 @@ pub fn decode_column(spec: &TableSpec, blob: &[u8], name: &str) -> Result<Column
 /// use tessera_io::table::{table_chunk_index, ColumnData, TableData};
 ///
 /// let spec = TableSpec {
-///     columns: vec![Column { name: "t".into(), dtype: "u8".into(), codec: None }],
+///     columns: vec![Column { name: "t".into(), dtype: "u8".into(), codec: None, ..Default::default() }],
 ///     rows: 3,
 ///     row_index: None,
 /// };
@@ -693,6 +693,7 @@ mod tests {
             name: name.into(),
             dtype: dtype.into(),
             codec: None,
+            ..Default::default()
         }
     }
 
