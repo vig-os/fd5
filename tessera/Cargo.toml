@@ -60,7 +60,7 @@ hdf5-metno = "0.12"
 hdf5-metno-sys = "0.12"
 # Python bindings (tessera-py). abi3 → one .so works across CPython ≥3.9; extension-module → no
 # libpython link (the build needs only the abi3 minimum, not a runtime interpreter).
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
 # Declarative ingest spec (`tessera-ingest::spec`) — pure-Rust TOML parser. The engine canonicalizes the
 # parsed model (JCS) before hashing, so whitespace / comments / key-order in the source TOML never
 # change the spec hash that flows into each member's `ingested_via_spec` provenance edge.
