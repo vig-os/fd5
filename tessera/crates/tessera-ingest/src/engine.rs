@@ -366,8 +366,12 @@ fn dispatch(
             block_prefix,
             streaming,
             slab_rows,
+            quantize,
         } => {
-            let should_stream = resolve_streaming(*streaming, input, dataset, stream_threshold)?;
+            // The opt-in GEDDF quantize/annotate transform (#310) operates on the whole in-memory
+            // table, so it forces the batch path (the streaming slab writer has no transform seam yet).
+            let should_stream =
+                !*quantize && resolve_streaming(*streaming, input, dataset, stream_threshold)?;
             if should_stream {
                 // Stream straight to disk — the bounded-memory + multi-block path. The output path
                 // is computed BEFORE the seal because the streaming writer writes the .tsra
@@ -411,19 +415,35 @@ fn dispatch(
                 Ok((m, ()))
             } else {
                 // Batch path: read the whole compound, build the in-memory product, pack.
-                let cols = crate::ge_hdf5::read_compound(input, dataset)?;
+                let mut cols = crate::ge_hdf5::read_compound(input, dataset)?;
                 let source = label
                     .map(str::to_string)
                     .unwrap_or_else(|| input.display().to_string());
-                let (m, payloads) = crate::ge_hdf5::to_listmode_product(
-                    &cols,
-                    name,
-                    &timestamp,
-                    &source,
-                    block_prefix,
-                    row_index,
-                    extra_sources,
-                )?;
+                let (m, payloads) = if *quantize {
+                    // Opt-in transform (#310): annotate + requantize float columns to int16 before
+                    // sealing, so both payload and manifest reflect the physical-resolution encoding.
+                    let schema = crate::ge_hdf5::apply_geddf_dictionary(dataset, &mut cols, true);
+                    crate::ge_hdf5::to_listmode_product_with_schema(
+                        &cols,
+                        name,
+                        &timestamp,
+                        &source,
+                        block_prefix,
+                        row_index,
+                        extra_sources,
+                        schema,
+                    )?
+                } else {
+                    crate::ge_hdf5::to_listmode_product(
+                        &cols,
+                        name,
+                        &timestamp,
+                        &source,
+                        block_prefix,
+                        row_index,
+                        extra_sources,
+                    )?
+                };
                 let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
                 Ok((m, ()))
             }

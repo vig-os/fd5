@@ -43,6 +43,7 @@
             (craneLib.filterCargoSources path type)
             || (pkgs.lib.hasInfix "/corpus/" path)
             || (pkgs.lib.hasInfix "/docs/examples/" path)
+            || (pkgs.lib.hasInfix "/docs/dictionaries/" path)
             || (pkgs.lib.hasInfix "/tests/cmd/" path);
           name = "source";
         };
