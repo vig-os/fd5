@@ -79,6 +79,73 @@ pub fn run(
     cfg: &tessera_io::WriteConfig,
     stream_threshold: u64,
 ) -> Result<tessera_core::Collection> {
+    // Atomicity (#302): the engine writes each member `.tsra` as it goes, so a failure on member N
+    // used to leave members 0..N orphaned in `out_dir` with NO `collection.json` — a half-written
+    // collection indistinguishable from a complete one. Fix: run the whole spec into a private
+    // staging dir, then PROMOTE it into `out_dir` only on full success (atomic per-file renames on
+    // the same filesystem). Any failure removes the staging dir → no orphans, no partial catalog.
+    std::fs::create_dir_all(out_dir).map_err(|e| {
+        Error::Invalid(format!(
+            "ingest-engine: create out_dir {}: {e}",
+            out_dir.display()
+        ))
+    })?;
+    let staging = out_dir.join(".staging-ingest");
+    // Clear any leftover staging from a previously-crashed run before starting.
+    let _ = std::fs::remove_dir_all(&staging);
+    match run_into(spec, spec_path, &staging, cfg, stream_threshold) {
+        Ok(collection) => {
+            promote_staging(&staging, out_dir)?;
+            Ok(collection)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// Move every entry from the completed staging dir into `out_dir` (atomic per-file renames — same
+/// filesystem, since staging is a subdir of `out_dir`), then remove the now-empty staging dir. This
+/// is the commit point of the transactional [`run`]: before it, `out_dir` has no partial output.
+fn promote_staging(staging: &Path, out_dir: &Path) -> Result<()> {
+    let entries = std::fs::read_dir(staging).map_err(|e| {
+        Error::Invalid(format!(
+            "ingest-engine: read staging {}: {e}",
+            staging.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| Error::Invalid(format!("ingest-engine: staging entry: {e}")))?;
+        let dest = out_dir.join(entry.file_name());
+        std::fs::rename(entry.path(), &dest).map_err(|e| {
+            Error::Invalid(format!(
+                "ingest-engine: promote {} -> {}: {e}",
+                entry.path().display(),
+                dest.display()
+            ))
+        })?;
+    }
+    std::fs::remove_dir_all(staging).map_err(|e| {
+        Error::Invalid(format!(
+            "ingest-engine: remove staging {}: {e}",
+            staging.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Run a parsed spec into `out_dir` writing members + `collection.json` directly (no staging). The
+/// transactional [`run`] wraps this against a staging dir; call this only where partial output on
+/// failure is acceptable (it isn't, for a user-facing ingest — use [`run`]).
+fn run_into(
+    spec: &IngestSpec,
+    spec_path: &Path,
+    out_dir: &Path,
+    cfg: &tessera_io::WriteConfig,
+    stream_threshold: u64,
+) -> Result<tessera_core::Collection> {
     let order = validate(spec)?;
     let h = spec_hash(spec)?;
     let spec_ref = spec_path.display().to_string();
@@ -645,6 +712,74 @@ streaming = "batch"
             b = h5_b.display()
         );
         std::fs::write(spec_path, s).unwrap();
+    }
+
+    #[test]
+    fn failed_member_leaves_no_orphans_or_partial_collection() {
+        // Atomicity (#302): a mid-run failure must leave `out_dir` with NO orphaned `.tsra`, NO
+        // partial `collection.json`, and no leftover staging dir.
+        let dir = tempfile::tempdir().unwrap();
+        let h5 = dir.path().join("a.h5");
+        write_synth_2p(&h5, 50, "events_2p");
+        // Product 1 valid; product 2 points at a dataset that doesn't exist → dispatch fails.
+        let spec_toml = format!(
+            r#"
+[collection]
+name = "atomic-test"
+timestamp = "{TS}"
+
+[[product]]
+name = "good"
+role = "raw"
+schema = "listmode"
+format = "hdf-compound"
+input = "{h5}"
+dataset = "events_2p"
+streaming = "batch"
+
+[[product]]
+name = "bad"
+role = "raw"
+schema = "listmode"
+format = "hdf-compound"
+input = "{h5}"
+dataset = "does_not_exist"
+streaming = "batch"
+"#,
+            h5 = h5.display()
+        );
+        let spec_path = dir.path().join("spec.toml");
+        std::fs::write(&spec_path, spec_toml).unwrap();
+        let out = dir.path().join("out");
+        let cfg = tessera_io::WriteConfig::for_system().workers(2);
+        let parsed = parse_spec(&spec_path).unwrap();
+
+        let result = run(
+            &parsed,
+            &spec_path,
+            &out,
+            &cfg,
+            DEFAULT_STREAM_THRESHOLD_BYTES,
+        );
+        assert!(result.is_err(), "the missing dataset should fail the run");
+
+        assert!(
+            !out.join("collection.json").exists(),
+            "partial collection.json left behind"
+        );
+        assert!(
+            !out.join(".staging-ingest").exists(),
+            "staging dir not cleaned up"
+        );
+        let orphans: Vec<_> = std::fs::read_dir(&out)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "tsra"))
+                    .map(|e| e.file_name())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(orphans.is_empty(), "orphaned .tsra files: {orphans:?}");
     }
 
     #[test]
