@@ -19,7 +19,10 @@ the derivation hierarchy that FAIR/WORM/distribution all want to act on.
 2. **Logical collections nest by reference.** A *collection* references its member products — and
    sub-collections, recursively — by `id`/`manifest_hash` plus the provenance DAG. Nesting lives at the
    logical (descriptor) layer, never by embedding one container in another. The existing `study` label
-   and `sources` edges are the primitives.
+   and `sources` edges are the primitives. **The recursion *mechanism* — a `kind: Product | Collection`
+   member discriminator, domain-separated MMR leaves, recursive offline `verify`, and a level-agnostic
+   engine — is decided in [ADR-0049](0049-recursive-collections.md) (spike #293); level *semantics*
+   (what a level means, living/frozen cohorts, FAIR mapping) are #294.**
 3. **One logical collection, three projections** (not opinionated — all three are emitted from the same
    descriptor): **RO-Crate** `ro-crate-metadata.json` (FAIR discovery; already the discovery-export
    target), **OCI image index** (native manifest-of-manifests referencing N `.tsra` artifacts), and an
