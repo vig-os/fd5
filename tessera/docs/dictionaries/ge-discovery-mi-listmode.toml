@@ -121,6 +121,8 @@ dtype = "f4[]"
 unit = "keV"                    # CONFIRMED by 511 photopeak; DescriptionCSV "eV" is inconsistent
 vocabulary = "MorePET"
 _conflict = "DescriptionCSV.md says eV; data (511 photopeak) says keV"
+quantize_scale = 0.1   # 0.1 keV — 0..1220 keV ×10 fits int16 ±32767
+quantize_dtype = "i2"
 
 [events.ax]
 short_name = "ax"
@@ -142,6 +144,8 @@ description = "Reconstructed annihilation vertex (x, y, z). Data: x,y ±369.8 (t
 dtype = "f4[3]"
 unit = "mm"                     # CONFIRMED: DescriptionCSV V_{x,y,z}/mm + FOV-matching ranges
 vocabulary = "MorePET"
+quantize_scale = 0.0125   # 0.0125 mm — ±370 mm ×80 = ±29600 (int16-safe)
+quantize_dtype = "i2"
 
 [events.lt]
 short_name = "lt"
@@ -150,6 +154,8 @@ dtype = "f4"
 unit = "ns"                     # data −16.8…+17.4 (matches ±15 ns window). DescriptionCSV says ps.
 vocabulary = "MorePET"
 _conflict = "DescriptionCSV.md says ps; HDF5 float range (±17, = ±15ns window) says ns"
+quantize_scale = 0.001   # 1 ps — ±17 ns ×1000 = ±17000 (int16-safe)
+quantize_dtype = "i2"
 
 [events.lt_corr]
 short_name = "lt_corr"
@@ -158,6 +164,8 @@ dtype = "f4"
 unit = "ns"
 vocabulary = "MorePET"
 _tentative = true               # same ns/ps question as lt; mostly NaN in DP01
+quantize_scale = 0.001   # 1 ps, as lt
+quantize_dtype = "i2"
 
 # ── raw_data/time_markers — per-millisecond time index + running counts (416 k rows) ────
 [time_markers.tm]
