@@ -38,6 +38,42 @@ pub enum Role {
     Derived,
 }
 
+/// Whether a [`CollectionMember`] resolves to a flat product (`<ref>.tsra`) or a nested
+/// sub-collection (`<ref>.collection.json`) — the recursion discriminator (ADR-0049 §1). A member is
+/// pinned by `manifest_hash` exactly like a product either way; `kind` only says how to *resolve* and
+/// *verify* it. `#[non_exhaustive]` so a future kind (external / virtual reference) stays additive and
+/// downstream matchers cannot lock the variant set; an unknown `kind` is *refused* by serde (never
+/// swallowed), gated first by [`Collection::check_version`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MemberKind {
+    /// A flat physical product — one `.tsra` (the default; skipped on serialize so pre-recursion
+    /// collections stay byte-identical).
+    #[default]
+    Product,
+    /// A nested sub-collection — a child `collection.json`, verified recursively.
+    Collection,
+}
+
+impl MemberKind {
+    /// The default-kind predicate for `#[serde(skip_serializing_if)]` — keeps existing all-product
+    /// collections byte-identical (the `kind` key is omitted entirely). A free-standing associated
+    /// fn (not a trait method) so serde's macro is happy. ADR-0049 §1.
+    pub fn is_product(&self) -> bool {
+        matches!(self, MemberKind::Product)
+    }
+
+    /// The tag folded into the `content_hash` leaf preimage so inclusion proofs are **kind-bound**
+    /// and `kind` cannot be flipped without moving the MMR (ADR-0049 §2).
+    fn leaf_tag(self) -> &'static str {
+        match self {
+            MemberKind::Product => "product",
+            MemberKind::Collection => "collection",
+        }
+    }
+}
+
 /// One member of a [`Collection`]: a flat physical product referenced by its content-addressed `id`
 /// and pinned to its `manifest_hash` (so the collection seal transitively commits to the member).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,9 +83,14 @@ pub struct CollectionMember {
     /// The member product's seal — pinned here so changing the member changes the collection.
     pub manifest_hash: String,
     pub role: Role,
+    /// Product or nested sub-collection (ADR-0049 §1). Skipped on serialize when `Product` (the
+    /// default) → pre-recursion collections serialize byte-identical.
+    #[serde(default, skip_serializing_if = "MemberKind::is_product")]
+    pub kind: MemberKind,
     /// Other members in this collection this one is derived from (their `reference`s). Forms an
     /// in-collection DAG that mirrors the manifest's `sources` edges, used by the RO-Crate
-    /// projection to render `wasDerivedFrom`.
+    /// projection to render `wasDerivedFrom`. Peers-only — a cross-collection dependency is
+    /// materialized as a member of the enclosing collection, never a dangling reference (ADR-0049 §4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_from: Vec<String>,
 }
@@ -60,8 +101,15 @@ impl CollectionMember {
             reference: reference.into(),
             manifest_hash: manifest_hash.into(),
             role,
+            kind: MemberKind::Product,
             derived_from: Vec::new(),
         }
+    }
+
+    /// Builder: mark this member as a nested sub-collection (vs the default flat product).
+    pub fn with_kind(mut self, kind: MemberKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Builder: record the in-collection edges this member is derived from.
@@ -92,6 +140,12 @@ pub struct Collection {
     /// same exam. Same field as on [`crate::manifest::Manifest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub study: Option<String>,
+    /// Optional, **open, domain-supplied** level tag (`_vocabulary`/`_code`). The engine carries it
+    /// but never interprets it — level *taxonomies* (exam / cohort / site / …) are domain
+    /// profiles/data, NOT an engine enum (ADR-0049 §5, RFC §12). `None` by default; part of the seal
+    /// when present. This is what makes a nesting level self-describing without Tessera opining on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<crate::schema::Coded>,
     /// Member products, in declared order — order is significant (folded into `content_hash`).
     #[serde(default)]
     pub members: Vec<CollectionMember>,
@@ -136,6 +190,7 @@ impl Collection {
             description,
             timestamp,
             study: None,
+            level: None,
             members: Vec::new(),
             content_hash: None,
             manifest_hash: None,
@@ -170,10 +225,16 @@ impl Collection {
     /// content-addressed in the exact same idiom as a product (and gets the same inclusion +
     /// consistency proofs as a free corollary).
     pub fn recompute_content_hash(&self) -> String {
+        // Domain-separate the leaf by `kind` (ADR-0049 §2): the leaf preimage is `"<kind>:<mh>"`, so
+        // an MMR inclusion proof is **kind-bound** (product-`H` and collection-`H` fold to different
+        // leaves) and `kind` cannot be flipped in the JSON without moving `content_hash`. The
+        // `merkle_root` construction (its own `0x00` leaf / `0x01` node domains, ADR-0028) is
+        // unchanged. Pre-1.0 with no pinned collection goldens, this construction is adopted
+        // outright — no bare-`manifest_hash`-leaf compat shim is needed.
         let leaves: Vec<String> = self
             .members
             .iter()
-            .map(|m| m.manifest_hash.clone())
+            .map(|m| format!("{}:{}", m.kind.leaf_tag(), m.manifest_hash))
             .collect();
         crate::hash::merkle_root(&leaves)
     }
@@ -251,6 +312,47 @@ fn check(what: &'static str, expected: &str, actual: &str) -> crate::Result<()> 
     Ok(())
 }
 
+/// A resolved reference to a sealed **product** — its logical `id` + `manifest_hash` carried as one
+/// unit, so a caller can't pair the wrong reference with the wrong hash (ADR-0049 §4).
+#[derive(Debug, Clone)]
+pub struct ProductHandle {
+    pub reference: String,
+    pub manifest_hash: String,
+}
+
+impl ProductHandle {
+    /// Build from a sealed product manifest (errors if it isn't sealed yet).
+    pub fn of(m: &crate::manifest::Manifest) -> crate::Result<Self> {
+        Ok(ProductHandle {
+            reference: m.id.clone(),
+            manifest_hash: m
+                .manifest_hash
+                .clone()
+                .ok_or_else(|| crate::Error::Invalid("product is not sealed".into()))?,
+        })
+    }
+}
+
+/// A resolved reference to a sealed **sub-collection** — the recursion analogue of [`ProductHandle`].
+#[derive(Debug, Clone)]
+pub struct CollectionHandle {
+    pub reference: String,
+    pub manifest_hash: String,
+}
+
+impl CollectionHandle {
+    /// Build from a sealed child collection (errors if it isn't sealed yet).
+    pub fn of(c: &Collection) -> crate::Result<Self> {
+        Ok(CollectionHandle {
+            reference: c.id.clone(),
+            manifest_hash: c
+                .manifest_hash
+                .clone()
+                .ok_or_else(|| crate::Error::Invalid("sub-collection is not sealed".into()))?,
+        })
+    }
+}
+
 /// Build a [`Collection`] by adding members in order then sealing — mirrors
 /// [`crate::ProductBuilder`]. Member order is preserved and is significant for `content_hash`, so
 /// the same members in the same order seal to byte-identical bytes (writer-determinism).
@@ -272,6 +374,44 @@ impl CollectionBuilder {
     /// Set the study/grouping id (ties this collection to the products of the same exam).
     pub fn with_study(&mut self, study: impl Into<String>) -> &mut Self {
         self.collection.study = Some(study.into());
+        self
+    }
+
+    /// Set the open, domain-supplied `level` tag (the engine carries it, never interprets it —
+    /// ADR-0049 §5). Level taxonomies are domain data, not an engine enum.
+    pub fn with_level(&mut self, level: crate::schema::Coded) -> &mut Self {
+        self.collection.level = Some(level);
+        self
+    }
+
+    /// Append a **product** member from its resolved handle (ADR-0049 §4) — the type-safe front for
+    /// [`add_member`](Self::add_member) that can't mismatch reference/hash.
+    pub fn add_product(
+        &mut self,
+        product: &ProductHandle,
+        role: Role,
+        derived_from: Vec<String>,
+    ) -> &mut Self {
+        self.collection.members.push(
+            CollectionMember::new(&product.reference, &product.manifest_hash, role)
+                .with_derived_from(derived_from),
+        );
+        self
+    }
+
+    /// Append a **sub-collection** member — the recursion entry point (ADR-0049 §1). Pinned by the
+    /// child's `manifest_hash`; `verify` resolves it as `<ref>.collection.json` and recurses.
+    pub fn add_subcollection(
+        &mut self,
+        sub: &CollectionHandle,
+        role: Role,
+        derived_from: Vec<String>,
+    ) -> &mut Self {
+        self.collection.members.push(
+            CollectionMember::new(&sub.reference, &sub.manifest_hash, role)
+                .with_kind(MemberKind::Collection)
+                .with_derived_from(derived_from),
+        );
         self
     }
 
@@ -425,5 +565,124 @@ mod tests {
         assert_eq!(parsed.content_hash, c.content_hash);
         assert_eq!(parsed.members.len(), 2);
         assert_eq!(parsed.members[1].derived_from, vec![raw.id]);
+    }
+
+    // ---- ADR-0049 recursion mechanism (Part 1) ----
+
+    /// Corpus-neutrality: a product-only collection serializes with NO `kind` key (default skipped),
+    /// so pre-recursion collections are byte-identical. ADR-0049 §1.
+    #[test]
+    fn product_only_collection_omits_the_kind_key() {
+        let raw = raw_listmode();
+        let recon = derived_recon(&raw);
+        let json = build_collection(&raw, &recon).to_json().unwrap();
+        assert!(
+            !json.contains("\"kind\""),
+            "default Product kind must be skipped on serialize:\n{json}"
+        );
+    }
+
+    /// `content_hash` is **kind-bound**: the same `reference`+`manifest_hash` folded as a product vs.
+    /// a sub-collection yields DIFFERENT roots, and the sub-collection member emits `"kind"`. ADR-0049 §2.
+    #[test]
+    fn content_hash_is_domain_separated_by_kind() {
+        let raw = raw_listmode();
+        let handle_ref = &raw.id;
+        let handle_mh = raw.manifest_hash.clone().unwrap();
+
+        let mut as_product = CollectionBuilder::new("c", "d", TS);
+        as_product.add_member(handle_ref, &handle_mh, Role::Raw, Vec::new());
+        let p = as_product.seal().unwrap();
+
+        let child = CollectionHandle {
+            reference: handle_ref.clone(),
+            manifest_hash: handle_mh.clone(),
+        };
+        let mut as_collection = CollectionBuilder::new("c", "d", TS);
+        as_collection.add_subcollection(&child, Role::Derived, Vec::new());
+        let c = as_collection.seal().unwrap();
+
+        assert_ne!(
+            p.content_hash, c.content_hash,
+            "flipping a member's kind must move content_hash (leaf domain separation)"
+        );
+        c.verify().unwrap();
+        assert!(c.to_json().unwrap().contains("\"kind\": \"collection\""));
+    }
+
+    /// The open `level` tag is optional (omitted when None) and **bound in the seal** when present —
+    /// but the engine never interprets it. ADR-0049 §5.
+    #[test]
+    fn level_tag_is_optional_and_sealed_but_uninterpreted() {
+        let plain = CollectionBuilder::new("cohort-A", "a cohort", TS)
+            .seal()
+            .unwrap();
+        assert!(!plain.to_json().unwrap().contains("\"level\""));
+
+        let mut b = CollectionBuilder::new("cohort-A", "a cohort", TS);
+        b.with_level(crate::schema::Coded::new(
+            "tessera-imaging-levels",
+            "cohort",
+        ));
+        let leveled = b.seal().unwrap();
+        let json = leveled.to_json().unwrap();
+        assert!(json.contains("tessera-imaging-levels") && json.contains("\"cohort\""));
+        // The level is part of the manifest_hash seal (same name/timestamp, only level differs).
+        assert_ne!(
+            leveled.manifest_hash, plain.manifest_hash,
+            "level must be committed by the seal"
+        );
+        leveled.verify().unwrap();
+    }
+
+    /// An unknown `kind` is REFUSED by the parser (serde rejects the variant; never swallowed). ADR-0049 §1.
+    #[test]
+    fn unknown_member_kind_is_refused() {
+        let child = CollectionHandle {
+            reference: "recon-x".into(),
+            manifest_hash: "blake3:abc".into(),
+        };
+        let mut b = CollectionBuilder::new("c", "d", TS);
+        b.add_subcollection(&child, Role::Derived, Vec::new());
+        let json = b
+            .seal()
+            .unwrap()
+            .to_json()
+            .unwrap()
+            .replace("\"kind\": \"collection\"", "\"kind\": \"teleport\"");
+        assert!(
+            Collection::from_json(&json).is_err(),
+            "an unknown member kind must be refused, not silently accepted"
+        );
+    }
+
+    /// End-to-end: a two-level nest (a cohort with a product + a sub-collection member) built through
+    /// the typed handles, sealed, round-tripped, and verified. ADR-0049 §1/§4.
+    #[test]
+    fn nested_collection_via_typed_handles_round_trips() {
+        let raw = raw_listmode();
+        let recon = derived_recon(&raw);
+        let exam = build_collection(&raw, &recon); // an L1 "exam" sub-collection (sealed)
+
+        let mut cohort = CollectionBuilder::new("cohort-2024", "a cohort", TS);
+        cohort.add_product(
+            &ProductHandle::of(&recon).unwrap(),
+            Role::Derived,
+            Vec::new(),
+        );
+        cohort.add_subcollection(
+            &CollectionHandle::of(&exam).unwrap(),
+            Role::Derived,
+            Vec::new(),
+        );
+        let sealed = cohort.seal().unwrap();
+
+        assert_eq!(sealed.members[0].kind, MemberKind::Product);
+        assert_eq!(sealed.members[1].kind, MemberKind::Collection);
+        assert_eq!(sealed.members[1].reference, exam.id);
+
+        let parsed = Collection::from_json_verified(&sealed.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.members[1].kind, MemberKind::Collection);
+        assert_eq!(parsed.content_hash, sealed.content_hash);
     }
 }
