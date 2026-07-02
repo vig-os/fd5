@@ -413,6 +413,7 @@ pub fn compound_columns(path: &std::path::Path, dataset: &str) -> Result<Vec<Col
             name,
             dtype: code.into(),
             codec: None,
+            ..Default::default()
         })
         .collect())
 }
@@ -725,6 +726,7 @@ pub(crate) fn to_listmode_product_partitioned(
             name: n.clone(),
             dtype: c.numpy_code().into(),
             codec: None,
+            ..Default::default()
         })
         .collect();
     // Partition through the format SSoT — every block carries `block_rows` rows except the trailing
@@ -1033,6 +1035,7 @@ mod tests {
                         name: n.clone(),
                         dtype: c.numpy_code().into(),
                         codec: None,
+                        ..Default::default()
                     })
                     .collect(),
                 rows: 100,
@@ -1088,6 +1091,7 @@ mod tests {
                     name: n.clone(),
                     dtype: c.numpy_code().into(),
                     codec: None,
+                    ..Default::default()
                 })
                 .collect(),
             rows: 64,

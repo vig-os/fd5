@@ -291,6 +291,7 @@ impl Builder {
                 name: n.clone(),
                 dtype: c.numpy_code().into(),
                 codec: None,
+                ..Default::default()
             })
             .collect();
         let spec = TableSpec {

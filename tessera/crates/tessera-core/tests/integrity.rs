@@ -21,6 +21,7 @@ fn sample_product() -> Manifest {
             name: "lt".into(),
             dtype: "f4".into(),
             codec: Some("zstd".into()),
+            ..Default::default()
         }],
         rows: 2_696_935,
         row_index: Some("ms".into()),
@@ -123,6 +124,7 @@ fn tamper_one_block_changes_content_hash() {
                 name: "lt".into(),
                 dtype: "f4".into(),
                 codec: Some("zstd".into()),
+                ..Default::default()
             }],
             rows: 2_696_935,
             row_index: Some("ms".into()),
@@ -143,6 +145,7 @@ fn block_reorder_changes_content_hash() {
                 name: "lt".into(),
                 dtype: "f4".into(),
                 codec: None,
+                ..Default::default()
             }],
             rows: 1,
             row_index: None,
@@ -214,7 +217,7 @@ proptest! {
             .map(|(i, _)| ArrayBlock::new(format!("a{i}"), ArraySpec::new(vec![2, 2, 2], "int16"))).collect();
         let tables: Vec<_> = kinds.iter().enumerate().filter(|(_, k)| !**k)
             .map(|(i, _)| TableBlock::new(format!("t{i}"),
-                TableSpec { columns: vec![Column { name: "c".into(), dtype: "f4".into(), codec: None }], rows: i as u64, row_index: None })).collect();
+                TableSpec { columns: vec![Column { name: "c".into(), dtype: "f4".into(), codec: None, ..Default::default() }], rows: i as u64, row_index: None })).collect();
         for a in &arrays { b.add_block(a).unwrap(); }
         for t in &tables { b.add_block(t).unwrap(); }
         let m = b.seal().unwrap();

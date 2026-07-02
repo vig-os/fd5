@@ -164,11 +164,13 @@ mod tests {
                     name: "lt".into(),
                     dtype: "f4".into(),
                     codec: Some("zstd".into()),
+                    ..Default::default()
                 },
                 Column {
                     name: "en0".into(),
                     dtype: "f4".into(),
                     codec: Some("zstd".into()),
+                    ..Default::default()
                 },
             ],
             rows: 2_696_935,
