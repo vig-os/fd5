@@ -619,6 +619,33 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum CollectionAction {
+    /// Assemble a collection.json from pre-sealed .tsra products (decouples membership from ingest).
+    New {
+        /// A pre-sealed `.tsra` product member (repeatable).
+        #[arg(long = "member", required = true)]
+        members: Vec<PathBuf>,
+        /// Output directory: writes `collection.json` + each member as `<id>.tsra`.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Collection name.
+        #[arg(long)]
+        name: String,
+        /// Collection description.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Level schema: `collection` (generic) · `dataset` (products) · `project` · a domain level.
+        #[arg(long, default_value = "collection")]
+        schema: String,
+        /// Optional study/grouping id.
+        #[arg(long)]
+        study: Option<String>,
+        /// RFC-3339 identity timestamp (default: the latest member's timestamp).
+        #[arg(long)]
+        timestamp: Option<String>,
+        /// Member role applied to all members: `raw` | `derived`.
+        #[arg(long, default_value = "derived")]
+        role: String,
+    },
     /// Catalog header: identity, seal badge, and each member's role + reference + pinned hash.
     Inspect {
         /// The `collection.json` descriptor.
@@ -1330,6 +1357,38 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
         Cmd::Collection { action } => {
             let mut out = std::io::stdout().lock();
             match action {
+                CollectionAction::New {
+                    members,
+                    out: dir,
+                    name,
+                    description,
+                    schema,
+                    study,
+                    timestamp,
+                    role,
+                } => match role.as_str() {
+                    "raw" | "derived" => {
+                        let role = if role == "raw" {
+                            tessera_core::collection::Role::Raw
+                        } else {
+                            tessera_core::collection::Role::Derived
+                        };
+                        collection::new(
+                            &members,
+                            &dir,
+                            &name,
+                            &description,
+                            &schema,
+                            study.as_deref(),
+                            timestamp.as_deref(),
+                            role,
+                            &mut out,
+                        )
+                    }
+                    other => Err(tessera_core::Error::Invalid(format!(
+                        "--role must be 'raw' or 'derived', got '{other}'"
+                    ))),
+                },
                 CollectionAction::Inspect { file } => collection::inspect(&file, &mut out),
                 CollectionAction::Ls { file, full } => collection::ls(&file, full, &mut out),
                 CollectionAction::Verify { file } => collection::verify(&file, &mut out),
