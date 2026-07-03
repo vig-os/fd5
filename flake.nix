@@ -347,12 +347,21 @@
               mkdir -p $TMPDIR/miniodata
               ${minio}/bin/minio server $TMPDIR/miniodata --address 127.0.0.1:9101 \
                 > $TMPDIR/minio.log 2>&1 &
-              for i in $(seq 1 80); do
+              for i in $(seq 1 160); do
                 ${pkgs.curl}/bin/curl -sf http://127.0.0.1:9101/minio/health/ready && break
                 sleep 0.25
               done
+              # `health/ready` can go green before the S3 API actually accepts `CreateBucket`
+              # (notably on the slower aarch64 runner — `XMinioServerNotInitialized`), so retry the
+              # bucket op itself until it lands rather than firing it once and racing.
+              for i in $(seq 1 120); do
+                ${pkgs.awscli2}/bin/aws --endpoint-url http://127.0.0.1:9101 \
+                  s3 mb s3://tessera-test 2>/dev/null && break
+                sleep 0.5
+              done
+              # Fail the check clearly if the bucket never materialised (vs a confusing later error).
               ${pkgs.awscli2}/bin/aws --endpoint-url http://127.0.0.1:9101 \
-                s3 mb s3://tessera-test
+                s3 ls s3://tessera-test > /dev/null
             '';
             nativeBuildInputs = commonArgs.nativeBuildInputs
               ++ [ minio pkgs.awscli2 pkgs.curl pkgs.cacert ];
