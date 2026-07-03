@@ -138,11 +138,13 @@ impl ProductBuilder {
                 self.manifest.schema = Some(s.to_value()?);
             }
         }
-        // Sealed provenance: stamp the producing tool/build so a reader knows what wrote the file.
-        // Re-stamped per version (not inherited) — a new version is sealed by *this* tool.
+        // Sealed provenance: stamp the **format version** that wrote the file — identity-relevant and
+        // stable across software/crate version bumps (ADR-0052). The build-tool/*software* version is
+        // non-sealed provenance and lives in `aux/provenance.json` (ADR-0042), so a `cargo` version
+        // bump never changes the seal or forces a conformance-corpus regen. (`TESSERA_VERSION` only
+        // changes on a *deliberate* format revision — where a regen is expected.)
         if self.manifest.producer.is_none() {
-            self.manifest.producer =
-                Some(concat!("tessera/", env!("CARGO_PKG_VERSION")).to_string());
+            self.manifest.producer = Some(format!("tessera/{}", crate::manifest::TESSERA_VERSION));
         }
         // The seal is computed last, over the manifest with `manifest_hash` excluded, so it
         // transitively commits to id_inputs, sources, the producer, the embedded schema, and blocks.

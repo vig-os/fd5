@@ -1,14 +1,18 @@
-# Opens/updates a HELD release PR (workspace version bump + CHANGELOG) on pushes to `dev` — ADR-0052.
-# It does NOT tag or publish; `0.1.0-alpha.1` is cut only by deliberately merging that release PR.
+# Opens/updates a HELD release PR (workspace version bump + CHANGELOG) — ADR-0052. It does NOT tag or
+# publish; the alpha is cut only by deliberately merging that release PR.
+#
+# TRIGGER = manual (workflow_dispatch) while the release is *held*: the crates are `0.0.0` with no
+# published/tagged baseline, so release-plz cannot determine a next version yet ("first-release
+# bootstrap"). Run this manually once the workspace version is bootstrapped to `0.1.0-alpha.1` — the
+# `producer` is now decoupled from the crate version (ADR-0052), so that bump costs no corpus regen.
+# Switch back to `push: [dev]` after the first release, when auto-updating the PR is useful.
 #
 # NOTE: for GITHUB_TOKEN to open the PR, enable Settings → Actions → "Allow GitHub Actions to create and
 # approve pull requests", or add a PAT as secrets.RELEASE_PLZ_TOKEN (used first when present).
 name: release-plz
 
 on:  # yamllint disable-line rule:truthy
-  push:
-    branches:
-      - dev
+  workflow_dispatch:
 
 permissions:
   contents: write
