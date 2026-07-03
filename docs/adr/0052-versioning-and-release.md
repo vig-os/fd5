@@ -59,6 +59,20 @@ dev → main                    (distribution: main flips to the tagged release)
 - The Python-template `release.yml` is superseded by `release-plz.yml` (kept or removed separately).
 - Registry publishes stay off until credentials + `publish`-scoping are set — a deliberate, separate step.
 
+## Update (2026-07-03) — producer decoupled from the crate version; trigger held
+
+The first release-plz runs surfaced that the sealed `Manifest.producer` embedded `CARGO_PKG_VERSION`
+(`product.rs`), so *any* crate version bump changed every `manifest_hash` → a full conformance-corpus
+regen per release. **Fixed (C):** the sealed `producer` now stamps the **format** version
+(`TESSERA_VERSION`), not the crate version — byte-identical today (both `0.0.0` → **no regen**), but a
+future crate bump no longer touches the seal. The build/software version stays in the non-sealed
+`aux/provenance.json` (ADR-0042). Software SemVer and format identity are now truly independent.
+
+**Release held (A):** the workflow trigger is `workflow_dispatch` (manual) while the crates are `0.0.0`
+with no baseline (release-plz can't determine a next version pre-first-release). To cut `0.1.0-alpha.1`:
+bootstrap the workspace version (now regen-free), then dispatch release-plz → it opens the held release
+PR. Switch the trigger back to `push: [dev]` after the first release for auto-updating PRs.
+
 ## References
 
 RFC §14 (semver policy / format supersession) · PR #322 (Tessera→dev graduation) · `release-plz.toml`
