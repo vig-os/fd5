@@ -14,7 +14,9 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use tessera_core::collection::{Collection, CollectionBuilder, MemberKind, ProductHandle, Role};
+use tessera_core::collection::{
+    member_filename, Collection, CollectionBuilder, MemberKind, ProductHandle, Role,
+};
 use tessera_core::{Error, Result};
 use tessera_io::Reader;
 
@@ -43,15 +45,11 @@ fn load(file: &Path) -> Result<Collection> {
     Collection::from_json(&std::fs::read_to_string(file)?)
 }
 
-/// The on-disk path of a member next to the `collection.json` — resolved by `kind` (ADR-0049 §4): a
-/// product is `<reference>.tsra`, a sub-collection is `<reference>.collection.json`.
+/// The on-disk path of a member next to the `collection.json` — resolved by `kind` (ADR-0049 §4) via
+/// the shared [`member_filename`] SSoT (so the resolved name matches what every writer emits, #323).
 fn member_path(collection_file: &Path, reference: &str, kind: MemberKind) -> PathBuf {
     let dir = collection_file.parent().unwrap_or_else(|| Path::new("."));
-    if kind == MemberKind::Collection {
-        dir.join(format!("{reference}.collection.json"))
-    } else {
-        dir.join(format!("{reference}.tsra"))
-    }
+    dir.join(member_filename(reference, kind))
 }
 
 fn w(out: &mut dyn Write, args: std::fmt::Arguments<'_>) -> Result<()> {
@@ -296,13 +294,14 @@ pub fn new(
     // `project` would reject them — fail-fast before writing anything).
     let sealed = cb.seal()?;
 
-    // Write the self-contained collection dir: collection.json + each member as `<id>.tsra`.
+    // Write the self-contained collection dir: collection.json + each member under the shared
+    // `member_filename` (sanitized `<stem>.tsra`), the same name `verify`/`ls` resolve (#323).
     std::fs::create_dir_all(out)?;
     std::fs::write(out.join("collection.json"), sealed.to_json()?)?;
     for (h, src) in &handles {
-        let dst = out.join(format!("{}.tsra", h.reference()));
+        let dst = out.join(member_filename(h.reference(), MemberKind::Product));
         if src.canonicalize().ok() == dst.canonicalize().ok() {
-            continue; // member already in place as <id>.tsra
+            continue; // member already in place
         }
         let _ = std::fs::remove_file(&dst);
         // Hard-link when same-filesystem (no data copy); fall back to a full copy across mounts.
@@ -345,7 +344,7 @@ mod tests {
             pack(
                 &sealed,
                 &[payload],
-                &dir.join(format!("{}.tsra", sealed.id)),
+                &dir.join(member_filename(&sealed.id, MemberKind::Product)),
             )
             .unwrap();
             cb.add_member(
@@ -391,7 +390,11 @@ mod tests {
             .contains("verified (2 members, recursive)"));
 
         // Remove a member file → verify fails loudly (missing member).
-        std::fs::remove_file(dir.path().join(format!("{}.tsra", c.members[0].reference))).unwrap();
+        std::fs::remove_file(dir.path().join(member_filename(
+            &c.members[0].reference,
+            MemberKind::Product,
+        )))
+        .unwrap();
         assert!(verify(&cf, &mut Vec::new()).is_err());
     }
 
@@ -409,7 +412,7 @@ mod tests {
             pack(
                 &sealed,
                 &[payload],
-                &dir.join(format!("{}.tsra", sealed.id)),
+                &dir.join(member_filename(&sealed.id, MemberKind::Product)),
             )
             .unwrap();
             cb.add_member(
@@ -421,7 +424,7 @@ mod tests {
         }
         let c = cb.seal().unwrap();
         std::fs::write(
-            dir.join(format!("{}.collection.json", c.id)),
+            dir.join(member_filename(&c.id, MemberKind::Collection)),
             c.to_json().unwrap(),
         )
         .unwrap();
@@ -470,10 +473,10 @@ mod tests {
         assert!(s.contains("recursive") && s.contains("3 members"), "{s}");
 
         // Tamper a grandchild product `.tsra` → the recursive verify catches it transitively.
-        std::fs::remove_file(
-            dir.path()
-                .join(format!("{}.tsra", child.members[0].reference)),
-        )
+        std::fs::remove_file(dir.path().join(member_filename(
+            &child.members[0].reference,
+            MemberKind::Product,
+        )))
         .unwrap();
         assert!(verify(&pf, &mut Vec::new()).is_err());
     }
@@ -513,6 +516,21 @@ mod tests {
 
         let cf = out.join("collection.json");
         assert!(cf.exists(), "collection.json written");
+        // #323: each member lands under the sanitized stem (`blake3_….tsra`), NOT the raw
+        // colon-bearing reference — and that is exactly the name `verify` resolves.
+        let c = load(&cf).unwrap();
+        for m in &c.members {
+            assert!(m.reference.contains(':'), "a real blake3 id has a colon");
+            assert!(
+                out.join(member_filename(&m.reference, MemberKind::Product))
+                    .exists(),
+                "member resolves under the sanitized stem"
+            );
+            assert!(
+                !out.join(format!("{}.tsra", m.reference)).exists(),
+                "the raw colon-named file must NOT be the on-disk name (the #323 mismatch)"
+            );
+        }
         // The assembled collection is self-contained + passes recursive verify.
         verify(&cf, &mut Vec::new()).unwrap();
         let mut buf = Vec::new();

@@ -31,7 +31,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tessera_core::collection::CollectionBuilder;
+use tessera_core::collection::{
+    member_filename, sanitize_reference, CollectionBuilder, MemberKind,
+};
 use tessera_core::manifest::Manifest;
 use tessera_core::provenance::Source;
 use tessera_core::{Error, Result};
@@ -445,8 +447,8 @@ fn dispatch(
                 // Stream straight to disk — the bounded-memory + multi-block path. The output path
                 // is computed BEFORE the seal because the streaming writer writes the .tsra
                 // directly; we then re-open the sealed manifest to record its id.
-                let stage = out_dir.join(format!("__stage_{}", sanitize_filename(name)));
-                let tmp_out = out_dir.join(format!("__pending_{}.tsra", sanitize_filename(name)));
+                let stage = out_dir.join(format!("__stage_{}", sanitize_reference(name)));
+                let tmp_out = out_dir.join(format!("__pending_{}.tsra", sanitize_reference(name)));
                 // Build extra_sources with the canonical `ingested_from` flowing through the
                 // streaming session (it adds its own `ingested_from`); pass `extra_sources` as-is.
                 let m = crate::ge_hdf5::stream_to_listmode_product_2p_to_file(
@@ -466,7 +468,7 @@ fn dispatch(
                 )?;
                 // Rename the pending .tsra to its id-named final path. Same filesystem → rename is
                 // atomic, so a crash here leaves either the old or the new file in place.
-                let final_path = out_dir.join(format!("{}.tsra", sanitize_filename(&m.id)));
+                let final_path = out_dir.join(member_filename(&m.id, MemberKind::Product));
                 std::fs::rename(&tmp_out, &final_path).map_err(|e| {
                     Error::Invalid(format!(
                         "ingest-engine: rename {} -> {}: {e}",
@@ -577,7 +579,7 @@ fn seal_to_tsra(
     _timestamp: &str,
 ) -> Result<Manifest> {
     let m = apply_spec_metadata(m, &p.metadata)?;
-    let path = out_dir.join(format!("{}.tsra", sanitize_filename(&m.id)));
+    let path = out_dir.join(member_filename(&m.id, MemberKind::Product));
     pack(&m, payloads, &path)?;
     // ADR-0042: stamp `aux/provenance.json` (wall-clock + producer + host) as a non-sealed aux
     // member. The sealed region is byte-identical afterwards (proven by container tests), so this
@@ -602,7 +604,7 @@ fn seal_streaming_to_tsra(
     p: &crate::spec::ProductSpec,
 ) -> Result<Manifest> {
     let m = apply_spec_metadata(m, &p.metadata)?;
-    let path = out_dir.join(format!("{}.tsra", sanitize_filename(&m.id)));
+    let path = out_dir.join(member_filename(&m.id, MemberKind::Product));
     pack_streaming_verified(&m, sources, &path)?;
     // ADR-0042: aux/provenance.json stamp, matching seal_to_tsra above.
     stamp_ingest_provenance(&path, &ProvenanceOptions::default())?;
@@ -626,13 +628,6 @@ fn apply_spec_metadata(
         b.with_field(k, v.clone());
     }
     b.seal()
-}
-
-/// Strip filesystem-hostile chars (`:` / `/` from the blake3-prefixed id) so the member's id
-/// becomes a portable filename. The id is hex + a single `:`; replacing the `:` with `_` is
-/// lossless (the prefix is fixed: `blake3:`).
-fn sanitize_filename(s: &str) -> String {
-    s.replace([':', '/', '\\'], "_")
 }
 
 /// Public seam: re-export so a CLI caller can pre-parse + re-use the same spec without re-reading.
@@ -811,7 +806,7 @@ streaming = "batch"
         // 2. members were written to disk + open.
         let mut by_name: BTreeMap<String, Manifest> = BTreeMap::new();
         for m in &coll.members {
-            let path = out.join(format!("{}.tsra", m.reference.replace([':', '/'], "_")));
+            let path = out.join(member_filename(&m.reference, MemberKind::Product));
             assert!(path.exists(), "missing {}", path.display());
             let r = tessera_io::Reader::open(&path).unwrap();
             by_name.insert(m.reference.clone(), r.manifest().clone());
@@ -906,9 +901,9 @@ streaming = "auto"
         let cfg = tessera_io::WriteConfig::for_system().workers(2);
         let coll = run(&parsed, &PathBuf::from("inline-spec"), &out, &cfg, 1).unwrap();
         assert_eq!(coll.members.len(), 1);
-        let member_path = out.join(format!(
-            "{}.tsra",
-            coll.members[0].reference.replace([':', '/'], "_")
+        let member_path = out.join(member_filename(
+            &coll.members[0].reference,
+            MemberKind::Product,
         ));
         assert!(
             member_path.exists(),
@@ -971,10 +966,7 @@ metadata = {{ coincidence_mode = "singles", site = "anvil" }}
         assert_eq!(coll.members.len(), 2);
 
         for member in &coll.members {
-            let p = out.join(format!(
-                "{}.tsra",
-                member.reference.replace([':', '/'], "_")
-            ));
+            let p = out.join(member_filename(&member.reference, MemberKind::Product));
             let mani = tessera_io::Reader::open(&p).unwrap().manifest().clone();
             if mani.metadata.contains_key("operator") {
                 // batch product: spec overrode the default + added a field

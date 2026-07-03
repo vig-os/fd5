@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use tessera_core::collection::{member_filename, MemberKind};
 use tessera_core::SchemaRegistry;
 use tessera_ingest::{engine, spec as ingest_spec};
 use tessera_io::{pack_dir, parse_byte_size, unpack, Reader, WriteConfig};
@@ -1568,13 +1569,14 @@ fn run_ingest(src: IngestSrc) -> tessera_core::Result<()> {
         &cfg,
         engine::DEFAULT_STREAM_THRESHOLD_BYTES,
     )?;
-    // Move the single produced `.tsra` to the user's `out` path. The engine names files by
-    // sanitized id (`blake3_<hex>.tsra`); we read that name back out of the sealed collection.
+    // Move the single produced `.tsra` to the user's `out` path. The engine names files by the
+    // shared `member_filename` SSoT (`blake3_<hex>.tsra`); resolve that same name here (#323).
     let member = coll.members.first().ok_or_else(|| {
         tessera_core::Error::Invalid("tessera ingest: engine produced no member".into())
     })?;
-    let sanitized = member.reference.replace([':', '/', '\\'], "_");
-    let from = staging.path().join(format!("{sanitized}.tsra"));
+    let from = staging
+        .path()
+        .join(member_filename(&member.reference, MemberKind::Product));
     if let Some(parent) = user_out.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -1801,8 +1803,11 @@ fn run_ingest_spec(opts: IngestSpecOpts) -> tessera_core::Result<()> {
         out_dir.display()
     );
     for m in &coll.members {
-        let sanitized = m.reference.replace([':', '/', '\\'], "_");
-        println!("  - {} -> {sanitized}.tsra", m.reference);
+        println!(
+            "  - {} -> {}",
+            m.reference,
+            member_filename(&m.reference, MemberKind::Product)
+        );
     }
     Ok(())
 }
@@ -2039,7 +2044,7 @@ streaming = "batch"
 
         // 2. every member's .tsra exists + verifies + carries the expected spec edge.
         for m in &coll.members {
-            let p = out_dir.join(format!("{}.tsra", m.reference.replace([':', '/'], "_")));
+            let p = out_dir.join(member_filename(&m.reference, MemberKind::Product));
             assert!(p.exists(), "missing {}", p.display());
             run(Cmd::Verify { file: p.clone() }).unwrap();
             let r = Reader::open(&p).unwrap();
@@ -2050,11 +2055,16 @@ streaming = "batch"
                 .any(|s| s.role == engine::SPEC_PROVENANCE_ROLE));
         }
 
+        // 2b. #323: the COLLECTION-level verb resolves every ingested member by the same sanitized
+        // name the engine wrote — the exact path that used to fail (`blake3:…` resolve vs `blake3_…`
+        // write). This is the ingest --spec → `collection verify` round-trip the bug report asked for.
+        collection::verify(&out_dir.join("collection.json"), &mut Vec::new()).unwrap();
+
         // 3. the derived member's `derived_from` edge pins the raw's manifest_hash → chain verifies.
         let raw_id = &coll.members[0].reference;
         let derived_id = &coll.members[1].reference;
-        let raw_path = out_dir.join(format!("{}.tsra", raw_id.replace([':', '/'], "_")));
-        let derived_path = out_dir.join(format!("{}.tsra", derived_id.replace([':', '/'], "_")));
+        let raw_path = out_dir.join(member_filename(raw_id, MemberKind::Product));
+        let derived_path = out_dir.join(member_filename(derived_id, MemberKind::Product));
         let raw_m = Reader::open(&raw_path).unwrap().manifest().clone();
         let derived_m = Reader::open(&derived_path).unwrap().manifest().clone();
         let mut resolver: std::collections::BTreeMap<String, tessera_core::Manifest> =
