@@ -50,6 +50,53 @@ pub fn to_blob_product(
     Ok((sealed, vec![payload]))
 }
 
+/// Seal MANY files as ONE `blob` product with a **`Blob` block per file** — the block-per-file "junk"
+/// tier for a multi-file vendor series (e.g. a DICOM series' slices). Each file is preserved
+/// bit-faithfully inside a single `.tsra` container (**no intermediate tar** — the `.tsra` is already a
+/// STORED-zip archive), independently `read`/`extract`-able, and range-readable (O(1) seek regardless of
+/// block count; the only cost is a larger manifest, linear in file count). Block names are `file_NNNN`
+/// in input order; each block's descriptor keeps the source basename (`tessera ls` shows them).
+///
+/// `source_label` overrides the recorded `ingested_from` reference (PHI hygiene). Memory: reads each
+/// file whole in turn (peak RSS ≈ largest single file), so it fits multi-file series of MB-scale slices.
+pub fn to_blob_multi_product(
+    paths: &[std::path::PathBuf],
+    name: &str,
+    timestamp: &str,
+    media_type: Option<&str>,
+    source_label: Option<&str>,
+    extra_sources: &[tessera_core::provenance::Source],
+) -> Result<(Manifest, Vec<BlockPayload>)> {
+    if paths.is_empty() {
+        return Err(Error::Invalid("blob-multi: no input files".into()));
+    }
+    let mut b = ProductBuilder::new(
+        "blob",
+        name,
+        "opaque preserved files (one block per file)",
+        timestamp,
+    );
+    let mut payloads = Vec::with_capacity(paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        let bytes = std::fs::read(p).map_err(Error::from)?;
+        let filename = p.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
+        let block_name = format!("file_{i:04}");
+        let (block_ref, payload) = blob_block(&block_name, filename, media_type, bytes)?;
+        b.add_block_ref(block_ref);
+        payloads.push(payload);
+    }
+    let source_ref = source_label
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} files", paths.len()));
+    let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    b.add_source(crate::provenance::ingested_from(&path_refs, source_ref)?);
+    for s in extra_sources {
+        b.add_source(s.clone());
+    }
+    let sealed = b.seal()?;
+    Ok((sealed, payloads))
+}
+
 /// Like [`to_blob_product`] but **bounded-memory**: streams the file through blake3 (no whole-file
 /// `Vec`) and returns only the sealed manifest — the caller seals it with [`tessera_io::pack_streaming`]
 /// handing the **same `path`** as the `data` block's fragment, so a multi-GB file never enters RAM. The
@@ -115,6 +162,41 @@ mod tests {
             .sources
             .iter()
             .any(|s| s.reference.contains("testscan.l64")));
+    }
+
+    #[test]
+    fn seals_many_files_as_one_blob_product_block_per_file() {
+        // Block-per-file preservation (no tar): N files → one `.tsra`, a Blob block per file,
+        // each bit-faithful.
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        let mut all_bytes = Vec::new();
+        for i in 0..3u32 {
+            let p = dir.path().join(format!("slice_{i}.img"));
+            let bytes: Vec<u8> = (0..1000u32).map(|k| ((k + i * 7) % 256) as u8).collect();
+            std::fs::write(&p, &bytes).unwrap();
+            paths.push(p);
+            all_bytes.push(bytes);
+        }
+        let (m, payloads) = to_blob_multi_product(
+            &paths,
+            "DP01-series",
+            "2024-01-01T00:00:00Z",
+            Some("application/dicom"),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(m.product, "blob");
+        assert_eq!(m.blocks.len(), 3, "one Blob block per file");
+        for (i, blk) in m.blocks.iter().enumerate() {
+            assert_eq!(blk.name, format!("file_{i:04}"));
+            assert_eq!(
+                blk.digest.as_deref(),
+                Some(tessera_core::hash::digest(&all_bytes[i]).as_str())
+            );
+            assert_eq!(payloads[i].bytes, all_bytes[i], "block {i} bit-faithful");
+        }
     }
 
     /// ADR-0040: when `source_label` is given, the recorded `ingested_from` reference is the LABEL,

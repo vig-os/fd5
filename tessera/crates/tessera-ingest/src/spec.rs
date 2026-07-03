@@ -183,6 +183,14 @@ pub enum FormatOptions {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         media_type: Option<String>,
     },
+    /// Multi-file opaque preservation: seal a set of files as ONE `blob` product with a `Blob` block
+    /// **per file** (no tar — the `.tsra` is already a STORED-zip container). The block-per-file cold
+    /// tier for a multi-file vendor series (e.g. a DICOM series' slices). `format = "blob-series"`.
+    BlobSeries {
+        inputs: Vec<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_type: Option<String>,
+    },
 }
 
 fn default_row_index() -> String {
