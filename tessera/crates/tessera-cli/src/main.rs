@@ -57,7 +57,6 @@ fn open_local_or_url(arg: &std::path::Path) -> tessera_core::Result<Box<dyn Tsra
 /// behind a single boxed handle.
 trait TsraSource {
     fn manifest(&self) -> &tessera_core::Manifest;
-    fn read_block_by_name(&mut self, name: &str) -> tessera_core::Result<Vec<u8>>;
     fn block_names(&self) -> Vec<String>;
     /// Bounded-memory copy of a block's bytes into `w`, digest-verified after the last byte.
     /// Delegates to [`Reader::stream_block`] — preserves the same integrity contract: on
@@ -73,9 +72,6 @@ trait TsraSource {
 impl<R: std::io::Read + std::io::Seek> TsraSource for Reader<R> {
     fn manifest(&self) -> &tessera_core::Manifest {
         Reader::manifest(self)
-    }
-    fn read_block_by_name(&mut self, name: &str) -> tessera_core::Result<Vec<u8>> {
-        Reader::read_block(self, name)
     }
     fn block_names(&self) -> Vec<String> {
         Reader::block_names(self)
@@ -926,8 +922,20 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
         Cmd::Verify { file } => {
             let mut r = open_local_or_url(&file)?; // magic + manifest seal
             let n = r.manifest().blocks.len();
+            // Stream each block's payload through a bounded ring (never buffer the whole block) and
+            // check its digest — so verifying a multi-GB blob stays at a few MiB RSS, not the whole
+            // file (#268 part 3; `stream_block` uses a 64 KiB buffer, same path `extract` uses). On a
+            // failure, name the file + block so the operator sees the locus, not a bare `io:` error
+            // (#268 part 4).
+            let mut sink = std::io::sink();
             for name in r.block_names() {
-                r.read_block_by_name(&name)?; // payload bytes vs recorded digest
+                r.stream_block_to(&name, &mut sink).map_err(|e| {
+                    tessera_core::Error::BlockIntegrity {
+                        file: file.display().to_string(),
+                        block: name.clone(),
+                        detail: e.to_string(),
+                    }
+                })?;
             }
             println!("OK  {} verified ({n} blocks)", file.display());
             Ok(())
@@ -1889,6 +1897,54 @@ mod tests {
         let bad = dir.path().join("bad.tsra");
         std::fs::write(&bad, b"not a zip at all").unwrap();
         assert!(run(Cmd::Verify { file: bad }).is_err());
+    }
+
+    /// #268 parts 3+4: a corrupt block payload makes `verify` fail with a typed `BlockIntegrity`
+    /// error that names the container file AND the block (not a bare `io: Invalid checksum`), and
+    /// the check runs over the bounded-memory `stream_block` path (never buffering the whole block).
+    #[test]
+    fn verify_names_the_corrupt_block_with_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_tsra(&tsra);
+        // Unpack → corrupt the block payload → repack. Repack recomputes the zip CRC over the
+        // tampered bytes (so the container reads clean), but the manifest still pins the ORIGINAL
+        // blake3 digest → the streamed digest check is what catches it (exercising the rich path).
+        let exploded = dir.path().join("exploded");
+        run(Cmd::Unpack {
+            file: tsra,
+            outdir: exploded.clone(),
+        })
+        .unwrap();
+        let block = exploded.join("blocks/volume");
+        let mut bytes = std::fs::read(&block).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&block, &bytes).unwrap();
+        let bad = dir.path().join("bad.tsra");
+        run(Cmd::Pack {
+            dir: exploded,
+            out: bad.clone(),
+        })
+        .unwrap();
+
+        match run(Cmd::Verify { file: bad }).unwrap_err() {
+            tessera_core::Error::BlockIntegrity {
+                file,
+                block,
+                detail,
+            } => {
+                assert_eq!(block, "volume", "names the corrupt block");
+                assert!(
+                    file.contains("bad.tsra"),
+                    "names the container file: {file}"
+                );
+                assert!(
+                    detail.contains("block_payload") || detail.contains("checksum"),
+                    "carries the underlying integrity cause: {detail}"
+                );
+            }
+            other => panic!("expected a typed BlockIntegrity error, got {other:?}"),
+        }
     }
 
     // Mirrors the GE 3-photon compound record (HDF5 maps by member name on read).
