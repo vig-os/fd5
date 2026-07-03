@@ -14,8 +14,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/*
-!lib/c/
+lib/
 lib64/
 parts/
 sdist/
@@ -218,3 +217,8 @@ __marimo__/
 
 # Pre-commit cache
 .pre-commit-cache/
+
+# Nix + direnv
+.direnv/
+/result
+/result-*
