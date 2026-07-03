@@ -28,14 +28,16 @@ use crate::table::{
 };
 
 /// An empty buffer (one empty column per spec column). Spec dtypes are validated in
-/// [`TableStreamWriter::new`], so the empty construction can't fail afterwards.
+/// [`TableStreamWriter::new`], so the empty construction can't fail afterwards. Nullable columns
+/// (#330) get a `ColumnData::Nullable` wrapper with an empty inner + empty validity — so the
+/// staging accumulator's variant matches the sealed spec through the whole push/flush lifecycle.
 fn empty_cols(columns: &[Column]) -> TableData {
     columns
         .iter()
         .map(|c| {
             (
                 c.name.clone(),
-                ColumnData::from_le_bytes(&c.dtype, &[]).expect("validated dtype"),
+                ColumnData::empty_for(c).expect("validated dtype"),
             )
         })
         .collect()
@@ -61,6 +63,10 @@ pub(crate) fn write_fragment(path: &Path, group: &TableData) -> Result<()> {
 /// Read one fragment back into a [`TableData`] of `columns` (inverse of [`write_fragment`]). The
 /// fragment format is internal; this is the only reader. `pub(crate)` so [`crate::stream`] can lazily
 /// pull fragments inside a per-block encode job.
+///
+/// A nullable column (#330) is serialized by [`write_fragment`] as `values ‖ validity` (see
+/// [`ColumnData::to_le_bytes`]), so on read we skip both the value bytes AND the trailing
+/// `ceil(rows / 8)` validity bytes.
 pub(crate) fn read_fragment(path: &Path, columns: &[Column]) -> Result<TableData> {
     let bytes = fs::read(path)?;
     let head = bytes
@@ -74,12 +80,17 @@ pub(crate) fn read_fragment(path: &Path, columns: &[Column]) -> Result<TableData
     let mut off = 8usize;
     let mut out = Vec::with_capacity(columns.len());
     for c in columns {
-        let len = n_rows * ColumnData::dtype_size(&c.dtype)?;
+        let value_len = n_rows * ColumnData::dtype_size(&c.dtype)?;
+        let validity_len = if c.nullable { n_rows.div_ceil(8) } else { 0 };
+        let total_len = value_len + validity_len;
         let raw = bytes
-            .get(off..off + len)
+            .get(off..off + total_len)
             .ok_or_else(|| Error::Codec(format!("fragment: truncated column '{}'", c.name)))?;
-        out.push((c.name.clone(), ColumnData::from_le_bytes(&c.dtype, raw)?));
-        off += len;
+        out.push((
+            c.name.clone(),
+            ColumnData::from_column_bytes(c, raw, n_rows)?,
+        ));
+        off += total_len;
     }
     Ok(out)
 }

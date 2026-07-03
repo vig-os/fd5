@@ -31,6 +31,19 @@ pub struct Column {
     /// physical (no quantization). Carried so the read/compute path recovers physical units.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<f64>,
+    /// Nullability marker (#330): when `true`, the column carries a validity bitmap alongside its
+    /// values (Arrow/Vortex native nullness), and `NaN`/`None` values are stored as **NULL** rather
+    /// than a float sentinel. Default `false`, skipped on serialize when unset — so a legacy column
+    /// (or any non-null column) serializes byte-identical to today, preserving on-disk content
+    /// hashes and the conformance corpus.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nullable: bool,
+}
+
+/// Serde helper: skip a `bool` field when it's `false` (the null default), so an unannotated
+/// column round-trips byte-identical through JSON.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Column {
@@ -66,6 +79,12 @@ impl Column {
     /// Builder: fixed-point scale (physical = raw × scale).
     pub fn with_scale(mut self, scale: f64) -> Self {
         self.scale = Some(scale);
+        self
+    }
+    /// Builder: mark the column nullable (#330 — values carry a validity bitmap; missing rows
+    /// serialize as NULL rather than a float sentinel). Idempotent.
+    pub fn with_nullable(mut self) -> Self {
+        self.nullable = true;
         self
     }
 }
@@ -140,12 +159,16 @@ mod tests {
 
     #[test]
     fn bare_column_skips_annotation_fields_on_serialize() {
-        // Back-compat: an unannotated column serializes to exactly the legacy shape (name+dtype),
-        // so existing on-disk `.tsra` specs and content hashes are unaffected.
+        // Back-compat: an unannotated column serializes to exactly the legacy shape (name+dtype
+        // only), so existing on-disk `.tsra` specs and content hashes are unaffected. Order-
+        // agnostic: `serde_json`'s Map iterates alphabetically without the `preserve_order`
+        // feature — the invariant is the KEY SET, not its iteration order.
         let bare = Column::new("ms", "u4");
         let v = serde_json::to_value(&bare).unwrap();
         let obj = v.as_object().unwrap();
-        assert_eq!(obj.keys().collect::<Vec<_>>(), vec!["name", "dtype"]);
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["dtype", "name"]);
     }
 
     #[test]
@@ -161,5 +184,30 @@ mod tests {
         let c: Column = serde_json::from_str(r#"{"name":"t","dtype":"u8"}"#).unwrap();
         assert_eq!(c.name, "t");
         assert!(c.unit.is_none() && c.scale.is_none() && c.description.is_none());
+        assert!(!c.nullable, "legacy column defaults to non-nullable");
+    }
+
+    #[test]
+    fn nullable_flag_round_trips_and_skips_when_false() {
+        // #330 back-compat: `nullable: false` is the default, MUST NOT appear on serialize (so a
+        // non-null column is byte-identical to today's on-disk shape and content hashes are
+        // preserved). A nullable column round-trips through JSON with the flag set.
+        let bare = Column::new("t", "u8");
+        let v = serde_json::to_value(&bare).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("nullable"),
+            "unset `nullable` MUST be skipped — content-hash stability"
+        );
+
+        let n = Column::new("lt_corr", "i2")
+            .with_unit("ns")
+            .with_scale(0.001)
+            .with_nullable();
+        assert!(n.nullable);
+        let v2 = serde_json::to_value(&n).unwrap();
+        assert_eq!(v2["nullable"], true);
+        let back: Column = serde_json::from_value(v2).unwrap();
+        assert_eq!(back, n);
     }
 }

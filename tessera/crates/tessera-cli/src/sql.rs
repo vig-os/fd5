@@ -37,6 +37,10 @@ use crate::nav::Format;
 /// (`ColumnData` is a closed enum, so every variant is covered exhaustively). Small vectors go
 /// through `.clone()`; f32/f64 are copied verbatim (no NaN canonicalisation — DataFusion honours
 /// IEEE-754 comparison semantics the same way the tests below assert).
+///
+/// Nullable columns (#330) build the Arrow array via `from_iter(Option<T>)` so DataFusion sees the
+/// standard Arrow validity bitmap — `WHERE col IS NULL` / `AVG(col)` / etc. treat missing rows
+/// correctly out of the box, no tessera sentinel to translate.
 fn column_to_array(col: ColumnData) -> ArrayRef {
     match col {
         ColumnData::I8(v) => Arc::new(Int8Array::from(v)) as ArrayRef,
@@ -49,6 +53,36 @@ fn column_to_array(col: ColumnData) -> ArrayRef {
         ColumnData::U64(v) => Arc::new(UInt64Array::from(v)) as ArrayRef,
         ColumnData::F32(v) => Arc::new(Float32Array::from(v)) as ArrayRef,
         ColumnData::F64(v) => Arc::new(Float64Array::from(v)) as ArrayRef,
+        ColumnData::Nullable { values, validity } => nullable_to_array(*values, &validity),
+    }
+}
+
+/// Build an Arrow array carrying its validity bitmap from a tessera nullable column. One arm per
+/// inner numeric dtype — the nested `Nullable` case can't occur (validity is on the outer wrapper
+/// only, enforced by `validate`).
+fn nullable_to_array(values: ColumnData, validity: &[bool]) -> ArrayRef {
+    fn zip_opt<T: Copy>(values: &[T], validity: &[bool]) -> Vec<Option<T>> {
+        values
+            .iter()
+            .zip(validity.iter())
+            .map(|(&v, &ok)| ok.then_some(v))
+            .collect()
+    }
+    match values {
+        ColumnData::I8(v) => Arc::new(Int8Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::I16(v) => Arc::new(Int16Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::I32(v) => Arc::new(Int32Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::I64(v) => Arc::new(Int64Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::U8(v) => Arc::new(UInt8Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::U16(v) => Arc::new(UInt16Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::U32(v) => Arc::new(UInt32Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::U64(v) => Arc::new(UInt64Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::F32(v) => Arc::new(Float32Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::F64(v) => Arc::new(Float64Array::from_iter(zip_opt(&v, validity))) as ArrayRef,
+        ColumnData::Nullable { .. } => {
+            // The validate() pass rejects Nullable-inside-Nullable, so this arm is unreachable.
+            unreachable!("nested Nullable inside a nullable ColumnData is rejected by validate")
+        }
     }
 }
 
@@ -126,7 +160,13 @@ pub fn run_with(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for col in &columns {
         let data = view.column(&mut r, &col.name)?;
-        fields.push(Field::new(&col.name, numpy_to_arrow(&col.dtype)?, false));
+        // #330: the Arrow field is `nullable` iff the tessera column is — DataFusion honours the
+        // schema's nullability + the array's validity bitmap in aggregate semantics.
+        fields.push(Field::new(
+            &col.name,
+            numpy_to_arrow(&col.dtype)?,
+            col.nullable,
+        ));
         arrays.push(column_to_array(data));
     }
     let schema = Arc::new(Schema::new(fields));
@@ -312,6 +352,92 @@ mod tests {
             msg.contains("no_such_column") || msg.contains("Schema") || msg.contains("plan"),
             "expected a schema/plan error naming the missing column, got: {msg}"
         );
+    }
+
+    /// #330: a nullable column decoded from a sealed `.tsra` reaches DataFusion with an Arrow
+    /// validity bitmap, so `IS NULL` / `AVG(col)` behave correctly (SQL-standard: nulls skipped in
+    /// aggregates, `IS NULL` matches missing rows). This is the "does the DUPLET `lt_corr` shape
+    /// query correctly?" guard.
+    #[test]
+    fn sql_over_nullable_column_honours_null_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("nullable.tsra");
+        // Sealed sample: 4 rows, `lt_corr` = [NULL, 10, 20, NULL] (int16 quantized).
+        let spec = TableSpec {
+            columns: vec![
+                Column {
+                    name: "ms".into(),
+                    dtype: "u4".into(),
+                    ..Default::default()
+                },
+                Column {
+                    name: "lt_corr".into(),
+                    dtype: "i2".into(),
+                    nullable: true,
+                    ..Default::default()
+                },
+            ],
+            rows: 4,
+            row_index: None,
+        };
+        let data: TableData = vec![
+            ("ms".into(), ColumnData::U32(vec![1, 2, 3, 4])),
+            (
+                "lt_corr".into(),
+                ColumnData::Nullable {
+                    values: Box::new(ColumnData::I16(vec![0, 10, 20, 0])),
+                    validity: vec![false, true, true, false],
+                },
+            ),
+        ];
+        let (block_ref, payload) = table_block("events", &spec, &data).unwrap();
+        let mut b = ProductBuilder::new("listmode", "DP", "d", "2024-01-01T00:00:00Z");
+        b.add_block_ref(block_ref);
+        b.with_field("modality", serde_json::json!("PT"));
+        let sealed = b.seal().unwrap();
+        pack(&sealed, &[payload], &tsra).unwrap();
+
+        // WHERE lt_corr IS NULL → rows 1 and 4.
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT ms FROM events WHERE lt_corr IS NULL ORDER BY ms",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "ms\n1\n4\n");
+
+        // AVG(lt_corr) skips NULLs → (10 + 20) / 2 = 15.
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT AVG(lt_corr) AS avg_lt FROM events",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("avg_lt\n15"),
+            "expected AVG=15 (nulls skipped), got: {text:?}"
+        );
+
+        // COUNT(*) counts all rows; COUNT(lt_corr) counts only non-NULL — the SQL-standard split.
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT COUNT(*), COUNT(lt_corr) FROM events",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        // csv writer prints these as `count(*)` / `count(events.lt_corr)` etc — assert the row.
+        assert!(text.contains("4,2\n"), "expected 4,2 row, got: {text:?}");
     }
 
     /// `--format ndjson` is explicitly rejected today (arrow-csv is the writer) — proves the
