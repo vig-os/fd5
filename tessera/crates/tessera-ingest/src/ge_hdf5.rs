@@ -463,12 +463,17 @@ fn geddf_dict() -> &'static GeDict {
 /// Map an HDF5 dataset name (or block prefix) to its dictionary group: `events_2p`/`events_3p` →
 /// `events`, `coin_2p`/`coin_3p` → `coin`, else the name itself (`singles`, `time_markers`, …).
 fn dataset_group(name: &str) -> &str {
-    if name.starts_with("events") {
+    // Accept either a bare dataset name (`events_3p`) or a full HDF5 path (`/proc_data/events_3p`) —
+    // the GEDDF dictionary is keyed on the leaf group, so a spec that passes the nested path (as real
+    // DUPLET specs do) must still resolve. Without the leaf-strip the annotation/quantize silently
+    // no-op'd on every path-qualified dataset.
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    if leaf.starts_with("events") {
         "events"
-    } else if name.starts_with("coin_2p") || name.starts_with("coin_3p") || name == "coin" {
+    } else if leaf.starts_with("coin_2p") || leaf.starts_with("coin_3p") || leaf == "coin" {
         "coin"
     } else {
-        name
+        leaf
     }
 }
 
@@ -974,6 +979,11 @@ mod tests {
         assert_eq!(dataset_group("coin_2p"), "coin");
         assert_eq!(dataset_group("singles"), "singles");
         assert_eq!(dataset_group("time_markers"), "time_markers");
+        // Full HDF5 paths (what real DUPLET specs pass) resolve on the leaf, not the whole path.
+        assert_eq!(dataset_group("/proc_data/events_3p"), "events");
+        assert_eq!(dataset_group("/proc_data/coin_2p"), "coin");
+        assert_eq!(dataset_group("/raw_data/singles"), "singles");
+        assert_eq!(dataset_group("/raw_data/time_markers"), "time_markers");
     }
 
     #[test]
