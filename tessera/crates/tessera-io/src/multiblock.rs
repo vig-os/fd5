@@ -109,8 +109,11 @@ impl LogicalTableView {
     /// For very large columns prefer [`Self::column_blocks`] — it yields one block's worth at a
     /// time so callers can stream the column without materialising it all.
     pub fn column<R: Read + Seek>(&self, reader: &mut Reader<R>, name: &str) -> Result<ColumnData> {
-        let code = self.column_dtype(name)?;
-        let mut out = ColumnData::from_le_bytes(code, &[])?;
+        // `empty_for(col)` respects the schema's `nullable` flag so a nullable column concatenates
+        // into a `ColumnData::Nullable` accumulator (extend on the outer wrapper appends both
+        // values and validity in lock-step).
+        let col = self.column_spec(name)?;
+        let mut out = ColumnData::empty_for(col)?;
         for (bname, spec) in self.block_names.iter().zip(&self.specs) {
             let blob = reader.read_block(bname)?;
             let chunk = decode_column(spec, &blob, name)?;
@@ -171,7 +174,7 @@ impl LogicalTableView {
         // Build output columns in spec order; gather one row at a time in caller order.
         let mut out: TableData = Vec::with_capacity(columns.len());
         for (col_idx, col) in columns.iter().enumerate() {
-            let mut typed = ColumnData::from_le_bytes(&col.dtype, &[])?;
+            let mut typed = ColumnData::empty_for(col)?;
             for &(b, l) in &mapping {
                 let src = decoded.get(&b).ok_or_else(|| {
                     Error::Codec(format!("take: missing decoded cache for block {b}"))
@@ -228,10 +231,13 @@ impl LogicalTableView {
     }
 
     fn column_dtype(&self, name: &str) -> Result<&str> {
+        self.column_spec(name).map(|c| c.dtype.as_str())
+    }
+
+    fn column_spec(&self, name: &str) -> Result<&Column> {
         self.specs
             .first()
             .and_then(|s| s.columns.iter().find(|c| c.name == name))
-            .map(|c| c.dtype.as_str())
             .ok_or_else(|| {
                 Error::Codec(format!(
                     "logical_table('{}'): no column '{name}'",
@@ -654,6 +660,80 @@ mod tests {
         assert!(view
             .select_blocks_overlapping(&mut rdr, "e", 0, 100)
             .is_err());
+    }
+
+    #[test]
+    fn nullable_column_round_trips_through_sealed_multi_block_container() {
+        // #330 end-to-end: a nullable int16 column (the DUPLET `lt_corr` shape — partial-NaN
+        // ingest → nullable int16) survives the SEAL: streaming write → pack → open → logical
+        // read → values + validity byte-exact against the input. Multi-block partition too, so
+        // the validity concatenates correctly across `events_NNNN` shards.
+        let dir = tempfile::tempdir().unwrap();
+        let block_rows = ROWS_PER_GROUP as u64;
+        let rows = (block_rows as usize) * 2 + 555;
+
+        // The nullable column: values pinned to a deterministic sequence, ~10% NULL in a striped
+        // pattern (mixes null/non-null within a row-group and across blocks).
+        let mut values: Vec<i16> = (0..rows).map(|k| (k as i16).wrapping_mul(11)).collect();
+        let validity: Vec<bool> = (0..rows).map(|k| k % 10 != 3).collect();
+        for (i, ok) in validity.iter().enumerate() {
+            if !ok {
+                values[i] = 0;
+            }
+        }
+
+        let columns = vec![
+            col("t", "u8"),
+            Column {
+                name: "lt_corr".into(),
+                dtype: "i2".into(),
+                nullable: true,
+                unit: Some("ns".into()),
+                scale: Some(0.001),
+                ..Default::default()
+            },
+        ];
+        let ws = WriteSession::create(&dir.path().join("ws"), "listmode", "p", "d", TS).unwrap();
+        let mut sw = StreamWriter::new(ws, 2, 4);
+        {
+            let mut sink = crate::accumulate::TableMultiBlockSink::with_block_rows(
+                columns,
+                "events",
+                &dir.path().join("sink"),
+                &mut sw,
+                block_rows,
+            )
+            .unwrap()
+            .with_row_index("t");
+            let batch: TableData = vec![
+                ("t".into(), ColumnData::U64((0..rows as u64).collect())),
+                (
+                    "lt_corr".into(),
+                    ColumnData::Nullable {
+                        values: Box::new(ColumnData::I16(values.clone())),
+                        validity: validity.clone(),
+                    },
+                ),
+            ];
+            sink.push(batch).unwrap();
+            sink.finish().unwrap();
+        }
+        let path = dir.path().join("nullable.tsra");
+        sw.finish(&path).unwrap();
+
+        // Read back via the logical view — spans every `events_NNNN` shard.
+        let mut rdr = Reader::open(&path).unwrap();
+        let view = rdr.logical_table("events").unwrap();
+        assert!(view.block_count() >= 3, "need multi-block partition");
+        let column_back = view.column(&mut rdr, "lt_corr").unwrap();
+        let expected = ColumnData::Nullable {
+            values: Box::new(ColumnData::I16(values)),
+            validity,
+        };
+        assert_eq!(
+            column_back, expected,
+            "sealed multi-block nullable column lost values or validity"
+        );
     }
 
     #[test]

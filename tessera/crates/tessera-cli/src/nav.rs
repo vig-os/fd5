@@ -1403,6 +1403,9 @@ fn csv_cell(v: &Value) -> String {
 /// Convert a (sliced) numeric column to per-row JSON values. Floats render via their **native**
 /// shortest round-trip `Display` (so an `f32` shows `0.01`, not its widened-`f64` expansion);
 /// non-finite floats (NaN/±inf) have no JSON encoding → null (CSV shows `nan`, ndjson `null`).
+/// Nullable columns (#330) forward valid rows to the inner variant and surface `Value::Null` for
+/// NULL rows — ndjson consumers see proper `null` instead of a misleading finite value; CSV keeps
+/// the existing `nan` cell (consistent with how it already renders non-finite floats).
 fn col_to_values(col: &ColumnData) -> Vec<Value> {
     fn floats<T: std::fmt::Display + Copy>(v: &[T]) -> Vec<Value> {
         v.iter()
@@ -1424,6 +1427,14 @@ fn col_to_values(col: &ColumnData) -> Vec<Value> {
         ColumnData::U64(v) => v.iter().map(|x| Value::from(*x)).collect(),
         ColumnData::F32(v) => floats(v),
         ColumnData::F64(v) => floats(v),
+        ColumnData::Nullable { values, validity } => {
+            let inner = col_to_values(values);
+            inner
+                .into_iter()
+                .zip(validity.iter())
+                .map(|(v, &ok)| if ok { v } else { Value::Null })
+                .collect()
+        }
     }
 }
 

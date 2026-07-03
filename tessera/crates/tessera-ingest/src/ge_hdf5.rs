@@ -156,6 +156,12 @@ fn slab_to_columns(bytes: &[u8], c: &CompoundType, n_rows: usize) -> Result<Tabl
             ColumnData::U64(v) => v.reserve_exact(n_rows),
             ColumnData::F32(v) => v.reserve_exact(n_rows),
             ColumnData::F64(v) => v.reserve_exact(n_rows),
+            // Raw HDF5 compounds decode to plain non-null columns; `apply_geddf_dictionary` is
+            // what folds a partial-NaN float into a nullable int16 downstream. So the accumulator
+            // seed here is always non-Nullable.
+            ColumnData::Nullable { .. } => {
+                unreachable!("HDF5 raw decode never seeds a Nullable accumulator")
+            }
         }
     }
 
@@ -479,9 +485,18 @@ fn base_field(col: &str) -> &str {
 
 /// Opt-in transform: annotate `data`'s columns from the GEDDF dictionary for `group`, and — when
 /// `quantize` — requantize float columns to int16 at the dictionary's `quantize_scale` (physical =
-/// raw × scale). Float columns with any non-finite value (e.g. the mostly-NaN `lt_corr`) are left as
-/// float and only annotated — int16 has no NaN. Returns the annotated [`Column`] schema for the
-/// (possibly requantized) `data`; call BEFORE sealing so payload and manifest reflect the transform.
+/// raw × scale).
+///
+/// **Nullable int16 for partial-NaN floats (#330).** A float column that has any non-finite value
+/// (e.g. `events_3p.lt_corr`, 0.7% NaN in the DUPLET dataset) becomes a **nullable int16**: NaN
+/// rows are stored as NULL via a validity bitmap, the finite rows are quantized to int16 at the
+/// dictionary's `quantize_scale`. Byte-savings: ~2× on 99.3% good data + 1 bit/row for the
+/// validity bitmap (compresses to near nothing on a mostly-finite column) vs. the pre-#330
+/// force-to-`f4` fallback. Fully-finite columns still take the non-nullable int16 path (a
+/// `ColumnData::I16(_)`, byte-identical to pre-#330 output — no corpus regen).
+///
+/// Returns the annotated [`Column`] schema for the (possibly requantized) `data`; call BEFORE
+/// sealing so payload and manifest reflect the transform.
 pub fn apply_geddf_dictionary(group: &str, data: &mut TableData, quantize: bool) -> Vec<Column> {
     let group = dataset_group(group);
     let dict = geddf_dict().get(group);
@@ -489,20 +504,35 @@ pub fn apply_geddf_dictionary(group: &str, data: &mut TableData, quantize: bool)
     for (name, col) in data.iter_mut() {
         let meta = dict.and_then(|g| g.get(base_field(name)));
         let mut scale: Option<f64> = None;
+        let mut nullable = false;
         if quantize {
             if let (ColumnData::F32(v), Some(qs)) = (&*col, meta.and_then(|m| m.quantize_scale)) {
+                let quant = |x: f32| -> i16 {
+                    (x as f64 / qs)
+                        .round()
+                        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+                };
                 if v.iter().all(|x| x.is_finite()) {
-                    let q: Vec<i16> = v
-                        .iter()
-                        .map(|x| {
-                            (*x as f64 / qs)
-                                .round()
-                                .clamp(i16::MIN as f64, i16::MAX as f64)
-                                as i16
-                        })
-                        .collect();
+                    // Fully finite → the pre-#330 non-nullable int16 path, byte-identical to
+                    // what today's corpus/manifest_hash records.
+                    let q: Vec<i16> = v.iter().map(|x| quant(*x)).collect();
                     *col = ColumnData::I16(q);
                     scale = Some(qs);
+                } else {
+                    // #330: NaN → NULL, finite → int16 quantized. Placeholder for null slots is
+                    // the deterministic `0` (never observed by callers — validity says NULL) so
+                    // encode remains a pure function of input.
+                    let validity: Vec<bool> = v.iter().map(|x| x.is_finite()).collect();
+                    let q: Vec<i16> = v
+                        .iter()
+                        .map(|x| if x.is_finite() { quant(*x) } else { 0 })
+                        .collect();
+                    *col = ColumnData::Nullable {
+                        values: Box::new(ColumnData::I16(q)),
+                        validity,
+                    };
+                    scale = Some(qs);
+                    nullable = true;
                 }
             }
         }
@@ -513,6 +543,7 @@ pub fn apply_geddf_dictionary(group: &str, data: &mut TableData, quantize: bool)
             c.unit = m.unit.clone();
         }
         c.scale = scale;
+        c.nullable = nullable;
         columns.push(c);
     }
     columns
@@ -979,13 +1010,33 @@ mod tests {
     }
 
     #[test]
-    fn quantize_skips_nonfinite_float_columns() {
-        // int16 has no NaN — the mostly-NaN `lt_corr` stays float, still annotated.
-        let mut data: TableData = vec![("lt".into(), ColumnData::F32(vec![1.0, f32::NAN, 2.0]))];
+    fn quantize_partial_nan_float_becomes_nullable_int16() {
+        // #330: a float column with any NaN becomes a **nullable int16** — NaN → NULL (validity
+        // bit = false), finite → int16 quantized at the dictionary scale. The DUPLET
+        // `events_3p.lt_corr` case (0.7% NaN over 158M rows) now saves ~2× on the 99.3% good data
+        // instead of forcing the whole column back to `f4` (the pre-#330 path).
+        let mut data: TableData = vec![("lt".into(), ColumnData::F32(vec![1.5, f32::NAN, 2.0]))];
         let cols = apply_geddf_dictionary("events", &mut data, true);
-        assert_eq!(cols[0].dtype, "f4");
-        assert!(cols[0].scale.is_none());
+        assert_eq!(cols[0].dtype, "i2");
+        assert!(cols[0].nullable, "partial-NaN → nullable int16");
+        assert_eq!(cols[0].scale, Some(0.001)); // `lt` scale = 1 ps (from GEDDF)
         assert_eq!(cols[0].unit.as_deref(), Some("ns"));
+        // The wrapped values quantize finite rows and use 0 as a deterministic placeholder for
+        // the NaN slot (never observed — validity says NULL).
+        match &data[0].1 {
+            ColumnData::Nullable { values, validity } => {
+                assert_eq!(validity, &vec![true, false, true]);
+                match values.as_ref() {
+                    ColumnData::I16(v) => {
+                        assert_eq!(v[0], 1500); // round(1.5 / 0.001)
+                        assert_eq!(v[1], 0); // deterministic NULL placeholder
+                        assert_eq!(v[2], 2000); // round(2.0 / 0.001)
+                    }
+                    other => panic!("expected inner I16, got {other:?}"),
+                }
+            }
+            other => panic!("expected Nullable, got {other:?}"),
+        }
     }
 
     #[test]
