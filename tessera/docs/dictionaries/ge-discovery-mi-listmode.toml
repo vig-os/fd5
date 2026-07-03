@@ -159,7 +159,7 @@ quantize_dtype = "i2"
 
 [events.lt_corr]
 short_name = "lt_corr"
-description = "Positronium lifetime, corrected (TOF/geometry). Sparse — NaN for most events."
+description = "Positronium lifetime, corrected (TOF/geometry). ~0.7% NaN (correction not computed for this event) → NULL (nullable int16, #330); the rest quantize."
 dtype = "f4"
 unit = "ns"
 vocabulary = "MorePET"
