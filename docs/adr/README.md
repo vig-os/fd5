@@ -6,6 +6,7 @@ Accepted / Superseded.
 
 | ADR | Decision (register id) | Status |
 |---|---|---|
+| [0052](0052-versioning-and-release.md) | Versioning policy & release pipeline — **two axes** (software SemVer from `0.1.0-alpha.1` vs the format `tessera_version` staying `v0`/pre-1.0); **unified workspace version**; **release-plz** (Rust-native) drives version+CHANGELOG from conventional commits as a **held release PR** (nothing tags/publishes until deliberately merged); crates.io/PyPI/binaries deferred to when creds are set. `dev`=moving-target / `main`=distribution | **Accepted** (process; adr-matrix-exempt) |
 | [0020](0020-canonical-encoding-and-identity.md) | **D4** canonical encoding (RFC 8785 JCS) + **D5** identity model (id / content_hash / manifest_hash) + manifest & BlockRef schema | **Accepted** |
 | [0022](0022-versioning-and-container.md) | **D1** fd5 supersession (done) · versioning DAG · `.tsra` container spec | **Accepted** |
 | [0023](0023-array-block-payload.md) | Array block payload — Zarr v3 + pcodec, serialized as one deterministic blob (P3/S5) | **Accepted** |

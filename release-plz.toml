@@ -1,0 +1,8 @@
+# Release pipeline — ADR-0052. release-plz drives the workspace version + CHANGELOG from conventional
+# commits and opens a HELD release PR on pushes to `dev`. Nothing is tagged or published automatically;
+# the first alpha (0.1.0-alpha.1) is cut only by deliberately merging that release PR, then a separate,
+# token-gated `release-plz release`.
+[workspace]
+# No auto-publish / auto-tag. crates.io publishing is wired later, gated on CARGO_REGISTRY_TOKEN;
+# `tessera-py` / `tessera-wasm` are cdylibs (PyPI / npm) → `publish = false` for crates.io when that lands.
+release = false
