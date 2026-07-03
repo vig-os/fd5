@@ -33,5 +33,7 @@ jobs:
         uses: release-plz/action@v0.5
         with:
           command: release-pr
+          # The Cargo workspace is nested under `tessera/`, not the repo root.
+          manifest_path: tessera/Cargo.toml
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
