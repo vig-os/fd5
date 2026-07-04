@@ -440,6 +440,26 @@ impl<R: Read + Seek> Reader<R> {
         }
         Ok(total)
     }
+
+    /// Verify every block's stored payload by streaming it through [`Self::stream_block`] (the
+    /// bounded-memory 64 KiB-ring path) into a null sink — so a multi-GB product verifies at a few
+    /// MiB RSS, never buffering a whole block. `open` already checked the seal (manifest); this is
+    /// the payload half. The first corrupt block returns a typed [`Error::BlockIntegrity`] naming
+    /// `label` (the file path or URL) and the block, with the underlying cause in `detail` (the zip
+    /// CRC error, or an `Integrity` mismatch with expected/actual) — never a locus-free `io:` error
+    /// (#268). Shared by `tessera verify` and the `--verify` deep opt-in of the read-side commands.
+    pub fn verify_payloads(&mut self, label: &str) -> Result<()> {
+        let mut sink = std::io::sink();
+        for name in self.block_names() {
+            self.stream_block(&name, &mut sink)
+                .map_err(|e| Error::BlockIntegrity {
+                    file: label.to_string(),
+                    block: name.clone(),
+                    detail: e.to_string(),
+                })?;
+        }
+        Ok(())
+    }
 }
 
 /// One aux member to add to an existing `.tsra` — a name **relative to `aux/`** (so
