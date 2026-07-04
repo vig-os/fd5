@@ -229,7 +229,7 @@ fn block_children(kind: &BlockKind, spec: &Value) -> Vec<String> {
 ///
 /// A file is "signed" if it carries **either** an embedded signature (ADR-0042 `aux/signatures/…`)
 /// or a detached `<file>.tsra.sig.json` sidecar.
-fn status_line(file: &Path, m: &tessera_core::Manifest) -> String {
+fn status_line(file: &Path, m: &tessera_core::Manifest, verified: bool) -> String {
     let known = m.schema.is_some() || SchemaRegistry::builtin().get(&m.product).is_some();
     let schema = if known {
         match tessera_core::validate_manifest(m) {
@@ -239,10 +239,13 @@ fn status_line(file: &Path, m: &tessera_core::Manifest) -> String {
     } else {
         format!("schema={}(open-world)", m.product)
     };
-    let sealed = if m.manifest_hash.is_some() {
-        "sealed"
-    } else {
-        "unsealed"
+    // `open` already re-verified the seal, so a sealed file's seal is valid here. The default badge
+    // is `sealed` (seal only — payloads NOT re-hashed); `--verify` streams every payload first and
+    // upgrades it to `verified✓` (the honest distinction the audit tool owes, #268).
+    let sealed = match (verified, m.manifest_hash.is_some()) {
+        (true, _) => "verified✓",
+        (false, true) => "sealed",
+        (false, false) => "unsealed",
     };
     let has_embedded = tessera_io::has_embedded_signature(file).unwrap_or(false);
     let has_detached = tessera_io::sign::sidecar_path(file).exists();
@@ -256,14 +259,20 @@ fn status_line(file: &Path, m: &tessera_core::Manifest) -> String {
 
 /// `tessera tree FILE` — the whole hierarchy: root status, `meta` fields, every block (with its
 /// columns / array spec), and `sources`, drawn with box characters.
-pub fn tree(file: &Path, full: bool, out: &mut dyn Write) -> Result<()> {
-    let r = Reader::open(file)?;
+pub fn tree(file: &Path, full: bool, verify: bool, out: &mut dyn Write) -> Result<()> {
+    let mut r = Reader::open(file)?;
+    // Deep-verify (opt-in): re-hash every block payload before rendering, so a corrupt file errors
+    // out here rather than drawing a clean tree with a `sealed` badge (#268). Bounded RSS.
+    if verify {
+        r.verify_payloads(&file.display().to_string())?;
+    }
     let m = r.manifest();
     let name = file
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("<tsra>");
-    writeln!(out, "{name}  ·  {}", status_line(file, m)).map_err(tessera_core::Error::from)?;
+    writeln!(out, "{name}  ·  {}", status_line(file, m, verify))
+        .map_err(tessera_core::Error::from)?;
 
     // Build the node list: (header, children). meta · schema · blocks · sources · extra.
     let mut nodes: Vec<(String, Vec<String>)> = Vec::new();
@@ -1516,7 +1525,7 @@ mod tests {
         let p = dir.path().join("p.tsra");
         sample(&p);
         let mut buf = Vec::new();
-        tree(&p, false, &mut buf).unwrap();
+        tree(&p, false, false, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("product=listmode"));
         assert!(s.contains("schema=listmode")); // known schema; ✓/✗ depends on field completeness
@@ -1524,6 +1533,25 @@ mod tests {
         assert!(s.contains("modality"));
         assert!(s.contains("events"));
         assert!(s.contains("ms")); // a column leaf
+    }
+
+    /// #268 part 1: the default `tree` badge is `sealed` (seal only — the seal `open` verified),
+    /// and `--verify` re-hashes every payload and upgrades the badge to `verified✓`.
+    #[test]
+    fn tree_verify_upgrades_the_badge_from_sealed_to_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p.tsra");
+        sample(&p);
+
+        let mut buf = Vec::new();
+        tree(&p, false, false, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("· sealed") && !s.contains("verified"), "{s}");
+
+        let mut buf = Vec::new();
+        tree(&p, false, true, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("verified✓"), "{s}");
     }
 
     #[test]
@@ -1652,7 +1680,7 @@ mod tests {
 
         // tree includes the schema + extra sub-trees.
         let mut t = Vec::new();
-        tree(&p, false, &mut t).unwrap();
+        tree(&p, false, false, &mut t).unwrap();
         let t = String::from_utf8(t).unwrap();
         assert!(t.contains("schema  (recon") && t.contains("extra"), "{t}");
     }

@@ -57,7 +57,6 @@ fn open_local_or_url(arg: &std::path::Path) -> tessera_core::Result<Box<dyn Tsra
 /// behind a single boxed handle.
 trait TsraSource {
     fn manifest(&self) -> &tessera_core::Manifest;
-    fn block_names(&self) -> Vec<String>;
     /// Bounded-memory copy of a block's bytes into `w`, digest-verified after the last byte.
     /// Delegates to [`Reader::stream_block`] — preserves the same integrity contract: on
     /// `Err(Integrity)` the writer already saw the unverified bytes, so callers must stage to
@@ -67,14 +66,14 @@ trait TsraSource {
         name: &str,
         w: &mut dyn std::io::Write,
     ) -> tessera_core::Result<u64>;
+    /// Verify every block payload at bounded RSS, returning a typed `BlockIntegrity` (naming
+    /// `label` + the block) on the first corrupt block. Delegates to [`Reader::verify_payloads`].
+    fn verify_payloads(&mut self, label: &str) -> tessera_core::Result<()>;
 }
 
 impl<R: std::io::Read + std::io::Seek> TsraSource for Reader<R> {
     fn manifest(&self) -> &tessera_core::Manifest {
         Reader::manifest(self)
-    }
-    fn block_names(&self) -> Vec<String> {
-        Reader::block_names(self)
     }
     fn stream_block_to(
         &mut self,
@@ -85,6 +84,9 @@ impl<R: std::io::Read + std::io::Seek> TsraSource for Reader<R> {
         // trait object as `&mut &mut dyn Write` — the mutable-reference impl of `Write` is itself
         // `Sized`, which keeps the generic happy without changing the underlying writer.
         Reader::stream_block(self, name, &mut w)
+    }
+    fn verify_payloads(&mut self, label: &str) -> tessera_core::Result<()> {
+        Reader::verify_payloads(self, label)
     }
 }
 
@@ -178,6 +180,11 @@ enum Cmd {
         /// path); default collapses a multi-file edge to `<first> (+N more)`.
         #[arg(long)]
         full: bool,
+        /// Deep-verify: also re-hash every block payload (bounded memory), not just the seal that
+        /// `open` already checked. Exits nonzero and names the block on corruption. Slower — it
+        /// reads all payloads; for a huge blob prefer the fast default (seal only) unless auditing.
+        #[arg(long)]
+        verify: bool,
     },
     /// Verify a `.tsra`'s integrity (magic, seal, every block digest).
     ///
@@ -199,6 +206,11 @@ enum Cmd {
         /// Print provenance references in full instead of collapsing a multi-file edge.
         #[arg(long)]
         full: bool,
+        /// Deep-verify: re-hash every block payload (bounded memory) before rendering; the root
+        /// badge becomes `verified✓`, or the command exits nonzero naming the corrupt block. The
+        /// fast default only shows `sealed` (the seal `open` verified), not payload integrity (#268).
+        #[arg(long)]
+        verify: bool,
     },
     /// List one node's children (top level, `meta`, a block, or `sources`).
     ///
@@ -873,8 +885,13 @@ fn main() -> ExitCode {
 
 fn run(cmd: Cmd) -> tessera_core::Result<()> {
     match cmd {
-        Cmd::Inspect { file, full } => {
-            let r = open_local_or_url(&file)?;
+        Cmd::Inspect { file, full, verify } => {
+            let mut r = open_local_or_url(&file)?;
+            // Deep-verify (opt-in): re-hash every payload before rendering, so a corrupt file
+            // errors out here instead of printing a clean-looking summary (#268). Bounded RSS.
+            if verify {
+                r.verify_payloads(&file.display().to_string())?;
+            }
             let m = r.manifest();
             println!("tessera {} · product={}", m.tessera_version, m.product);
             println!("id            {}", m.id);
@@ -891,6 +908,12 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
                 "manifest_hash {}",
                 m.manifest_hash.as_deref().unwrap_or("-")
             );
+            if verify {
+                println!(
+                    "integrity     verified✓ ({} block payloads re-hashed)",
+                    m.blocks.len()
+                );
+            }
             println!("blocks        {}", m.blocks.len());
             for b in &m.blocks {
                 println!(
@@ -922,27 +945,15 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
         Cmd::Verify { file } => {
             let mut r = open_local_or_url(&file)?; // magic + manifest seal
             let n = r.manifest().blocks.len();
-            // Stream each block's payload through a bounded ring (never buffer the whole block) and
-            // check its digest — so verifying a multi-GB blob stays at a few MiB RSS, not the whole
-            // file (#268 part 3; `stream_block` uses a 64 KiB buffer, same path `extract` uses). On a
-            // failure, name the file + block so the operator sees the locus, not a bare `io:` error
-            // (#268 part 4).
-            let mut sink = std::io::sink();
-            for name in r.block_names() {
-                r.stream_block_to(&name, &mut sink).map_err(|e| {
-                    tessera_core::Error::BlockIntegrity {
-                        file: file.display().to_string(),
-                        block: name.clone(),
-                        detail: e.to_string(),
-                    }
-                })?;
-            }
+            // Payload half of verification: stream every block at bounded RSS + typed, located
+            // errors (#268 parts 3+4). `open` already checked the seal.
+            r.verify_payloads(&file.display().to_string())?;
             println!("OK  {} verified ({n} blocks)", file.display());
             Ok(())
         }
-        Cmd::Tree { file, full } => {
+        Cmd::Tree { file, full, verify } => {
             let mut out = std::io::stdout().lock();
-            nav::tree(&file, full, &mut out)
+            nav::tree(&file, full, verify, &mut out)
         }
         Cmd::Ls { file, path, full } => {
             let mut out = std::io::stdout().lock();
@@ -1865,6 +1876,7 @@ mod tests {
         run(Cmd::Inspect {
             file: tsra.clone(),
             full: false,
+            verify: false,
         })
         .unwrap();
         run(Cmd::Schema {
@@ -1947,6 +1959,57 @@ mod tests {
         }
     }
 
+    /// #268 part 1: the `--verify` deep opt-in on `tree`/`inspect` re-hashes payloads, so a
+    /// payload-corrupt file (whose seal is still valid → the fast default renders it) errors out
+    /// with a typed `BlockIntegrity` instead of showing a clean-looking `sealed` view.
+    #[test]
+    fn deep_verify_flag_rejects_a_corrupt_block_in_tree_and_inspect() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_tsra(&tsra);
+        let exploded = dir.path().join("exploded");
+        run(Cmd::Unpack {
+            file: tsra,
+            outdir: exploded.clone(),
+        })
+        .unwrap();
+        let block = exploded.join("blocks/volume");
+        let mut bytes = std::fs::read(&block).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&block, &bytes).unwrap();
+        let bad = dir.path().join("bad.tsra");
+        run(Cmd::Pack {
+            dir: exploded,
+            out: bad.clone(),
+        })
+        .unwrap();
+
+        // Fast default: the seal is valid, so it renders without error (no payload check).
+        run(Cmd::Tree {
+            file: bad.clone(),
+            full: false,
+            verify: false,
+        })
+        .unwrap();
+        // --verify: the payload corruption is caught, typed + located.
+        assert!(matches!(
+            run(Cmd::Tree {
+                file: bad.clone(),
+                full: false,
+                verify: true,
+            }),
+            Err(tessera_core::Error::BlockIntegrity { .. })
+        ));
+        assert!(matches!(
+            run(Cmd::Inspect {
+                file: bad,
+                full: false,
+                verify: true,
+            }),
+            Err(tessera_core::Error::BlockIntegrity { .. })
+        ));
+    }
+
     // Mirrors the GE 3-photon compound record (HDF5 maps by member name on read).
     #[repr(C)]
     #[derive(hdf5_metno::H5Type, Clone, Copy)]
@@ -2008,6 +2071,7 @@ mod tests {
         run(Cmd::Inspect {
             file: out.clone(),
             full: false,
+            verify: false,
         })
         .unwrap();
         let r = Reader::open(&out).unwrap();
