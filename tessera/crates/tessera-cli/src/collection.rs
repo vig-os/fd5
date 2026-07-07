@@ -43,14 +43,32 @@ fn load(file: &Path) -> Result<Collection> {
     Collection::from_json(&std::fs::read_to_string(file)?)
 }
 
+/// Filesystem-safe stem for a member `reference`/`id`: `blake3:<hex>` → `blake3_<hex>`.
+/// A colon is illegal in Windows paths and trips up some tooling, so the on-disk canonical
+/// member name uses `_`. Resolution still accepts the verbatim `:` form for back-compat.
+pub(crate) fn ref_stem(reference: &str) -> String {
+    reference.replace(':', "_")
+}
+
 /// The on-disk path of a member next to the `collection.json` — resolved by `kind` (ADR-0049 §4): a
-/// product is `<reference>.tsra`, a sub-collection is `<reference>.collection.json`.
+/// product is `<reference>.tsra`, a sub-collection is `<reference>.collection.json`. The `reference`
+/// is `blake3:<hex>`, but a colon is not portable in filenames, so the canonical on-disk name is the
+/// sanitized `blake3_<hex>` (see [`ref_stem`]). We prefer that portable name and fall back to the
+/// verbatim `:` name if that's what's on disk (collections written before this convention). If
+/// neither exists, we return the portable name so a not-found error points at the canonical form.
 fn member_path(collection_file: &Path, reference: &str, kind: MemberKind) -> PathBuf {
     let dir = collection_file.parent().unwrap_or_else(|| Path::new("."));
-    if kind == MemberKind::Collection {
-        dir.join(format!("{reference}.collection.json"))
+    let ext = if kind == MemberKind::Collection {
+        "collection.json"
     } else {
-        dir.join(format!("{reference}.tsra"))
+        "tsra"
+    };
+    let portable = dir.join(format!("{}.{ext}", ref_stem(reference)));
+    let verbatim = dir.join(format!("{reference}.{ext}"));
+    if portable.exists() || !verbatim.exists() {
+        portable
+    } else {
+        verbatim
     }
 }
 
@@ -247,7 +265,8 @@ fn verify_collection(
 /// (which verifies its seal), pins it by `(id, manifest_hash)` via the typed [`ProductHandle`], seals
 /// the catalog under the declared `--schema` (validating its `member_rule`), and writes a
 /// self-contained collection directory: `<out>/collection.json` + each member hard-linked (or copied)
-/// as `<out>/<id>.tsra`, so `collection verify` resolves + checks it in place. The collection's
+/// as `<out>/<ref_stem>.tsra` (portable — colon → `_`), so `collection verify` resolves + checks it
+/// in place cross-platform. The collection's
 /// timestamp defaults to the latest member's (deterministic) unless `--timestamp` is given.
 #[allow(clippy::too_many_arguments)]
 pub fn new(
@@ -296,11 +315,12 @@ pub fn new(
     // `project` would reject them — fail-fast before writing anything).
     let sealed = cb.seal()?;
 
-    // Write the self-contained collection dir: collection.json + each member as `<id>.tsra`.
+    // Write the self-contained collection dir: collection.json + each member as the portable
+    // `<ref_stem>.tsra` (colon → `_`) so `collection verify` resolves it in place cross-platform.
     std::fs::create_dir_all(out)?;
     std::fs::write(out.join("collection.json"), sealed.to_json()?)?;
     for (h, src) in &handles {
-        let dst = out.join(format!("{}.tsra", h.reference()));
+        let dst = out.join(format!("{}.tsra", ref_stem(h.reference())));
         if src.canonicalize().ok() == dst.canonicalize().ok() {
             continue; // member already in place as <id>.tsra
         }
@@ -393,6 +413,67 @@ mod tests {
         // Remove a member file → verify fails loudly (missing member).
         std::fs::remove_file(dir.path().join(format!("{}.tsra", c.members[0].reference))).unwrap();
         assert!(verify(&cf, &mut Vec::new()).is_err());
+    }
+
+    /// Regression (#344): a collection whose members are written with the **portable** `blake3_<hex>`
+    /// name (colon → `_`, as `collection new` and the DUPLET archive generator emit) must resolve.
+    /// Before the fix `member_path` only tried the verbatim `blake3:<hex>.tsra`, so `ls`/`verify`
+    /// reported every member `<member file not found>`.
+    #[test]
+    fn portable_underscore_named_members_resolve() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut members = Vec::new();
+        for name in ["ct", "pt"] {
+            let spec = ArraySpec::new(vec![2, 2], "int16");
+            let (bref, payload) =
+                tessera_io::array::array_block("volume", &spec, &ArrayData::I16(vec![0, 1, 2, 3]))
+                    .unwrap();
+            let mut b = ProductBuilder::new("recon", name, "d", "2024-01-01T00:00:00Z");
+            b.add_block_ref(bref);
+            let sealed = b.seal().unwrap();
+            let p = src.path().join(format!("{name}.tsra"));
+            pack(&sealed, &[payload], &p).unwrap();
+            members.push(p);
+        }
+
+        // `collection new` writes each member as the portable `blake3_<hex>.tsra`.
+        new(
+            &members,
+            out.path(),
+            "study",
+            "a CT+PET study",
+            "dataset",
+            Some("DP01"),
+            Some("2024-01-01T00:00:00Z"),
+            Role::Derived,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        // No colon-named files on disk; the canonical members are `blake3_<hex>.tsra`.
+        let tsras: Vec<_> = std::fs::read_dir(out.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.ends_with(".tsra"))
+            .collect();
+        assert_eq!(tsras.len(), 2, "{tsras:?}");
+        assert!(
+            tsras
+                .iter()
+                .all(|n| n.starts_with("blake3_") && !n.contains(':')),
+            "members must be portable underscore names, got {tsras:?}"
+        );
+
+        // ls resolves each member's name (not `<member file not found>`), and verify passes.
+        let cf = out.path().join("collection.json");
+        let mut buf = Vec::new();
+        ls(&cf, false, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(!s.contains("member file not found"), "{s}");
+        assert!(s.contains("ct") && s.contains("pt"), "{s}");
+
+        verify(&cf, &mut Vec::new()).unwrap();
     }
 
     /// Build a child collection on disk written as `<id>.collection.json` (+ its member `.tsra`s).
