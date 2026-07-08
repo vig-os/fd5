@@ -145,6 +145,31 @@ product, not a corpus-wide format change). The core ships a permissive default; 
 curates its own inheritable set — unlimited fields, zero engine change (symmetry with ADR-0050's
 schema-registered collection levels).
 
+## Implementation surface — the hardcode / schema / script boundary
+
+The engine holds only **mechanism + the format's own struct shapes**; every domain opinion is schema
+data; every per-run value comes from the ingest spec. This is the same split the existing `FieldSpec`
+already embodies (`required`/`recommended`/`sensitivity` are schema flags that the `validate()` loop
+*reads* — the loop is the mechanism, the *which* is data). `inherit` and "needs a recipe" slot into
+that mold; no new policy engine.
+
+| Concern | Engine (Rust, hardcoded) | Schema (registered data) | Spec / script (ingest TOML, per run) |
+|---|---|---|---|
+| **Producer identity** | the `Producer{tool,version,git_commit,git_repo,dirty}` struct shape; tessera stamps *its own* build | — | an external DAQ/SIM's `tool`/`version` values via `[producer]` |
+| **Generation recipe** | the `Generation{config, config_ref}` envelope; `config` is `Map<String,Value>` — **keys never inspected** | (optionally) whether this product-schema *requires* a recipe | the actual `config = {…}` keys/values, or `config_ref` to a carried block |
+| **Which fields inherit** | the DAG-walk-and-copy loop; "copy fields the schema marks `inherit`, unless the child overrides" | per-field `FieldSpec.inherit: bool` (+ its `sensitivity` tier rides along) | — (automatic at seal from schema + edges) |
+| **"derived needs a recipe"** | the `validate()` check that blocks on a missing schema-required thing (the *existing* required-field mechanism, extended to the `generation` slot) | schema-level `requires_generation` (core ships it `true` on derived-role schemas; a domain overrides) | satisfying it: supply `[generation]` for the member |
+| **PHI / anon / crypto-shred** | reads the tier; redact/encrypt machinery (ADR-0040) | per-field `sensitivity` (`public`/`coded`/`sensitive`/`identifying`) | — |
+
+The engine source never contains the string `patient_id` or `energy_window`. It contains "walk
+`derived_from`; copy fields the schema flags `inherit`; the config bag is opaque." `Role::{Raw,Derived}`
+stays a hardcoded enum (format-level, ADR-0033, also drives WORM tiers), but the mapping *derived ⇒
+recipe-required* is a **default on core's shipped schema**, overridable as data — not an engine `if`.
+The one unapologetic hardcode is the `Producer`/`Generation` **struct shape**: it is the manifest
+format (ADR-0020), and something must be the fixed spine the hashes commit to — but the shape is
+minimal and open (universal producer keys; an opaque `Map` config), so a never-before-seen instrument
+is self-describing with zero format change.
+
 ## Consequences
 
 - **A single derived `.tsra` becomes self-describing** — `inspect` alone yields patient/exam/study/

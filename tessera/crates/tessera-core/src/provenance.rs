@@ -39,6 +39,153 @@ impl Source {
     }
 }
 
+/// Structured producer identity (ADR-0052 §1) — *who/what generated a product*. The universal,
+/// domain-agnostic keys the format fixes; a generator (tessera itself, or an external DAQ/SIM/recon)
+/// fills its own. Sealed inside the manifest, so it is tamper-evident and part of the product's id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Producer {
+    /// The generating tool, e.g. `tessera`, `ge-listmode-daq`, a sim name.
+    pub tool: String,
+    pub version: String,
+    /// Exact source commit of the tool, when known. tessera stamps its own via the
+    /// `TESSERA_GIT_COMMIT` build env (absent in a sandboxed build ⇒ `None`, keeping the build
+    /// deterministic); an external producer fills its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_repo: Option<String>,
+    /// Working-tree dirty state at build, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
+}
+
+impl Producer {
+    /// An external producer's minimal identity (tool + version).
+    pub fn new(tool: impl Into<String>, version: impl Into<String>) -> Self {
+        Producer {
+            tool: tool.into(),
+            version: version.into(),
+            git_commit: None,
+            git_repo: None,
+            dirty: None,
+        }
+    }
+
+    /// Tessera's own identity, stamped at seal. `git_commit` is captured from the optional
+    /// `TESSERA_GIT_COMMIT` build env — `None` when unset (e.g. the Nix sandbox), so the default
+    /// stamp stays writer-deterministic within a build.
+    pub fn tessera() -> Self {
+        Producer {
+            tool: "tessera".into(),
+            version: crate::manifest::TESSERA_VERSION.into(),
+            git_commit: option_env!("TESSERA_GIT_COMMIT").map(str::to_string),
+            git_repo: option_env!("TESSERA_GIT_REPO").map(str::to_string),
+            dirty: None,
+        }
+    }
+}
+
+/// The manifest `producer` slot: a structured [`Producer`] (ADR-0052) **or** a legacy bare string
+/// (`"tessera/0.0.0"`, pre-ADR-0052). Untagged so a legacy string round-trips **byte-identically**
+/// — existing seals hold, no corpus break — while newly-sealed products carry the struct.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProducerRef {
+    Structured(Producer),
+    Legacy(String),
+}
+
+impl ProducerRef {
+    /// Tessera's own structured identity (the default seal stamp).
+    pub fn tessera() -> Self {
+        ProducerRef::Structured(Producer::tessera())
+    }
+
+    /// The generating tool name, whichever form. A legacy `"tool/version"` splits on the first `/`.
+    pub fn tool(&self) -> &str {
+        match self {
+            ProducerRef::Structured(p) => &p.tool,
+            ProducerRef::Legacy(s) => s.split('/').next().unwrap_or(s),
+        }
+    }
+
+    /// The tool version, whichever form.
+    pub fn version(&self) -> &str {
+        match self {
+            ProducerRef::Structured(p) => &p.version,
+            ProducerRef::Legacy(s) => s.split_once('/').map(|(_, v)| v).unwrap_or(""),
+        }
+    }
+
+    /// One-line `tool/version` for display (round-trips a legacy string verbatim).
+    pub fn display(&self) -> String {
+        match self {
+            ProducerRef::Structured(p) => match &p.git_commit {
+                Some(c) => format!("{}/{} ({c})", p.tool, p.version),
+                None => format!("{}/{}", p.tool, p.version),
+            },
+            ProducerRef::Legacy(s) => s.clone(),
+        }
+    }
+}
+
+/// Generation record (ADR-0052 §2) — *how a product was made*: a generic, **non-opinionated bag**.
+/// The format enforces only that it is present + non-empty for products whose schema requires a
+/// recipe; the `config` keys are the generator's business and are never inspected by the engine.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Generation {
+    /// Free-form settings the generator used (energy window, coincidence window, TOF cal, quant
+    /// scales, sim seed, cmd, …). Keys are opaque to the format.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, serde_json::Value>,
+    /// Alternative to inline `config`: a `blake3:` digest of a config / `.ini` / `.cfg` **block
+    /// carried in this `.tsra`** (ADR-0038 Blob) — bit-faithful and dedup'd for large vendor config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_ref: Option<String>,
+}
+
+impl Generation {
+    /// A recipe is "present" iff it carries inline settings or points at a carried config block.
+    pub fn is_empty(&self) -> bool {
+        self.config.is_empty() && self.config_ref.is_none()
+    }
+
+    /// Builder: inline settings.
+    pub fn with(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.config.insert(key.into(), value);
+        self
+    }
+
+    /// Builder: point at a carried config block by digest.
+    pub fn with_config_ref(mut self, digest: impl Into<String>) -> Self {
+        self.config_ref = Some(digest.into());
+        self
+    }
+}
+
+/// Copy **inheritable identity** fields from `parent` into `child`'s metadata (ADR-0052 §5),
+/// schema-driven: a field flows iff the `schema` marks it [`inherit`](crate::schema::FieldSpec::inherit)
+/// **and** the child does not already set it (an explicit child value always wins). The engine holds
+/// no field list — *which* fields are identity is the schema's declaration. The first-class `study`
+/// grouping key (a manifest field, not schema metadata) is inherited when unset, as it is the
+/// format's own grouping primitive rather than domain opinion.
+pub fn inherit_identity(
+    child: &mut Manifest,
+    parent: &Manifest,
+    schema: &crate::schema::ProductSchema,
+) {
+    for f in schema.inheritable_fields() {
+        if !child.metadata.contains_key(&f.id) {
+            if let Some(v) = parent.metadata.get(&f.id) {
+                child.metadata.insert(f.id.clone(), v.clone());
+            }
+        }
+    }
+    if child.study.is_none() {
+        child.study = parent.study.clone();
+    }
+}
+
 /// Resolves a provenance `reference` (a parent product's `id`) to its manifest, so a chain can be
 /// walked and verified. A `BTreeMap<id, Manifest>` is the simplest implementation; a real store
 /// would fetch from object storage.
@@ -136,5 +283,103 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Back-compat (ADR-0052): a pre-ADR-0052 manifest carries `producer` as a bare string. Reading
+    /// then re-serializing MUST reproduce the exact string (not a struct), so the seal over the old
+    /// bytes still holds and the conformance corpus / DP01 archive are not broken.
+    #[test]
+    fn legacy_producer_string_round_trips_byte_identical() {
+        let json = r#"{"tessera_version":"0.0.0","id":"blake3:x","id_inputs":{},"product":"recon","name":"n","description":"d","timestamp":"2024-01-01T00:00:00Z","producer":"tessera/0.0.0"}"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(&m.producer, Some(ProducerRef::Legacy(s)) if s == "tessera/0.0.0"),
+            "a bare string must parse as Legacy, got {:?}",
+            m.producer
+        );
+        let back = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            back["producer"],
+            serde_json::json!("tessera/0.0.0"),
+            "a legacy string must NOT be rewritten as a struct (would break the seal)"
+        );
+        // The accessors read it uniformly.
+        let p = m.producer.unwrap();
+        assert_eq!(p.tool(), "tessera");
+        assert_eq!(p.version(), "0.0.0");
+    }
+
+    /// A newly-sealed product carries the structured producer (tessera stamps its own tool+version),
+    /// serialized as a map.
+    #[test]
+    fn structured_producer_is_stamped_on_seal() {
+        let m = ProductBuilder::new("recon", "n", "d", TS).seal().unwrap();
+        match &m.producer {
+            Some(ProducerRef::Structured(p)) => assert_eq!(p.tool, "tessera"),
+            other => panic!("expected a structured producer, got {other:?}"),
+        }
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["producer"]["tool"], "tessera");
+    }
+
+    /// ADR-0052 §5: identity inheritance is **schema-driven** — only fields the schema flags
+    /// `inherit` flow from parent to child; a non-flagged field (a transform setting) does not; an
+    /// explicit child value always wins; the first-class `study` grouping key flows when unset.
+    #[test]
+    fn inherit_identity_is_schema_driven_and_child_wins() {
+        use crate::schema::{FieldSpec, ProductSchema};
+
+        let mut parent = Manifest::new("listmode", "raw", "d", TS);
+        parent.study = Some("DP01".into());
+        parent
+            .metadata
+            .insert("patient_id".into(), serde_json::json!("ANON9297"));
+        parent
+            .metadata
+            .insert("exam".into(), serde_json::json!("9297"));
+        parent
+            .metadata
+            .insert("energy_window".into(), serde_json::json!("425-650")); // not inheritable
+
+        let mut child = Manifest::new("listmode", "events", "d", TS);
+        child
+            .metadata
+            .insert("patient_id".into(), serde_json::json!("KEEP")); // child override
+
+        let schema = ProductSchema {
+            product: "listmode".into(),
+            version: "1".into(),
+            description: String::new(),
+            fields: vec![
+                FieldSpec::optional("patient_id", "", "string").inheritable(),
+                FieldSpec::optional("exam", "", "string").inheritable(),
+                FieldSpec::optional("energy_window", "", "string"), // NOT inheritable
+            ],
+            blocks: Vec::new(),
+            requires_generation: false,
+        };
+
+        inherit_identity(&mut child, &parent, &schema);
+
+        assert_eq!(
+            child.metadata.get("patient_id"),
+            Some(&serde_json::json!("KEEP")),
+            "an explicit child value wins over the parent's"
+        );
+        assert_eq!(
+            child.metadata.get("exam"),
+            Some(&serde_json::json!("9297")),
+            "a schema-flagged field is inherited"
+        );
+        assert_eq!(
+            child.metadata.get("energy_window"),
+            None,
+            "a non-inheritable field (a transform setting) does not flow down"
+        );
+        assert_eq!(
+            child.study.as_deref(),
+            Some("DP01"),
+            "the study grouping key is inherited when unset"
+        );
     }
 }

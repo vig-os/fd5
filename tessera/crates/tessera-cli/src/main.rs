@@ -922,7 +922,7 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
             println!("name          {}", m.name);
             println!("timestamp     {}", m.timestamp);
             if let Some(p) = &m.producer {
-                println!("producer      {p}");
+                println!("producer      {}", p.display());
             }
             if let Some(s) = &m.study {
                 println!("study         {s}");
