@@ -455,14 +455,42 @@ fn geddf_dict() -> &'static GeDict {
 }
 
 /// Map an HDF5 dataset name (or block prefix) to its dictionary group: `events_2p`/`events_3p` →
-/// `events`, `coin_2p`/`coin_3p` → `coin`, else the name itself (`singles`, `time_markers`, …).
+/// `events`, `coin_2p`/`coin_3p` → `coin`, else the leaf name itself (`singles`, `time_markers`,
+/// `coin_counters`, …). A path-qualified dataset (`/proc_data/events_3p`) is stripped to its leaf
+/// first (#331) — otherwise annotation/quantization silently no-op'd on nested HDF5 layouts.
 fn dataset_group(name: &str) -> &str {
-    if name.starts_with("events") {
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    if leaf.starts_with("events") {
         "events"
-    } else if name.starts_with("coin_2p") || name.starts_with("coin_3p") || name == "coin" {
+    } else if leaf.starts_with("coin_2p") || leaf.starts_with("coin_3p") || leaf == "coin" {
         "coin"
     } else {
-        name
+        leaf
+    }
+}
+
+/// Annotate an already-built column list from the GEDDF dictionary for `group`
+/// (`short_name`/`description`/`unit`) — the annotation half of [`apply_geddf_dictionary`], reused by
+/// the streaming and batch-non-quantize paths (which build columns without requantizing). Leaves
+/// `dtype`/`scale`/`codec` untouched, and never overwrites an already-set annotation. Unknown groups
+/// or columns pass through unchanged (open-world).
+pub fn annotate_columns(group: &str, columns: &mut [Column]) {
+    let group = dataset_group(group);
+    let Some(dict) = geddf_dict().get(group) else {
+        return;
+    };
+    for c in columns.iter_mut() {
+        if let Some(m) = dict.get(base_field(&c.name)) {
+            if c.short_name.is_none() {
+                c.short_name = m.short_name.clone();
+            }
+            if c.description.is_none() {
+                c.description = m.description.clone();
+            }
+            if c.unit.is_none() {
+                c.unit = m.unit.clone();
+            }
+        }
     }
 }
 
@@ -507,14 +535,11 @@ pub fn apply_geddf_dictionary(group: &str, data: &mut TableData, quantize: bool)
             }
         }
         let mut c = Column::new(name.clone(), col.numpy_code());
-        if let Some(m) = meta {
-            c.short_name = m.short_name.clone();
-            c.description = m.description.clone();
-            c.unit = m.unit.clone();
-        }
         c.scale = scale;
         columns.push(c);
     }
+    // Unit/description/short_name from the dictionary — the same annotation the non-quantize paths use.
+    annotate_columns(group, &mut columns);
     columns
 }
 
@@ -657,7 +682,10 @@ fn stream_to_listmode_product_2p_to_file_inner(
     extra_sources: &[tessera_core::provenance::Source],
     extra_metadata: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Manifest> {
-    let columns = compound_columns(path, dataset)?;
+    let mut columns = compound_columns(path, dataset)?;
+    // #343: annotate the streamed columns (unit/description/short_name) from the GEDDF dictionary so
+    // singles/coin (bounded-memory, non-quantized) are self-describing like the batch events tables.
+    annotate_columns(dataset, &mut columns);
     // Per-row width × BLOCK_ROWS = the encode-side per-block estimate; feed it to the StreamWriter's
     // ring-depth sizing so the in-flight RAM ceiling tracks `cfg.ram_budget` on wide schemas.
     let row_bytes: u64 = columns
@@ -943,6 +971,45 @@ mod tests {
         assert_eq!(dataset_group("coin_2p"), "coin");
         assert_eq!(dataset_group("singles"), "singles");
         assert_eq!(dataset_group("time_markers"), "time_markers");
+        assert_eq!(dataset_group("coin_counters"), "coin_counters");
+        // #331: a path-qualified dataset resolves via its leaf, not the whole path.
+        assert_eq!(dataset_group("/proc_data/events_3p"), "events");
+        assert_eq!(dataset_group("/proc_data/singles"), "singles");
+        assert_eq!(dataset_group("grp/coin_2p"), "coin");
+    }
+
+    #[test]
+    fn annotate_columns_labels_all_listmode_tables() {
+        // #343: the non-quantize paths (streaming singles/coin, batch time-markers/coin-counters)
+        // annotate columns from the dictionary — not just the quantized events table.
+        let mut singles = vec![
+            Column::new("ms", "u4"),
+            Column::new("en", "u2"),
+            Column::new("td", "u2"),
+        ];
+        annotate_columns("singles", &mut singles);
+        assert_eq!(singles[0].unit.as_deref(), Some("ms"));
+        assert_eq!(singles[1].unit.as_deref(), Some("keV"));
+        assert_eq!(singles[2].unit.as_deref(), Some("ps"));
+        assert!(singles[0]
+            .description
+            .as_deref()
+            .is_some_and(|d| d.contains("timestamp")));
+
+        // coin_counters via a nested path (#331 leaf resolution) still annotates.
+        let mut cc = vec![Column::new("cc", "u4")];
+        annotate_columns("/proc_data/coin_counters", &mut cc);
+        assert!(cc[0].description.is_some(), "coin_counters.cc annotated");
+
+        // Already-set annotation is never clobbered (open-world, non-destructive).
+        let mut pre = vec![Column {
+            name: "ms".into(),
+            dtype: "u4".into(),
+            unit: Some("custom".into()),
+            ..Default::default()
+        }];
+        annotate_columns("singles", &mut pre);
+        assert_eq!(pre[0].unit.as_deref(), Some("custom"), "existing unit kept");
     }
 
     #[test]

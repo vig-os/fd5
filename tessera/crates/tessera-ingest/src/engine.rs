@@ -536,7 +536,11 @@ fn dispatch(
                         schema,
                     )?
                 } else {
-                    crate::ge_hdf5::to_listmode_product(
+                    // #343: annotate columns (unit/description/short_name) from the GEDDF dictionary
+                    // even without quantization, so batch tables (time-markers, coin-counters, …) are
+                    // self-describing. `quantize = false` leaves dtypes + values untouched.
+                    let schema = crate::ge_hdf5::apply_geddf_dictionary(dataset, &mut cols, false);
+                    crate::ge_hdf5::to_listmode_product_with_schema(
                         &cols,
                         name,
                         &timestamp,
@@ -544,6 +548,7 @@ fn dispatch(
                         block_prefix,
                         row_index,
                         extra_sources,
+                        schema,
                     )?
                 };
                 let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
