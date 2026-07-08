@@ -95,13 +95,16 @@ instrument's config.
 ### 3. Enforcement (schema-driven, ADR-0040/0050 pattern)
 
 **Whether a product must carry generation provenance is a schema property, not an engine hardcode.**
-The core ships the sensible default: a product with `role = derived` (ADR-0033), or one authored by an
-external DAQ/SIM through the library, requires a structured `producer` with a real `tool`+`version`
-**and** a non-empty `generation` (inline `config` or a resolvable `config_ref`); absence is a **block**
-(`Error::Invalid`), not a warning. A `raw` acquisition records instrument/serial identity instead (§5)
-and is exempt — it was measured, not computed. A **domain schema is authoritative** and may tighten or
-relax this per its needs (same mechanism as ADR-0050's `member_rule` and ADR-0040's tiers): the engine
-reads the rule from the embedded, versioned schema and applies it — it does not itself decide policy.
+A schema that sets `requires_generation = true` blocks any member lacking a non-empty `generation`
+(inline `config` or a resolvable `config_ref`) at `validate()` — a **block** (`Error::Invalid`), not a
+warning — reusing the existing required-field mechanism. **The built-in schemas ship this `false`
+(permissive):** core `recon`/`listmode`/… do not force a recipe, so the vast corpus of already-sealed
+products keeps validating and an operator is never blocked by a default they did not choose. Producers
+that *have* a recipe attach it voluntarily (DP01 does — its raw records the DAQ `.ini` as `generation`).
+A **domain schema is authoritative** and may tighten this to `true` per its needs (same mechanism as
+ADR-0050's `member_rule` and ADR-0040's tiers): the engine reads the rule from the embedded, versioned
+schema and applies it — it does not itself decide policy. A `raw` acquisition records instrument/serial
+identity (§5) rather than a compute recipe — it was measured, not computed.
 
 ### 4. Library / py-binding surface
 
@@ -158,7 +161,7 @@ that mold; no new policy engine.
 | **Producer identity** | the `Producer{tool,version,git_commit,git_repo,dirty}` struct shape; tessera stamps *its own* build | — | an external DAQ/SIM's `tool`/`version` values via `[producer]` |
 | **Generation recipe** | the `Generation{config, config_ref}` envelope; `config` is `Map<String,Value>` — **keys never inspected** | (optionally) whether this product-schema *requires* a recipe | the actual `config = {…}` keys/values, or `config_ref` to a carried block |
 | **Which fields inherit** | the DAG-walk-and-copy loop; "copy fields the schema marks `inherit`, unless the child overrides" | per-field `FieldSpec.inherit: bool` (+ its `sensitivity` tier rides along) | — (automatic at seal from schema + edges) |
-| **"derived needs a recipe"** | the `validate()` check that blocks on a missing schema-required thing (the *existing* required-field mechanism, extended to the `generation` slot) | schema-level `requires_generation` (core ships it `true` on derived-role schemas; a domain overrides) | satisfying it: supply `[generation]` for the member |
+| **"derived needs a recipe"** | the `validate()` check that blocks on a missing schema-required thing (the *existing* required-field mechanism, extended to the `generation` slot) | schema-level `requires_generation` (built-ins ship it `false` / permissive; a domain schema opts in to `true`) | satisfying it: supply `[generation]` for the member |
 | **PHI / anon / crypto-shred** | reads the tier; redact/encrypt machinery (ADR-0040) | per-field `sensitivity` (`public`/`coded`/`sensitive`/`identifying`) | — |
 
 The engine source never contains the string `patient_id` or `energy_window`. It contains "walk

@@ -307,6 +307,21 @@ mod tests {
         let p = m.producer.unwrap();
         assert_eq!(p.tool(), "tessera");
         assert_eq!(p.version(), "0.0.0");
+
+        // The load-bearing claim: a manifest SEALED with a legacy string producer still VERIFIES
+        // after a JSON round-trip — i.e. the canonical bytes the seal is computed over are reproduced
+        // byte-for-byte, so an existing sealed .tsra never fails integrity under the new reader.
+        let mut sealed = Manifest::new("recon", "n", "d", TS);
+        sealed.producer = Some(ProducerRef::Legacy("acme-daq/1.2".into()));
+        sealed.manifest_hash = Some(sealed.compute_manifest_hash().unwrap());
+        let reparsed = Manifest::from_json(&sealed.to_json().unwrap()).unwrap();
+        reparsed
+            .verify()
+            .expect("legacy-producer seal must still verify after round-trip");
+        assert!(
+            matches!(&reparsed.producer, Some(ProducerRef::Legacy(s)) if s == "acme-daq/1.2"),
+            "the legacy producer survives the round-trip unchanged"
+        );
     }
 
     /// A newly-sealed product carries the structured producer (tessera stamps its own tool+version),

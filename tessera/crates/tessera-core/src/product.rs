@@ -46,6 +46,9 @@ impl ProductBuilder {
         manifest.schema = parent.schema.clone();
         manifest.metadata = parent.metadata.clone();
         manifest.extra = parent.extra.clone();
+        // `producer` and `generation` are intentionally NOT carried: a new version is sealed by
+        // *this* build (producer is re-stamped in `seal`), and its generation recipe is a property of
+        // how *this* revision was made — the caller re-attaches one via `with_generation` if needed.
         // Keep derivation/provenance edges; drop the parent's version edges (walked, not accumulated).
         manifest.sources = parent
             .sources
