@@ -1,6 +1,7 @@
 # ADR-0052 — Generation provenance (generic bag) + seal-time identity inheritance
 
-Status: **Proposed** · Relates: ADR-0025 (ingest, provenance-rooted) · ADR-0033 (raw→derived) ·
+Status: **Accepted** (implemented — tessera-core spine + tessera-ingest wiring, #324/#342/#343) ·
+Relates: ADR-0025 (ingest, provenance-rooted) · ADR-0033 (raw→derived) ·
 ADR-0042 (aux sidecars, the seal/wall-clock line) · ADR-0045 (units/quantities as derived products) ·
 ADR-0046 (time model) · ADR-0049/0050 (collections, schema-enforced rules) · #324 · #342 · #305 ·
 #310 · #331. Found during the DUPLET first-user run (two independent fresh-context FAIR reviews).
