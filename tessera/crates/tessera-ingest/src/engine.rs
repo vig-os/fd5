@@ -161,6 +161,10 @@ fn run_into(
 
     // (name → (id, manifest_hash)) — the resolver `derived_from` edges look parents up in.
     let mut built: BTreeMap<String, (String, String)> = BTreeMap::new();
+    // (name → sealed Manifest) — retained so a derived product can inherit schema-flagged identity
+    // from its parents at seal (ADR-0052 §5). Topo order (parents-first) guarantees a parent is
+    // present before any child that derives from it.
+    let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
 
     // The collection's normalised timestamp IS the per-product timestamp — re-running the same
     // spec must produce byte-identical member ids, so this MUST go through the same
@@ -170,8 +174,22 @@ fn run_into(
     for &idx in &order {
         let p = &spec.products[idx];
         let extra = build_extra_sources(p, &built, &spec_ref, &h)?;
-        let (manifest, _payloads_written_in_dispatch) =
-            dispatch(p, &extra, out_dir, cfg, stream_threshold, &timestamp)?;
+        // Resolve this product's `derived_from` parents to their sealed manifests (topo order ⇒
+        // present) so the seal can inherit their schema-flagged identity (ADR-0052 §5).
+        let parents: Vec<&Manifest> = p
+            .derived_from
+            .iter()
+            .filter_map(|n| manifests.get(n))
+            .collect();
+        let (manifest, _payloads_written_in_dispatch) = dispatch(
+            p,
+            &extra,
+            out_dir,
+            cfg,
+            stream_threshold,
+            &timestamp,
+            &parents,
+        )?;
         // Honor the fd5 schema contract AT INGEST: a product that claims a known schema must satisfy
         // it now, not only on a later `tessera schema`. Open-world → unknown product names pass.
         let registry = tessera_core::SchemaRegistry::builtin();
@@ -225,6 +243,7 @@ fn run_into(
             ))
         })?;
         built.insert(p.name.clone(), (id, mh));
+        manifests.insert(p.name.clone(), manifest);
     }
 
     // Assemble the collection in DECLARED order (= TOML `[[product]]` order, not topo order — the
@@ -310,6 +329,7 @@ fn dispatch(
     cfg: &tessera_io::WriteConfig,
     stream_threshold: u64,
     timestamp: &str,
+    parents: &[&Manifest],
 ) -> Result<(Manifest, ())> {
     let name = p.name.as_str();
     // collection-level timestamp is the per-product timestamp too: the engine takes its identity
@@ -332,8 +352,13 @@ fn dispatch(
                 label,
                 extra_sources,
             )?;
-            let m =
-                seal_streaming_to_tsra(m, &[("data".to_string(), input.as_path())], out_dir, p)?;
+            let m = seal_streaming_to_tsra(
+                m,
+                &[("data".to_string(), input.as_path())],
+                out_dir,
+                p,
+                parents,
+            )?;
             Ok((m, ()))
         }
         FormatOptions::Dicom { input, deidentify } => {
@@ -355,7 +380,7 @@ fn dispatch(
                 Some(&digest),
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             Ok((m, ()))
         }
         FormatOptions::DicomSeries {
@@ -393,7 +418,7 @@ fn dispatch(
                 Some(&digest),
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             Ok((m, ()))
         }
         FormatOptions::Nifti { input } => {
@@ -410,7 +435,7 @@ fn dispatch(
                 Some(&digest),
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             Ok((m, ()))
         }
         FormatOptions::Raw {
@@ -427,7 +452,7 @@ fn dispatch(
                 label,
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             Ok((m, ()))
         }
         FormatOptions::HdfCompound {
@@ -449,6 +474,14 @@ fn dispatch(
                 // directly; we then re-open the sealed manifest to record its id.
                 let stage = out_dir.join(format!("__stage_{}", sanitize_reference(name)));
                 let tmp_out = out_dir.join(format!("__pending_{}.tsra", sanitize_reference(name)));
+                // ADR-0052 §5: inherit schema-flagged identity from parents up-front (the streaming
+                // writer applies metadata pre-seal on the WriteSession, so there is no post-build
+                // re-seal hook — and re-writing a multi-GB streamed .tsra just for metadata would
+                // defeat the bounded-memory path). Spec `[product.metadata]` overrides inherited.
+                let mut merged_meta = inherited_metadata(parents, "listmode");
+                for (k, v) in &p.metadata {
+                    merged_meta.insert(k.clone(), v.clone());
+                }
                 // Build extra_sources with the canonical `ingested_from` flowing through the
                 // streaming session (it adds its own `ingested_from`); pass `extra_sources` as-is.
                 let m = crate::ge_hdf5::stream_to_listmode_product_2p_to_file(
@@ -464,7 +497,7 @@ fn dispatch(
                     row_index,
                     label,
                     extra_sources,
-                    &p.metadata,
+                    &merged_meta,
                 )?;
                 // Rename the pending .tsra to its id-named final path. Same filesystem → rename is
                 // atomic, so a crash here leaves either the old or the new file in place.
@@ -515,7 +548,7 @@ fn dispatch(
                         extra_sources,
                     )?
                 };
-                let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+                let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
                 Ok((m, ()))
             }
         }
@@ -576,9 +609,10 @@ fn seal_to_tsra(
     payloads: &[tessera_io::BlockPayload],
     out_dir: &Path,
     p: &crate::spec::ProductSpec,
+    parents: &[&Manifest],
     _timestamp: &str,
 ) -> Result<Manifest> {
-    let m = apply_spec_metadata(m, &p.metadata)?;
+    let m = apply_spec_metadata(m, &p.metadata, parents, p)?;
     let path = out_dir.join(member_filename(&m.id, MemberKind::Product));
     pack(&m, payloads, &path)?;
     // ADR-0042: stamp `aux/provenance.json` (wall-clock + producer + host) as a non-sealed aux
@@ -602,8 +636,9 @@ fn seal_streaming_to_tsra(
     sources: &[(String, &Path)],
     out_dir: &Path,
     p: &crate::spec::ProductSpec,
+    parents: &[&Manifest],
 ) -> Result<Manifest> {
-    let m = apply_spec_metadata(m, &p.metadata)?;
+    let m = apply_spec_metadata(m, &p.metadata, parents, p)?;
     let path = out_dir.join(member_filename(&m.id, MemberKind::Product));
     pack_streaming_verified(&m, sources, &path)?;
     // ADR-0042: aux/provenance.json stamp, matching seal_to_tsra above.
@@ -611,21 +646,69 @@ fn seal_streaming_to_tsra(
     Ok(m)
 }
 
-/// If the spec declared `[product.metadata]`, return a manifest re-sealed with those fields applied
-/// (overriding any builder default); else the manifest unchanged. Blocks are reused by digest
-/// (`from_manifest`), so `content_hash`/`id` are stable — only the metadata + `manifest_hash` change.
-/// The streaming path applies its overrides directly on the `WriteSession` (no post-seal re-build);
-/// this is the batch-path counterpart.
+/// Re-seal a product with (1) **inherited identity** from its `derived_from` parents (ADR-0052 §5)
+/// and (2) the spec's `[product.metadata]` overrides, then the recorded `[generation]`/`[producer]`.
+/// Priority is spec metadata > the product's own value > inherited-from-parent, so an explicit value
+/// always wins. Blocks are reused by digest (`from_manifest`), so `content_hash`/`id` are stable —
+/// only the metadata/provenance + `manifest_hash` change. Returns `m` unchanged when there is nothing
+/// to apply (no parents, no spec metadata, no generation/producer) so the common path is untouched.
+///
+/// `parents` are the resolved parent manifests (the engine walks `derived_from` in declared order);
+/// inheritance is driven by the **child's** embedded/builtin schema (`inheritable_fields`) — the
+/// engine holds no field list. The streaming path (`WriteSession`) applies spec overrides directly;
+/// this is the batch-path counterpart, and inheritance rides both.
+/// The identity fields a `product`-schema'd child inherits from its `parents` (ADR-0052 §5), as a
+/// plain metadata map. The **streaming** ingest path applies metadata on the `WriteSession` before
+/// seal (not via [`apply_spec_metadata`]), so it needs the inherited fields up-front rather than a
+/// post-build `inherit_identity_from`. Schema-driven — the engine holds no field list; the first
+/// parent carrying a field wins. (`study` is a manifest field carried by the spec, not returned here.)
+fn inherited_metadata(parents: &[&Manifest], product: &str) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
+    let registry = tessera_core::SchemaRegistry::builtin();
+    let Some(schema) = registry.get(product) else {
+        return out;
+    };
+    for f in schema.inheritable_fields() {
+        for parent in parents {
+            if let Some(v) = parent.metadata.get(&f.id) {
+                out.entry(f.id.clone()).or_insert_with(|| v.clone());
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn apply_spec_metadata(
     m: Manifest,
     meta: &BTreeMap<String, serde_json::Value>,
+    parents: &[&Manifest],
+    p: &crate::spec::ProductSpec,
 ) -> Result<Manifest> {
-    if meta.is_empty() {
+    let has_generation = p.generation.is_some() || p.producer.is_some();
+    if meta.is_empty() && parents.is_empty() && !has_generation {
         return Ok(m);
     }
     let mut b = tessera_core::ProductBuilder::from_manifest(&m);
+    // (1) Inherit schema-flagged identity from each parent (fills only fields the child lacks).
+    if !parents.is_empty() {
+        let registry = tessera_core::SchemaRegistry::builtin();
+        if let Some(schema) = registry.get(&m.product) {
+            for parent in parents {
+                b.inherit_identity_from(parent, schema);
+            }
+        }
+    }
+    // (2) Spec `[product.metadata]` overrides inherited + builder-default values.
     for (k, v) in meta {
         b.with_field(k, v.clone());
+    }
+    // (3) The sealed generation recipe + producer identity (ADR-0052 §1/§2).
+    if let Some(g) = &p.generation {
+        b.with_generation(g.clone());
+    }
+    if let Some(pr) = &p.producer {
+        b.with_producer(pr.clone());
     }
     b.seal()
 }
@@ -989,5 +1072,132 @@ metadata = {{ coincidence_mode = "singles", site = "anvil" }}
                 assert_eq!(mani.metadata.get("site"), Some(&serde_json::json!("anvil")));
             }
         }
+    }
+
+    /// ADR-0052 through-line (#342/#324): a derived product **inherits** schema-flagged identity
+    /// from its parent on BOTH the batch and streaming paths, an explicit child value wins, and the
+    /// raw records a **generation** recipe + external **producer** identity that ride the seal.
+    #[test]
+    fn derived_inherits_identity_and_raw_records_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("raw.h5");
+        let b = dir.path().join("der.h5");
+        write_synth_2p(&a, 40, "events_2p");
+        write_synth_2p(&b, 40, "events_2p");
+        let spec_text = format!(
+            r#"
+[collection]
+name = "inherit-test"
+timestamp = "{TS}"
+study = "DP06"
+
+[[product]]
+name = "raw"
+role = "raw"
+schema = "listmode"
+format = "hdf-compound"
+input = "{a}"
+dataset = "events_2p"
+streaming = "batch"
+[product.metadata]
+coincidence_mode = "singles"
+patient_id = "ANON1"
+exam = "9999"
+[product.generation.config]
+energy_window_keV = "425-650"
+coincidence_window_ns = "4.5"
+[product.producer]
+tool = "ge-listmode-daq"
+version = "3.2"
+
+[[product]]
+name = "derived-batch"
+role = "derived"
+schema = "listmode"
+derived_from = ["raw"]
+format = "hdf-compound"
+input = "{b}"
+dataset = "events_2p"
+streaming = "batch"
+[product.metadata]
+coincidence_mode = "prompt-coincidence"
+
+[[product]]
+name = "derived-stream"
+role = "derived"
+schema = "listmode"
+derived_from = ["raw"]
+format = "hdf-compound"
+input = "{b}"
+dataset = "events_2p"
+streaming = "stream"
+[product.metadata]
+coincidence_mode = "prompt-coincidence"
+patient_id = "OVERRIDE"
+"#,
+            a = a.display(),
+            b = b.display()
+        );
+        let parsed = crate::spec::parse_str(&spec_text).unwrap();
+        let out = dir.path().join("out");
+        let cfg = tessera_io::WriteConfig::for_system().workers(2);
+        // threshold = 1 so the explicit `streaming = "stream"` product really streams.
+        let coll = run(&parsed, &PathBuf::from("inline-spec"), &out, &cfg, 1).unwrap();
+        let mani = |i: usize| {
+            let path = out.join(format!(
+                "{}.tsra",
+                coll.members[i].reference.replace([':', '/'], "_")
+            ));
+            tessera_io::Reader::open(&path).unwrap().manifest().clone()
+        };
+        let raw = mani(0);
+        let der_batch = mani(1);
+        let der_stream = mani(2);
+
+        // The raw records the generation recipe + external producer (ADR-0052 §1/§2), sealed.
+        let g = raw
+            .generation
+            .as_ref()
+            .expect("raw must carry a generation record");
+        assert_eq!(
+            g.config.get("energy_window_keV"),
+            Some(&serde_json::json!("425-650"))
+        );
+        match raw.producer.as_ref().expect("raw producer") {
+            tessera_core::ProducerRef::Structured(p) => {
+                assert_eq!(p.tool, "ge-listmode-daq");
+                assert_eq!(p.version, "3.2");
+            }
+            other => panic!("expected a structured producer, got {other:?}"),
+        }
+
+        // Batch derived inherits patient_id + exam; keeps its own coincidence_mode; no recipe of its own.
+        assert_eq!(
+            der_batch.metadata.get("patient_id"),
+            Some(&serde_json::json!("ANON1")),
+            "batch path inherits identity from parent"
+        );
+        assert_eq!(
+            der_batch.metadata.get("exam"),
+            Some(&serde_json::json!("9999")),
+            "batch path inherits exam"
+        );
+        assert_eq!(
+            der_batch.metadata.get("coincidence_mode"),
+            Some(&serde_json::json!("prompt-coincidence")),
+            "the product's own per-level field is not inherited"
+        );
+
+        // Streaming derived inherits too (pre-seal metadata merge) — and an explicit child value wins.
+        assert_eq!(
+            der_stream.metadata.get("exam"),
+            Some(&serde_json::json!("9999")),
+            "streaming path inherits identity"
+        );
+        assert_eq!(
+            der_stream.metadata.get("patient_id"),
+            Some(&serde_json::json!("OVERRIDE")),
+            "an explicit child value wins over the inherited one"
+        );
     }
 }
