@@ -407,9 +407,11 @@ fn schema(product: &str, version: &str, description: &str) -> ProductSchema {
 /// `diffusion_mri` / `multicontrast_mri` rather than repeated per schema (DRY). `with` appends the
 /// schema's own extra fields.
 fn imaging_base(with: Vec<FieldSpec>) -> Vec<FieldSpec> {
+    // `modality` is intrinsic acquisition identity — it flows raw→derived (ADR-0052 §5).
     let mut fields = vec![FieldSpec::required("modality", "Imaging modality", "coded")
         .vocabulary("DICOM")
-        .with_sensitivity(Sensitivity::Coded)];
+        .with_sensitivity(Sensitivity::Coded)
+        .inheritable()];
     fields.extend(with);
     fields
 }
@@ -458,13 +460,15 @@ fn builtin_schemas() -> Vec<ProductSchema> {
                     "Pseudonymised patient handle (DICOM PS3.15 Patient Name / Patient ID family — direct PHI; supply a site-issued pseudonym, never the raw MRN)",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Identifying),
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
                 FieldSpec::optional(
                     "acquisition_uid",
                     "Acquisition UID (DICOM PS3.15 UID family — Study/Series/SOPInstance UID; linking PHI under the confidentiality profile)",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Identifying),
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
                 // ── DICOM curated-tag port (#253) ──────────────────────────────────────────
                 // Ported straight from the DICOM header at ingest time. Sensitivity tiers
                 // seeded from PS3.15 — the UIDs link back to the patient/study so they are
@@ -476,29 +480,34 @@ fn builtin_schemas() -> Vec<ProductSchema> {
                     "DICOM StudyInstanceUID (0020,000D) — PS3.15 UID family, links back to the patient/study",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Identifying),
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
                 FieldSpec::recommended(
                     "series_instance_uid",
                     "DICOM SeriesInstanceUID (0020,000E) — PS3.15 UID family, links back to the series",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Identifying),
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
                 FieldSpec::recommended(
                     "study_date",
                     "DICOM StudyDate (0008,0020), YYYYMMDD — scan context, access-controlled",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Sensitive),
+                .with_sensitivity(Sensitivity::Sensitive)
+                .inheritable(),
                 FieldSpec::recommended(
                     "manufacturer",
                     "DICOM Manufacturer (0008,0070) — device vendor",
                     "string",
-                ),
+                )
+                .inheritable(),
                 FieldSpec::recommended(
                     "model_name",
                     "DICOM ManufacturerModelName (0008,1090) — device model",
                     "string",
-                ),
+                )
+                .inheritable(),
                 FieldSpec::recommended("kvp", "DICOM KVP (0018,0060), CT peak kilovoltage", "float64")
                     .unit("kV"),
                 FieldSpec::recommended(
@@ -526,11 +535,52 @@ fn builtin_schemas() -> Vec<ProductSchema> {
             )
         },
         ProductSchema {
-            fields: vec![FieldSpec::required(
-                "coincidence_mode",
-                "Acquisition mode (singles / prompt-coincidence / extended-coincidence)",
-                "string",
-            )],
+            // `coincidence_mode` is per-level (singles vs prompt vs extended) — NOT inherited.
+            // The acquisition-identity fields ARE intrinsic to the acquisition and flow raw→derived
+            // (ADR-0052 §5): the raw `.dat` carries them, the derived singles/coin/events inherit
+            // them so each product is self-describing. Vendor acquisition *config* (cal files, the
+            // acq `.cfg`, load-point) is the raw's `generation.config` recipe, not inheritable identity.
+            fields: vec![
+                FieldSpec::required(
+                    "coincidence_mode",
+                    "Acquisition mode (singles / prompt-coincidence / extended-coincidence)",
+                    "string",
+                ),
+                FieldSpec::optional(
+                    "patient_id",
+                    "Pseudonymised patient handle for this acquisition (direct PHI — supply a site pseudonym, never the raw MRN)",
+                    "string",
+                )
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
+                FieldSpec::optional(
+                    "exam",
+                    "Exam / study number linking the acquisition to its study",
+                    "string",
+                )
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
+                FieldSpec::optional(
+                    "study_date",
+                    "Acquisition date (YYYYMMDD or RFC-3339) — scan context, access-controlled",
+                    "string",
+                )
+                .with_sensitivity(Sensitivity::Sensitive)
+                .inheritable(),
+                FieldSpec::optional(
+                    "acquisition_start",
+                    "Acquisition start instant",
+                    "string",
+                )
+                .with_sensitivity(Sensitivity::Sensitive)
+                .inheritable(),
+                FieldSpec::optional("acquisition_stop", "Acquisition stop instant", "string")
+                    .with_sensitivity(Sensitivity::Sensitive)
+                    .inheritable(),
+                FieldSpec::optional("acquisition_duration", "Acquisition duration", "float64")
+                    .unit("s")
+                    .inheritable(),
+            ],
             blocks: vec![one(
                 "events",
                 Some(Table),
