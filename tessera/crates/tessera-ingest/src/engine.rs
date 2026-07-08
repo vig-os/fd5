@@ -477,11 +477,12 @@ fn dispatch(
                 // ADR-0052 §5: inherit schema-flagged identity from parents up-front (the streaming
                 // writer applies metadata pre-seal on the WriteSession, so there is no post-build
                 // re-seal hook — and re-writing a multi-GB streamed .tsra just for metadata would
-                // defeat the bounded-memory path). Spec `[product.metadata]` overrides inherited.
-                let mut merged_meta = inherited_metadata(parents, "listmode");
-                for (k, v) in &p.metadata {
-                    merged_meta.insert(k.clone(), v.clone());
-                }
+                // defeat the bounded-memory path). The backend layers the three tiers in ascending
+                // priority (inherited < product-own default < spec), so `inherited` and `p.metadata`
+                // are passed SEPARATELY — never pre-merged — to keep an inherited value from ever
+                // clobbering a product-own default. `study` (first-class) inherits from the parent too.
+                let inherited = inherited_metadata(parents, "listmode");
+                let inherited_study = parents.iter().find_map(|m| m.study.as_deref());
                 // Build extra_sources with the canonical `ingested_from` flowing through the
                 // streaming session (it adds its own `ingested_from`); pass `extra_sources` as-is.
                 let m = crate::ge_hdf5::stream_to_listmode_product_2p_to_file(
@@ -497,7 +498,9 @@ fn dispatch(
                     row_index,
                     label,
                     extra_sources,
-                    &merged_meta,
+                    &inherited,
+                    inherited_study,
+                    &p.metadata,
                 )?;
                 // Rename the pending .tsra to its id-named final path. Same filesystem → rename is
                 // atomic, so a crash here leaves either the old or the new file in place.
