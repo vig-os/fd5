@@ -14,13 +14,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::block::BlockRef;
-use crate::provenance::Source;
+use crate::provenance::{Generation, ProducerRef, Source};
 
 /// Format/spec version this build writes.
 pub const TESSERA_VERSION: &str = "0.0.0";
 
 /// Highest major spec version this reader understands. A manifest with a higher major
-/// version is refused rather than silently mis-read.
+/// version is refused rather than silently misread.
 pub const SUPPORTED_MAJOR: u64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,10 +38,17 @@ pub struct Manifest {
     pub description: String,
     /// RFC 3339 timestamp, normalized to UTC.
     pub timestamp: String,
-    /// The tool/build that produced this product (`tessera/<version>`), stamped at seal — sealed
-    /// provenance so a reader knows *what wrote the file*. `None` only for pre-stamp legacy files.
+    /// The tool/build that produced this product — sealed provenance so a reader knows *what wrote
+    /// the file* (ADR-0052 §1). A structured [`ProducerRef::Structured`] on newly-sealed products;
+    /// a legacy bare string (`"tessera/0.0.0"`) round-trips unchanged on pre-ADR-0052 files. `None`
+    /// only for pre-stamp legacy files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub producer: Option<String>,
+    pub producer: Option<ProducerRef>,
+    /// Generation record (ADR-0052 §2) — *how* this product was made: producer's config/settings as
+    /// a generic bag (inline or a `config_ref` to a carried block). Sealed. Required at validate for
+    /// products whose schema sets `requires_generation`; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<Generation>,
     /// Embedded JSON Schema for the product (opaque to the core).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
@@ -98,6 +105,7 @@ impl Manifest {
             description,
             timestamp,
             producer: None,
+            generation: None,
             schema: None,
             blocks: Vec::new(),
             sources: Vec::new(),
@@ -181,7 +189,7 @@ impl Manifest {
     }
 
     /// Error if `tessera_version`'s major exceeds [`SUPPORTED_MAJOR`] (forward-incompat),
-    /// or if it is unparseable. Never panics.
+    /// or if it is unparsable. Never panics.
     pub fn check_version(&self) -> crate::Result<()> {
         let major = self
             .tessera_version
@@ -190,7 +198,7 @@ impl Manifest {
             .and_then(|x| x.parse::<u64>().ok())
             .ok_or_else(|| {
                 crate::Error::UnsupportedVersion(format!(
-                    "unparseable tessera_version: {}",
+                    "unparsable tessera_version: {}",
                     self.tessera_version
                 ))
             })?;

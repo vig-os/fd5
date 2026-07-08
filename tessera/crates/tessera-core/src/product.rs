@@ -112,6 +112,34 @@ impl ProductBuilder {
         self
     }
 
+    /// Declare the producing tool/build (ADR-0052 §1) — an external DAQ/SIM/recon records its own
+    /// identity here, overriding the default `tessera` stamp. Sealed provenance.
+    pub fn with_producer(&mut self, producer: crate::provenance::Producer) -> &mut Self {
+        self.manifest.producer = Some(crate::provenance::ProducerRef::Structured(producer));
+        self
+    }
+
+    /// Attach the generation record (ADR-0052 §2) — *how* this product was made, as a generic bag
+    /// (inline `config` and/or a `config_ref` to a carried block). Required at validate for schemas
+    /// that set `requires_generation`.
+    pub fn with_generation(&mut self, generation: crate::provenance::Generation) -> &mut Self {
+        self.manifest.generation = Some(generation);
+        self
+    }
+
+    /// Inherit **schema-flagged identity** fields from a resolved `derived_from` parent (ADR-0052
+    /// §5) — the DAG-walk caller (the ingest engine) supplies the parent manifest + this product's
+    /// schema; only fields the schema marks `inherit` flow, and an explicit child value always wins.
+    /// Call before `seal` so the inherited identity is covered by the seal.
+    pub fn inherit_identity_from(
+        &mut self,
+        parent: &Manifest,
+        schema: &crate::schema::ProductSchema,
+    ) -> &mut Self {
+        crate::provenance::inherit_identity(&mut self.manifest, parent, schema);
+        self
+    }
+
     /// Seal: roll block digests into the content Merkle root, then hash the whole manifest into
     /// the `manifest_hash` seal, freeze, and return it.
     ///
@@ -138,11 +166,11 @@ impl ProductBuilder {
                 self.manifest.schema = Some(s.to_value()?);
             }
         }
-        // Sealed provenance: stamp the producing tool/build so a reader knows what wrote the file.
+        // Sealed provenance: stamp the producing tool/build so a reader knows what wrote the file
+        // (ADR-0052 §1 — structured; tessera stamps its own version + optional build commit).
         // Re-stamped per version (not inherited) — a new version is sealed by *this* tool.
         if self.manifest.producer.is_none() {
-            self.manifest.producer =
-                Some(concat!("tessera/", env!("CARGO_PKG_VERSION")).to_string());
+            self.manifest.producer = Some(crate::provenance::ProducerRef::tessera());
         }
         // The seal is computed last, over the manifest with `manifest_hash` excluded, so it
         // transitively commits to id_inputs, sources, the producer, the embedded schema, and blocks.
