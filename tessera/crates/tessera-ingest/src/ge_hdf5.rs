@@ -604,6 +604,8 @@ pub fn stream_to_listmode_product_2p_to_file(
     row_index: &str,
     source_label: Option<&str>,
     extra_sources: &[tessera_core::provenance::Source],
+    inherited: &std::collections::BTreeMap<String, serde_json::Value>,
+    inherited_study: Option<&str>,
     extra_metadata: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Manifest> {
     stream_to_listmode_product_2p_to_file_inner(
@@ -620,6 +622,8 @@ pub fn stream_to_listmode_product_2p_to_file(
         row_index,
         source_label,
         extra_sources,
+        inherited,
+        inherited_study,
         extra_metadata,
     )
 }
@@ -657,6 +661,8 @@ pub fn stream_to_listmode_product_2p_to_file_with_block_rows(
         None,
         &[],
         &std::collections::BTreeMap::new(),
+        None,
+        &std::collections::BTreeMap::new(),
     )
 }
 
@@ -680,6 +686,8 @@ fn stream_to_listmode_product_2p_to_file_inner(
     row_index: &str,
     source_label: Option<&str>,
     extra_sources: &[tessera_core::provenance::Source],
+    inherited: &std::collections::BTreeMap<String, serde_json::Value>,
+    inherited_study: Option<&str>,
     extra_metadata: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Manifest> {
     let mut columns = compound_columns(path, dataset)?;
@@ -712,14 +720,23 @@ fn stream_to_listmode_product_2p_to_file_inner(
     for s in extra_sources {
         ws.add_source(s.clone())?;
     }
-    // Same default coincidence_mode as the batch builder — declared before any block commits so it
-    // flows into the sealed manifest_hash (the streaming path has no post-seal re-build).
+    // Three-tier metadata precedence, mirroring the batch path (inherit_identity → default → spec):
+    // apply in ascending priority so `with_field`'s last-write-wins yields spec > product-own > inherited.
+    // (1) INHERITED schema-flagged identity from `derived_from` parents (ADR-0052 §5) — lowest, so any
+    //     product-own default or explicit spec value below overrides it. `study` is a first-class field.
+    if let Some(s) = inherited_study {
+        ws.with_study(s)?;
+    }
+    for (k, v) in inherited {
+        ws.with_field(k, v.clone())?;
+    }
+    // (2) PRODUCT-OWN default coincidence_mode (same as the batch builder) — beats inherited, loses to spec.
     ws.with_field(
         "coincidence_mode",
         serde_json::Value::String(DEFAULT_COINCIDENCE_MODE.to_string()),
     )?;
-    // Spec `[product.metadata]` overrides — applied last (so a user value wins over the default)
-    // and before any block commits, so they flow into the sealed manifest_hash with no re-build.
+    // (3) SPEC `[product.metadata]` — highest; an explicit operator value wins over everything. All
+    //     three are declared before any block commits, so they flow into the sealed manifest_hash.
     for (k, v) in extra_metadata {
         ws.with_field(k, v.clone())?;
     }
@@ -776,6 +793,8 @@ pub fn stream_to_listmode_product_2p(
         "ms",
         None,
         &[],
+        &std::collections::BTreeMap::new(),
+        None,
         &std::collections::BTreeMap::new(),
     )?;
     // Re-read block bytes from the temp .tsra so callers get the in-memory pair their API expects.
