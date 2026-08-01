@@ -14,12 +14,14 @@ use tessera_core::block::{BlockKind, BlockRef};
 use tessera_core::chunk_index::{ChunkIndex, ChunkStats};
 use tessera_core::hash::digest;
 use tessera_core::{Error, Result};
+use vortex_array::accessor::ArrayAccessor;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{ChunkedArray, PrimitiveArray, StructArray};
+use vortex_array::arrays::{BoolArray, ChunkedArray, PrimitiveArray, StructArray, VarBinViewArray};
 use vortex_array::expr::{root, select};
 use vortex_array::iter::{ArrayIteratorAdapter, ArrayIteratorExt};
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
+use vortex_array::ExecutionCtx;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::float::{ALPRDScheme, ALPScheme};
 use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt};
@@ -49,6 +51,14 @@ pub enum ColumnData {
     U64(Vec<u64>),
     F32(Vec<f32>),
     F64(Vec<f64>),
+    /// Boolean column (dtype code `b1`). Bit-packed on the wire (Vortex
+    /// `BoolArray`); this in-memory form is a plain `Vec<bool>`.
+    Bool(Vec<bool>),
+    /// UTF-8 string column (dtype code `str`). Genuine variable/high-cardinality
+    /// text; Vortex picks FSST/dictionary automatically for low-cardinality
+    /// repeats. (For *known* small enums prefer an integer code column + a
+    /// categorical descriptor — a schema choice, not a `ColumnData` variant.)
+    Utf8(Vec<String>),
 }
 
 impl ColumnData {
@@ -65,6 +75,8 @@ impl ColumnData {
             ColumnData::U64(_) => "u8",
             ColumnData::F32(_) => "f4",
             ColumnData::F64(_) => "f8",
+            ColumnData::Bool(_) => "b1",
+            ColumnData::Utf8(_) => "str",
         }
     }
 
@@ -80,6 +92,8 @@ impl ColumnData {
             ColumnData::U64(v) => v.len(),
             ColumnData::F32(v) => v.len(),
             ColumnData::F64(v) => v.len(),
+            ColumnData::Bool(v) => v.len(),
+            ColumnData::Utf8(v) => v.len(),
         }
     }
 
@@ -104,7 +118,9 @@ impl ColumnData {
                 .iter()
                 .all(|&x| x <= i64::MAX as u64)
                 .then(|| v.iter().map(|&x| x as i64).collect()),
-            ColumnData::F32(_) | ColumnData::F64(_) => None,
+            ColumnData::F32(_) | ColumnData::F64(_) | ColumnData::Bool(_) | ColumnData::Utf8(_) => {
+                None
+            }
         }
     }
 
@@ -123,6 +139,16 @@ impl ColumnData {
             ColumnData::U64(v) => le_bytes(v, u64::to_le_bytes),
             ColumnData::F32(v) => le_bytes(v, f32::to_le_bytes),
             ColumnData::F64(v) => le_bytes(v, f64::to_le_bytes),
+            ColumnData::Bool(v) => v.iter().map(|&b| b as u8).collect(),
+            // length-prefixed: [u32 LE len | utf8 bytes] per string.
+            ColumnData::Utf8(v) => {
+                let mut out = Vec::new();
+                for s in v {
+                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                out
+            }
         }
     }
 
@@ -141,6 +167,27 @@ impl ColumnData {
             "u8" => ColumnData::U64(from_le(bytes, u64::from_le_bytes)?),
             "f4" => ColumnData::F32(from_le(bytes, f32::from_le_bytes)?),
             "f8" => ColumnData::F64(from_le(bytes, f64::from_le_bytes)?),
+            "b1" => ColumnData::Bool(bytes.iter().map(|&b| b != 0).collect()),
+            // inverse of the Utf8 length-prefixed encoding: [u32 LE len | bytes]*.
+            "str" => {
+                let mut v = Vec::new();
+                let mut i = 0usize;
+                while i + 4 <= bytes.len() {
+                    let len =
+                        u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]])
+                            as usize;
+                    i += 4;
+                    let end = i
+                        .checked_add(len)
+                        .filter(|&e| e <= bytes.len())
+                        .ok_or_else(|| {
+                            Error::Codec("truncated utf8 length-prefixed column".to_string())
+                        })?;
+                    v.push(String::from_utf8_lossy(&bytes[i..end]).into_owned());
+                    i = end;
+                }
+                ColumnData::Utf8(v)
+            }
             other => {
                 return Err(Error::Codec(format!(
                     "unsupported column dtype code '{other}'"
@@ -167,6 +214,8 @@ impl ColumnData {
             ColumnData::U64(v) => sl!(v, U64),
             ColumnData::F32(v) => sl!(v, F32),
             ColumnData::F64(v) => sl!(v, F64),
+            ColumnData::Bool(v) => sl!(v, Bool),
+            ColumnData::Utf8(v) => sl!(v, Utf8),
         }
     }
 
@@ -197,6 +246,8 @@ impl ColumnData {
             ColumnData::U64(v) => ext!(v, U64),
             ColumnData::F32(v) => ext!(v, F32),
             ColumnData::F64(v) => ext!(v, F64),
+            ColumnData::Bool(v) => ext!(v, Bool),
+            ColumnData::Utf8(v) => ext!(v, Utf8),
         }
         Ok(())
     }
@@ -224,6 +275,10 @@ impl ColumnData {
             ColumnData::U64(v) => Buffer::copy_from(v.as_slice()).into_array(),
             ColumnData::F32(v) => Buffer::copy_from(v.as_slice()).into_array(),
             ColumnData::F64(v) => Buffer::copy_from(v.as_slice()).into_array(),
+            ColumnData::Bool(v) => v.iter().copied().collect::<BoolArray>().into_array(),
+            ColumnData::Utf8(v) => {
+                VarBinViewArray::from_iter_str(v.iter().map(|s| s.as_str())).into_array()
+            }
         }
     }
 }
@@ -245,6 +300,8 @@ fn empty_column(code: &str) -> Result<ColumnData> {
         "u8" => ColumnData::U64(Vec::new()),
         "f4" => ColumnData::F32(Vec::new()),
         "f8" => ColumnData::F64(Vec::new()),
+        "b1" => ColumnData::Bool(Vec::new()),
+        "str" => ColumnData::Utf8(Vec::new()),
         other => {
             return Err(Error::Codec(format!(
             "table column dtype '{other}' unsupported (numpy codes i1/i2/i4/i8 u1/u2/u4/u8 f4/f8)"
@@ -488,6 +545,35 @@ where
 }
 
 /// Append a decoded (canonicalized) Vortex column's values onto the matching output (bit-exact).
+/// Execute one struct field into its declared `ColumnData` type and append it.
+/// Numeric columns canonicalize to `PrimitiveArray`; `Bool` → `BoolArray`,
+/// `Utf8` → `VarBinViewArray` (the compressor's chosen scheme is transparent
+/// here — canonicalization undoes FSST/dict/bit-packing).
+fn extend_field(col: &mut ColumnData, field: ArrayRef, ctx: &mut ExecutionCtx) -> Result<()> {
+    match col {
+        ColumnData::Bool(v) => {
+            let b: BoolArray = field.execute(ctx).map_err(ze)?;
+            v.extend(b.into_bit_buffer().iter());
+        }
+        ColumnData::Utf8(v) => {
+            let s: VarBinViewArray = field.execute(ctx).map_err(ze)?;
+            s.with_iterator(|it| {
+                for opt in it {
+                    v.push(
+                        opt.map(|b| String::from_utf8_lossy(b).into_owned())
+                            .unwrap_or_default(),
+                    );
+                }
+            });
+        }
+        _ => {
+            let prim: PrimitiveArray = field.execute(ctx).map_err(ze)?;
+            extend_column(col, &prim);
+        }
+    }
+    Ok(())
+}
+
 fn extend_column(col: &mut ColumnData, prim: &PrimitiveArray) {
     match col {
         ColumnData::I8(v) => v.extend_from_slice(prim.as_slice::<i8>()),
@@ -500,6 +586,9 @@ fn extend_column(col: &mut ColumnData, prim: &PrimitiveArray) {
         ColumnData::U64(v) => v.extend_from_slice(prim.as_slice::<u64>()),
         ColumnData::F32(v) => v.extend_from_slice(prim.as_slice::<f32>()),
         ColumnData::F64(v) => v.extend_from_slice(prim.as_slice::<f64>()),
+        ColumnData::Bool(_) | ColumnData::Utf8(_) => {
+            unreachable!("bool/utf8 columns are handled in extend_field, not as primitives")
+        }
     }
 }
 
@@ -527,9 +616,7 @@ pub fn decode(spec: &TableSpec, blob: &[u8]) -> Result<TableData> {
         while let Some(chunk) = stream.next().await {
             let st: StructArray = chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?;
             for (i, col) in cols.iter_mut().enumerate() {
-                let prim: PrimitiveArray =
-                    st.unmasked_field(i).clone().execute(&mut ctx).map_err(ze)?;
-                extend_column(col, &prim);
+                extend_field(col, st.unmasked_field(i).clone(), &mut ctx)?;
             }
         }
         Ok::<(), Error>(())
@@ -569,9 +656,7 @@ pub fn decode_column(spec: &TableSpec, blob: &[u8], name: &str) -> Result<Column
         futures::pin_mut!(stream);
         while let Some(chunk) = stream.next().await {
             let st: StructArray = chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?;
-            let prim: PrimitiveArray =
-                st.unmasked_field(0).clone().execute(&mut ctx).map_err(ze)?;
-            extend_column(&mut out, &prim);
+            extend_field(&mut out, st.unmasked_field(0).clone(), &mut ctx)?;
         }
         Ok::<(), Error>(())
     })?;
@@ -926,6 +1011,65 @@ mod tests {
             encode(&spec, &data).unwrap(),
             blob,
             "table non-deterministic"
+        );
+    }
+
+    #[test]
+    fn bool_and_utf8_columns_roundtrip() {
+        use tessera_core::block::table::{Column, TableSpec};
+        let n = 300usize;
+        let flags: Vec<bool> = (0..n).map(|k| k % 3 == 0).collect();
+        let origins: Vec<String> = (0..n)
+            .map(|k| ["annih511", "prompt_nuclear", "other"][k % 3].to_string())
+            .collect();
+        let data: TableData = vec![
+            ("flag".into(), ColumnData::Bool(flags.clone())),
+            ("origin".into(), ColumnData::Utf8(origins.clone())),
+        ];
+        let spec = TableSpec {
+            columns: vec![Column::new("flag", "b1"), Column::new("origin", "str")],
+            rows: n as u64,
+            row_index: None,
+        };
+        // Vortex round-trip (bit-packed bool + FSST/dict-chosen strings).
+        let blob = encode(&spec, &data).unwrap();
+        assert_eq!(
+            decode(&spec, &blob).unwrap(),
+            data,
+            "bool/utf8 vortex roundtrip"
+        );
+        assert_eq!(
+            encode(&spec, &data).unwrap(),
+            blob,
+            "bool/utf8 non-deterministic"
+        );
+        // The low-cardinality origin column compresses: encoding the *same shape* with unique
+        // strings instead is materially bigger, i.e. the compressor exploited the repeats
+        // (dict/FSST). Comparing against the raw string bytes would be unfair — a Vortex file
+        // carries a fixed footer/metadata cost that dwarfs 300 short strings.
+        let unique: Vec<String> = (0..n).map(|k| format!("origin-{k:07}")).collect();
+        let hi_card: TableData = vec![
+            ("flag".into(), ColumnData::Bool(flags.clone())),
+            ("origin".into(), ColumnData::Utf8(unique)),
+        ];
+        let hi_blob = encode(&spec, &hi_card).unwrap();
+        assert!(
+            blob.len() < hi_blob.len(),
+            "expected the repeated-string column to compress below the unique-string one: \
+             {} vs {}",
+            blob.len(),
+            hi_blob.len()
+        );
+        // LE-bytes round-trip (cross-runtime path).
+        let b = ColumnData::Bool(flags.clone());
+        assert_eq!(
+            ColumnData::from_le_bytes("b1", &b.to_le_bytes()).unwrap(),
+            b
+        );
+        let u = ColumnData::Utf8(origins);
+        assert_eq!(
+            ColumnData::from_le_bytes("str", &u.to_le_bytes()).unwrap(),
+            u
         );
     }
 
