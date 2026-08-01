@@ -335,17 +335,37 @@ fn ze(e: impl std::fmt::Display) -> Error {
     Error::Codec(e.to_string())
 }
 
+// The per-thread Vortex runtimes + sessions the read paths use. A session needs a runtime handle
+// (`CurrentThreadRuntime`, no tokio) or async IO panics, so each entry pairs the two.
+// (Plain comment, not a doc comment: rustdoc does not document macro invocations, and a `///` here
+// is an `unused_doc_comments` error under `-D warnings`.)
+thread_local! {
+    /// The encoding-registered session *template*, built once per thread.
+    /// `register_default_encodings` + session construction are the dominant
+    /// fixed cost of a read (measured in `examples/tsra_vs_parquet`: a decode is
+    /// ~4–6× a parquet read and the gap is per-call session *setup*, not the
+    /// data). Caching the template pays it once per thread; each call clones it
+    /// (`VortexSession` is `Arc`-backed → cheap) and rebinds a fresh runtime
+    /// handle. No call-site changes: `runtime_session()` keeps its signature.
+    static SESSION_TEMPLATE: VortexSession = {
+        let s = VortexSession::empty()
+            .with::<ArraySession>()
+            .with::<LayoutSession>()
+            .with::<ScalarFnSession>()
+            .with::<RuntimeSession>();
+        register_default_encodings(&s);
+        s
+    };
+}
+
 /// A fresh Vortex runtime + session with the default encodings registered. The session needs a
 /// runtime handle (`CurrentThreadRuntime`, no tokio) or async IO panics.
+///
+/// This is the *single-threaded* runtime. Read paths should prefer [`with_read_session`], which
+/// hands out the pooled one ([`READ_RT`]).
 fn runtime_session() -> (CurrentThreadRuntime, VortexSession) {
     let rt = CurrentThreadRuntime::new();
-    let s = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<LayoutSession>()
-        .with::<ScalarFnSession>()
-        .with::<RuntimeSession>()
-        .with_handle(rt.handle());
-    register_default_encodings(&s);
+    let s = SESSION_TEMPLATE.with(|t| t.clone().with_handle(rt.handle()));
     (rt, s)
 }
 
@@ -682,6 +702,52 @@ pub fn decode_column(spec: &TableSpec, blob: &[u8], name: &str) -> Result<Column
         Ok::<(), Error>(())
     })?;
     Ok(out)
+}
+
+/// Decode a **projected subset** of columns in a **single session** — Vortex
+/// scans only the named columns' layout segments (projection pushdown) and pays
+/// the session/encoding setup **once**, unlike N separate [`decode_column`]
+/// calls. The result columns are in `names` order.
+///
+/// This is the read shape the replay pipeline wants (a few columns of a wide
+/// listmode), and where Vortex's columnar layout beats a full [`decode`].
+pub fn decode_projected(spec: &TableSpec, blob: &[u8], names: &[&str]) -> Result<TableData> {
+    let dtypes: Vec<String> = names
+        .iter()
+        .map(|&n| {
+            spec.columns
+                .iter()
+                .find(|c| c.name == n)
+                .map(|c| c.dtype.clone())
+                .ok_or_else(|| Error::Codec(format!("table has no column '{n}'")))
+        })
+        .collect::<Result<_>>()?;
+    let (rt, s) = runtime_session();
+    let mut cols: Vec<ColumnData> = dtypes
+        .iter()
+        .map(|d| empty_column(d))
+        .collect::<Result<_>>()?;
+    let mut ctx = s.create_execution_ctx();
+    rt.block_on(async {
+        let stream = s
+            .open_options()
+            .open_buffer(ByteBuffer::copy_from(blob))
+            .map_err(ze)?
+            .scan()
+            .map_err(ze)?
+            .with_projection(select(names.to_vec(), root()))
+            .into_array_stream()
+            .map_err(ze)?;
+        futures::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            let st: StructArray = chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?;
+            for (i, col) in cols.iter_mut().enumerate() {
+                extend_field(col, st.unmasked_field(i).clone(), &mut ctx)?;
+            }
+        }
+        Ok::<(), Error>(())
+    })?;
+    Ok(names.iter().map(|n| n.to_string()).zip(cols).collect())
 }
 
 /// Build the `{hash, stats}` chunk-index (ADR-0028 §3) for a table block, splitting on the **same**
