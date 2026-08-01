@@ -319,9 +319,115 @@ impl Referenced {
     }
 }
 
+/// How a stored array's *values* are reconstructed **between** grid nodes — the
+/// evaluator law, distinct from the axis [`Transform`] (which maps index →
+/// coordinate). "Store, don't compute" applied to interpolation: a consumer
+/// gathers the bracketing node values and reconstructs from this descriptor
+/// alone, so CPU/GPU/FPGA lowerings all interpolate identically.
+///
+/// The axis space is already carried by the axis `Transform` (e.g.
+/// [`Transform::Log`] gives a log-spaced coordinate), so this enum names only
+/// the *value* space. Physics "log-log interpolation" = a [`Transform::Log`]
+/// axis + [`Interp::Log`] values; "lin-lin" = a linear axis + [`Interp::Linear`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "law", rename_all = "snake_case")]
+pub enum Interp {
+    /// Nearest node — no interpolation (`t < 0.5 → a`, else `b`).
+    Nearest,
+    /// Linear in value: `a + (b − a)·t`.
+    Linear,
+    /// Linear in `ln(value)`: `exp(ln a + (ln b − ln a)·t)` — exact for
+    /// power-law data. Falls back to [`Self::Linear`] if a node is ≤ 0.
+    Log,
+}
+
+impl Interp {
+    /// Reconstruct the value at fraction `t ∈ [0,1]` between node values `a`, `b`.
+    pub fn reconstruct(self, a: f64, b: f64, t: f64) -> f64 {
+        match self {
+            Interp::Nearest => {
+                if t < 0.5 {
+                    a
+                } else {
+                    b
+                }
+            }
+            Interp::Linear => a + (b - a) * t,
+            Interp::Log => {
+                if a > 0.0 && b > 0.0 {
+                    (a.ln() + (b.ln() - a.ln()) * t).exp()
+                } else {
+                    a + (b - a) * t
+                }
+            }
+        }
+    }
+}
+
+/// A 2-D **inverse-CDF sampler** descriptor: the value grid is `[row_axis × u]`
+/// (e.g. energy × uniform-quantile) and a draw gathers the four bracketing cells
+/// and combines them with the `row`/`col` [`Interp`] laws. Bilinear =
+/// `{ row: Linear, col: Linear }`. Self-describing so any backend samples the
+/// same distribution from the same table (the Compton-ICDF / calibration-LUT
+/// case that motivated [`Transform::Log`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcdfSampler {
+    /// Interpolation along the row axis (e.g. energy).
+    pub row: Interp,
+    /// Interpolation along the quantile (`u`) axis.
+    pub col: Interp,
+}
+
+impl IcdfSampler {
+    /// Bilinear (linear × linear) — the common case.
+    pub const BILINEAR: IcdfSampler = IcdfSampler {
+        row: Interp::Linear,
+        col: Interp::Linear,
+    };
+
+    /// Reconstruct the sampled value from the four bracketing cells
+    /// `v[row][col]`: `v00,v01` (row `r`), `v10,v11` (row `r+1`), with fractions
+    /// `tr` (row) and `tc` (col).
+    pub fn reconstruct(self, v00: f64, v01: f64, v10: f64, v11: f64, tr: f64, tc: f64) -> f64 {
+        let r0 = self.col.reconstruct(v00, v01, tc);
+        let r1 = self.col.reconstruct(v10, v11, tc);
+        self.row.reconstruct(r0, r1, tr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interp_reconstructs_and_round_trips_json() {
+        // linear
+        assert_eq!(Interp::Linear.reconstruct(2.0, 4.0, 0.5), 3.0);
+        // log (geometric mean at t=0.5)
+        let g = Interp::Log.reconstruct(1.0, 100.0, 0.5);
+        assert!((g - 10.0).abs() < 1e-9, "log midpoint {g}");
+        // log falls back to linear at a non-positive node
+        assert_eq!(Interp::Log.reconstruct(0.0, 2.0, 0.5), 1.0);
+        // nearest
+        assert_eq!(Interp::Nearest.reconstruct(2.0, 4.0, 0.4), 2.0);
+        assert_eq!(Interp::Nearest.reconstruct(2.0, 4.0, 0.6), 4.0);
+        // self-describing on the wire (tagged by `law`)
+        let j = serde_json::to_string(&Interp::Log).unwrap();
+        assert_eq!(j, r#"{"law":"log"}"#);
+        assert_eq!(serde_json::from_str::<Interp>(&j).unwrap(), Interp::Log);
+    }
+
+    #[test]
+    fn icdf_sampler_bilinear_and_round_trips_json() {
+        // bilinear over a unit cell: v00=0,v01=1,v10=2,v11=3
+        let s = IcdfSampler::BILINEAR;
+        assert_eq!(s.reconstruct(0.0, 1.0, 2.0, 3.0, 0.0, 0.0), 0.0);
+        assert_eq!(s.reconstruct(0.0, 1.0, 2.0, 3.0, 1.0, 1.0), 3.0);
+        assert_eq!(s.reconstruct(0.0, 1.0, 2.0, 3.0, 0.5, 0.5), 1.5);
+        let j = serde_json::to_string(&s).unwrap();
+        let back: IcdfSampler = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, s);
+    }
 
     #[test]
     fn identity_is_passthrough_both_directions() {
