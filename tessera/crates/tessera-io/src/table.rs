@@ -7,6 +7,29 @@
 //! the Vortex 0.75 file writer produces identical bytes for identical input — the writer-determinism
 //! release gate), digested over the encoded bytes. Column dtypes use the fd5 numpy-style codes
 //! (`i1/i2/i4/i8`, `u1/u2/u4/u8`, `f4/f8`) carried in [`tessera_core::block::table::Column`].
+//!
+//! # Reading — performance & the intended access pattern
+//!
+//! **These are Vortex-native reads and they parallelise.** [`decode`] /
+//! [`decode_projected`] drive the scan on a per-thread multi-core worker pool
+//! (`READ_RT`) so segment I/O + decode fan out across cores — do **not**
+//! reach for the bare single-threaded runtime and hand-roll a scan loop; that
+//! path is single-core and will read ~4× slower than a mature row store, which is
+//! a mis-use artefact, not a property of the format.
+//!
+//! Match the read to the format's shape:
+//! - **Project** — ask only for the columns you need ([`decode_projected`] /
+//!   [`decode_column`]); Vortex reads just those columns' layout segments.
+//! - **Full-materialise-to-`Vec<struct>` is the slow path on purpose.** The
+//!   fast, intended consumption is the columnar/zero-copy one (project + filter,
+//!   hand the canonical arrays to Arrow/DuckDB) — not decompressing every row into
+//!   host structs. A `decode`-everything-then-iterate bench measures the one
+//!   access pattern a columnar store is worst at.
+//!
+//! (Context: this guidance was added after a good-faith integrator copied
+//! `runtime_session`'s single-thread runtime into a hand-rolled loop, benched
+//! full-materialise, and wrongly concluded "Vortex decode is slow." The runtime
+//! choice + intended access pattern were the missing signposts.)
 
 use futures::StreamExt;
 use tessera_core::block::table::TableSpec;
