@@ -29,7 +29,7 @@ use vortex_buffer::{Buffer, ByteBuffer, ByteBufferMut};
 use vortex_file::{
     register_default_encodings, OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder,
 };
-use vortex_io::runtime::current::CurrentThreadRuntime;
+use vortex_io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::session::{RuntimeSession, RuntimeSessionExt};
 use vortex_layout::session::LayoutSession;
@@ -356,6 +356,20 @@ thread_local! {
         register_default_encodings(&s);
         s
     };
+
+    /// Per-thread **pooled** read runtime: a `CurrentThreadWorkerPool` sized to
+    /// available parallelism drives the scan's segment I/O + decode across all
+    /// cores in the background while `block_on` awaits results. The bare
+    /// `CurrentThreadRuntime` [`runtime_session`] uses is single-threaded — which
+    /// is the actual read-throughput bottleneck, NOT the columnar decode. The
+    /// pool + workers are spawned once per thread and kept alive here.
+    static READ_RT: (CurrentThreadRuntime, CurrentThreadWorkerPool, VortexSession) = {
+        let rt = CurrentThreadRuntime::new();
+        let pool = rt.new_pool();
+        pool.set_workers_to_available_parallelism();
+        let s = SESSION_TEMPLATE.with(|t| t.clone().with_handle(rt.handle()));
+        (rt, pool, s)
+    };
 }
 
 /// A fresh Vortex runtime + session with the default encodings registered. The session needs a
@@ -367,6 +381,11 @@ fn runtime_session() -> (CurrentThreadRuntime, VortexSession) {
     let rt = CurrentThreadRuntime::new();
     let s = SESSION_TEMPLATE.with(|t| t.clone().with_handle(rt.handle()));
     (rt, s)
+}
+
+/// Run `f` with the per-thread pooled read runtime+session (see [`READ_RT`]).
+fn with_read_session<R>(f: impl FnOnce(&CurrentThreadRuntime, &VortexSession) -> R) -> R {
+    READ_RT.with(|(rt, _pool, s)| f(rt, s))
 }
 
 /// Validate that `data` is encodable under `spec`: same column count, names, dtypes, and every
@@ -635,7 +654,6 @@ fn extend_column(col: &mut ColumnData, prim: &PrimitiveArray) {
 
 /// Decode the whole table from a block payload (inverse of [`encode`]).
 pub fn decode(spec: &TableSpec, blob: &[u8]) -> Result<TableData> {
-    let (rt, s) = runtime_session();
     // Accumulators, one per declared column (column order == struct field order on write).
     let mut cols: Vec<ColumnData> = spec
         .columns
@@ -643,24 +661,26 @@ pub fn decode(spec: &TableSpec, blob: &[u8]) -> Result<TableData> {
         .map(|c| empty_column(&c.dtype))
         .collect::<Result<_>>()?;
 
-    let mut ctx = s.create_execution_ctx();
-    rt.block_on(async {
-        let stream = s
-            .open_options()
-            .open_buffer(ByteBuffer::copy_from(blob))
-            .map_err(ze)?
-            .scan()
-            .map_err(ze)?
-            .into_array_stream()
-            .map_err(ze)?;
-        futures::pin_mut!(stream);
-        while let Some(chunk) = stream.next().await {
-            let st: StructArray = chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?;
-            for (i, col) in cols.iter_mut().enumerate() {
-                extend_field(col, st.unmasked_field(i).clone(), &mut ctx)?;
+    with_read_session(|rt, s| {
+        let mut ctx = s.create_execution_ctx();
+        rt.block_on(async {
+            let stream = s
+                .open_options()
+                .open_buffer(ByteBuffer::copy_from(blob))
+                .map_err(ze)?
+                .scan()
+                .map_err(ze)?
+                .into_array_stream()
+                .map_err(ze)?;
+            futures::pin_mut!(stream);
+            while let Some(chunk) = stream.next().await {
+                let st: StructArray = chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?;
+                for (i, col) in cols.iter_mut().enumerate() {
+                    extend_field(col, st.unmasked_field(i).clone(), &mut ctx)?;
+                }
             }
-        }
-        Ok::<(), Error>(())
+            Ok::<(), Error>(())
+        })
     })?;
 
     Ok(spec
@@ -722,30 +742,31 @@ pub fn decode_projected(spec: &TableSpec, blob: &[u8], names: &[&str]) -> Result
                 .ok_or_else(|| Error::Codec(format!("table has no column '{n}'")))
         })
         .collect::<Result<_>>()?;
-    let (rt, s) = runtime_session();
     let mut cols: Vec<ColumnData> = dtypes
         .iter()
         .map(|d| empty_column(d))
         .collect::<Result<_>>()?;
-    let mut ctx = s.create_execution_ctx();
-    rt.block_on(async {
-        let stream = s
-            .open_options()
-            .open_buffer(ByteBuffer::copy_from(blob))
-            .map_err(ze)?
-            .scan()
-            .map_err(ze)?
-            .with_projection(select(names.to_vec(), root()))
-            .into_array_stream()
-            .map_err(ze)?;
-        futures::pin_mut!(stream);
-        while let Some(chunk) = stream.next().await {
-            let st: StructArray = chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?;
-            for (i, col) in cols.iter_mut().enumerate() {
-                extend_field(col, st.unmasked_field(i).clone(), &mut ctx)?;
+    with_read_session(|rt, s| {
+        let mut ctx = s.create_execution_ctx();
+        rt.block_on(async {
+            let stream = s
+                .open_options()
+                .open_buffer(ByteBuffer::copy_from(blob))
+                .map_err(ze)?
+                .scan()
+                .map_err(ze)?
+                .with_projection(select(names.to_vec(), root()))
+                .into_array_stream()
+                .map_err(ze)?;
+            futures::pin_mut!(stream);
+            while let Some(chunk) = stream.next().await {
+                let st: StructArray = chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?;
+                for (i, col) in cols.iter_mut().enumerate() {
+                    extend_field(col, st.unmasked_field(i).clone(), &mut ctx)?;
+                }
             }
-        }
-        Ok::<(), Error>(())
+            Ok::<(), Error>(())
+        })
     })?;
     Ok(names.iter().map(|n| n.to_string()).zip(cols).collect())
 }
