@@ -1409,9 +1409,10 @@ fn csv_cell(v: &Value) -> String {
     }
 }
 
-/// Convert a (sliced) numeric column to per-row JSON values. Floats render via their **native**
+/// Convert a (sliced) column to per-row JSON values. Floats render via their **native**
 /// shortest round-trip `Display` (so an `f32` shows `0.01`, not its widened-`f64` expansion);
 /// non-finite floats (NaN/±inf) have no JSON encoding → null (CSV shows `nan`, ndjson `null`).
+/// Bool columns render as JSON `true`/`false`, Utf8 as JSON strings.
 fn col_to_values(col: &ColumnData) -> Vec<Value> {
     fn floats<T: std::fmt::Display + Copy>(v: &[T]) -> Vec<Value> {
         v.iter()
@@ -1433,6 +1434,8 @@ fn col_to_values(col: &ColumnData) -> Vec<Value> {
         ColumnData::U64(v) => v.iter().map(|x| Value::from(*x)).collect(),
         ColumnData::F32(v) => floats(v),
         ColumnData::F64(v) => floats(v),
+        ColumnData::Bool(v) => v.iter().map(|x| Value::from(*x)).collect(),
+        ColumnData::Utf8(v) => v.iter().map(|x| Value::from(x.as_str())).collect(),
     }
 }
 
@@ -1931,5 +1934,28 @@ mod tests {
         assert_eq!(s.lines().count(), 4);
         assert!(s.contains("\"ms\":10"));
         assert!(s.contains("\"en\":0.5"));
+    }
+
+    /// `b1`/`str` columns (#354) render as JSON booleans and strings — not as 0/1 or a debug
+    /// string — and `csv_cell` passes them through so the CSV path shows `true` / `annih511`.
+    #[test]
+    fn bool_and_utf8_render_as_json_bool_and_string() {
+        let flags = col_to_values(&ColumnData::Bool(vec![true, false]));
+        assert_eq!(flags, vec![Value::Bool(true), Value::Bool(false)]);
+        assert_eq!(csv_cell(&flags[0]), "true");
+
+        let origins = col_to_values(&ColumnData::Utf8(vec![
+            "annih511".to_string(),
+            "prompt_nuclear".to_string(),
+        ]));
+        assert_eq!(
+            origins,
+            vec![
+                Value::String("annih511".into()),
+                Value::String("prompt_nuclear".into())
+            ]
+        );
+        // csv_cell goes through `Value::to_string()` for non-numbers → JSON-quoted.
+        assert_eq!(csv_cell(&origins[0]), "\"annih511\"");
     }
 }

@@ -145,18 +145,7 @@ fn slab_to_columns(bytes: &[u8], c: &CompoundType, n_rows: usize) -> Result<Tabl
         .map(|(_, code)| empty_for(code))
         .collect::<Result<_>>()?;
     for col in &mut cols {
-        match col {
-            ColumnData::I8(v) => v.reserve_exact(n_rows),
-            ColumnData::I16(v) => v.reserve_exact(n_rows),
-            ColumnData::I32(v) => v.reserve_exact(n_rows),
-            ColumnData::I64(v) => v.reserve_exact(n_rows),
-            ColumnData::U8(v) => v.reserve_exact(n_rows),
-            ColumnData::U16(v) => v.reserve_exact(n_rows),
-            ColumnData::U32(v) => v.reserve_exact(n_rows),
-            ColumnData::U64(v) => v.reserve_exact(n_rows),
-            ColumnData::F32(v) => v.reserve_exact(n_rows),
-            ColumnData::F64(v) => v.reserve_exact(n_rows),
-        }
+        col.reserve_exact(n_rows);
     }
 
     // For each record, walk the field plan and push each (sub-)scalar.
