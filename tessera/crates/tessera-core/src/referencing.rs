@@ -28,6 +28,13 @@ pub enum Transform {
     /// PET → Bq/mL). Invertible iff `slope != 0`.
     #[serde(rename = "affine_1d")]
     Affine1d { slope: f64, intercept: f64 },
+    /// Log-spaced regular axis: `physical = exp(ln_lo + ln_step * stored)`. The log-space analogue of
+    /// [`Self::Affine1d`] — a *geometric* progression stored as a regular integer index, the way a
+    /// decade-spanning physical quantity (photon energy, frequency, a dose grid) is tabulated. This is
+    /// the calibration-LUT case: cross-section σ(E) curves and 2-D inverse-CDF samplers whose energy axis
+    /// is log-spaced so a few nodes cover keV→MeV at ~constant relative resolution. Regular (closed-form,
+    /// O(1) index) unlike the irregular [`Self::Lookup`]; invertible iff `ln_step != 0` and `physical > 0`.
+    Log { ln_lo: f64, ln_step: f64 },
     /// N-D affine: a homogeneous index→world matrix of `dims` rows × `dims+1` columns, **row-major**
     /// (`[R | t]`, implicit last row `[0…0 1]`). The [`WorldFrame`] voxel→world case.
     #[serde(rename = "affine_nd")]
@@ -66,6 +73,7 @@ impl Transform {
         match self {
             Transform::Identity => Some(stored),
             Transform::Affine1d { slope, intercept } => Some(stored * slope + intercept),
+            Transform::Log { ln_lo, ln_step } => Some((ln_lo + ln_step * stored).exp()),
             Transform::Lookup { values } => (stored.fract() == 0.0 && stored >= 0.0)
                 .then(|| values.get(stored as usize).copied())
                 .flatten(),
@@ -81,6 +89,9 @@ impl Transform {
             Transform::Identity => Some(physical),
             Transform::Affine1d { slope, intercept } => {
                 (*slope != 0.0).then(|| (physical - intercept) / slope)
+            }
+            Transform::Log { ln_lo, ln_step } => {
+                (*ln_step != 0.0 && physical > 0.0).then(|| (physical.ln() - ln_lo) / ln_step)
             }
             Transform::Lookup { values } => {
                 values.iter().position(|&v| v == physical).map(|i| i as f64)
@@ -234,6 +245,27 @@ impl Referenced {
         }
     }
 
+    /// ADR-0032 **calibration-LUT** instance: a **log-spaced** physical axis over `[lo, hi]` sampled at
+    /// `n` nodes — `physical = exp(ln(lo) + i * (ln(hi) − ln(lo))/(n−1))`. The cross-section / inverse-CDF
+    /// **energy axis** of a physics calibration table: log spacing lets a few nodes span keV→MeV at
+    /// ~constant *relative* resolution (the natural grid for σ(E) and sampler tables). A [`Transform::Log`];
+    /// unit is the quantity's UCUM code (e.g. `"keV"`), frame `"physical"`. Store-don't-compute — the two
+    /// log-grid parameters are data and the index is closed-form O(1) (unlike an irregular [`Transform::Lookup`]).
+    pub fn log_axis(lo: f64, hi: f64, n: usize, unit: Option<String>) -> Self {
+        let ln_lo = lo.ln();
+        let ln_step = if n > 1 {
+            (hi.ln() - ln_lo) / (n - 1) as f64
+        } else {
+            0.0
+        };
+        Referenced {
+            transform: Transform::Log { ln_lo, ln_step },
+            unit,
+            vocabulary: None,
+            frame: Some("physical".into()),
+        }
+    }
+
     /// Builder: attach the §3 vocabulary escape naming the controlled vocabulary `unit` is drawn from.
     pub fn with_vocabulary(mut self, vocabulary: &str) -> Self {
         self.vocabulary = Some(vocabulary.into());
@@ -341,6 +373,43 @@ mod tests {
     }
 
     #[test]
+    fn log_axis_maps_index_to_geometric_energy_grid() {
+        // a σ(E) / inverse-CDF energy axis: 1 keV .. 511 keV over 128 log-spaced nodes.
+        let r = Referenced::log_axis(1.0, 511.0, 128, Some("keV".into()));
+        assert_eq!(r.unit.as_deref(), Some("keV"));
+        assert_eq!(r.frame.as_deref(), Some("physical"));
+        // endpoints land on lo/hi; the grid is geometric (constant ratio per step).
+        assert!((r.transform.apply_scalar(0.0).unwrap() - 1.0).abs() < 1e-9);
+        assert!((r.transform.apply_scalar(127.0).unwrap() - 511.0).abs() < 1e-6);
+        // constant ratio: node k+1 / node k is the same everywhere (the defining log-grid property).
+        let step_ratio = 511.0f64.powf(1.0 / 127.0);
+        for k in [0.0, 50.0, 126.0] {
+            let lo = r.transform.apply_scalar(k).unwrap();
+            let hi = r.transform.apply_scalar(k + 1.0).unwrap();
+            assert!((hi / lo - step_ratio).abs() < 1e-9);
+        }
+        // invert recovers the (fractional) index — the O(1) closed-form gather.
+        let e = r.transform.apply_scalar(40.0).unwrap();
+        assert!((r.transform.invert_scalar(e).unwrap() - 40.0).abs() < 1e-9);
+        // guards: zero step and non-positive physical are non-invertible (no ln of ≤ 0).
+        assert_eq!(
+            Transform::Log {
+                ln_lo: 0.0,
+                ln_step: 0.0
+            }
+            .invert_scalar(1.0),
+            None
+        );
+        assert_eq!(r.transform.invert_scalar(0.0), None);
+        assert_eq!(r.transform.invert_scalar(-5.0), None);
+        // self-describing on the wire, additively (kind = "log"); roundtrips.
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["transform"]["kind"], "log");
+        let back: Referenced = serde_json::from_value(j).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
     fn affine_nd_from_world_frame_maps_voxel_to_world() {
         // 2 mm iso, origin (-100,-100,-50), LPS — voxel (10,20,5) → world.
         let wf = WorldFrame {
@@ -411,6 +480,7 @@ mod tests {
             Referenced::time_regular(0.0, 30.0),                                   // epoch
             Referenced::time_irregular(vec![5.0, 15.0]),                           // epoch
             Referenced::time_ticks(1e-12, 0.0),                                    // epoch
+            Referenced::log_axis(1.0, 511.0, 128, Some("keV".into())),             // physical
             Referenced::identity(Some("HU".into())),                               // no frame
         ] {
             assert!(
@@ -474,6 +544,7 @@ mod tests {
             Referenced::from_rescale(Some(1.0), Some(-1024.0), Some("HU".into())),
             Referenced::time_regular(0.0, 30.0), // s
             Referenced::time_ticks(1e-12, 0.0),  // s
+            Referenced::log_axis(1.0, 511.0, 128, Some("keV".into())), // keV
             Referenced::identity(Some("Bq/mL".into())),
         ] {
             assert!(r.unit_is_canonical(), "{:?} must use a pinned unit", r.unit);
