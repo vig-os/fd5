@@ -7,6 +7,29 @@
 //! the Vortex 0.75 file writer produces identical bytes for identical input — the writer-determinism
 //! release gate), digested over the encoded bytes. Column dtypes use the fd5 numpy-style codes
 //! (`i1/i2/i4/i8`, `u1/u2/u4/u8`, `f4/f8`) carried in [`tessera_core::block::table::Column`].
+//!
+//! # Reading — performance & the intended access pattern
+//!
+//! **These are Vortex-native reads and they parallelise.** [`decode`] /
+//! [`decode_projected`] drive the scan on a per-thread multi-core worker pool
+//! (`READ_RT`) so segment I/O + decode fan out across cores — do **not**
+//! reach for the bare single-threaded runtime and hand-roll a scan loop; that
+//! path is single-core and will read ~4× slower than a mature row store, which is
+//! a mis-use artefact, not a property of the format.
+//!
+//! Match the read to the format's shape:
+//! - **Project** — ask only for the columns you need ([`decode_projected`] /
+//!   [`decode_column`]); Vortex reads just those columns' layout segments.
+//! - **Full-materialise-to-`Vec<struct>` is the slow path on purpose.** The
+//!   fast, intended consumption is the columnar/zero-copy one (project + filter,
+//!   hand the canonical arrays to Arrow/DuckDB) — not decompressing every row into
+//!   host structs. A `decode`-everything-then-iterate bench measures the one
+//!   access pattern a columnar store is worst at.
+//!
+//! (Context: this guidance was added after a good-faith integrator copied
+//! `runtime_session`'s single-thread runtime into a hand-rolled loop, benched
+//! full-materialise, and wrongly concluded "Vortex decode is slow." The runtime
+//! choice + intended access pattern were the missing signposts.)
 
 use futures::StreamExt;
 use tessera_core::block::table::TableSpec;
@@ -29,7 +52,7 @@ use vortex_buffer::{Buffer, ByteBuffer, ByteBufferMut};
 use vortex_file::{
     register_default_encodings, OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder,
 };
-use vortex_io::runtime::current::CurrentThreadRuntime;
+use vortex_io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::session::{RuntimeSession, RuntimeSessionExt};
 use vortex_layout::session::LayoutSession;
@@ -310,19 +333,36 @@ pub type TableData = Vec<(String, ColumnData)>;
 
 /// An empty column of the dtype named by a numpy code (the decode accumulator).
 fn empty_column(code: &str) -> Result<ColumnData> {
+    empty_column_with_capacity(code, 0)
+}
+
+/// An empty accumulator column, pre-sized for `cap` rows.
+///
+/// **This is the dominant cost of a full-materialise read.** Profiling (`examples/read_profile`)
+/// attributes a 2 M-row × 21-column [`decode`] as ~2 % layout/scan, ~17 % genuine Vortex
+/// decompress, and **~81 % this host copy** — so the accumulators' growth policy, not the codec,
+/// sets the read's speed. Growing from empty re-allocates + re-copies each column O(log n) times
+/// (~2–3× the traffic of one pass); reserving the declared row count up front leaves exactly one
+/// copy per row-group.
+///
+/// `cap` comes from the spec's *declared* `rows`, which is attacker-controlled for an untrusted
+/// blob, so it is clamped to [`BLOCK_ROWS`] — the partitioning law's maximum rows in one table
+/// block. A larger table still decodes correctly; it just resumes amortised growth past the clamp.
+fn empty_column_with_capacity(code: &str, cap: usize) -> Result<ColumnData> {
+    let cap = cap.min(BLOCK_ROWS);
     Ok(match code {
-        "i1" => ColumnData::I8(Vec::new()),
-        "i2" => ColumnData::I16(Vec::new()),
-        "i4" => ColumnData::I32(Vec::new()),
-        "i8" => ColumnData::I64(Vec::new()),
-        "u1" => ColumnData::U8(Vec::new()),
-        "u2" => ColumnData::U16(Vec::new()),
-        "u4" => ColumnData::U32(Vec::new()),
-        "u8" => ColumnData::U64(Vec::new()),
-        "f4" => ColumnData::F32(Vec::new()),
-        "f8" => ColumnData::F64(Vec::new()),
-        "b1" => ColumnData::Bool(Vec::new()),
-        "str" => ColumnData::Utf8(Vec::new()),
+        "i1" => ColumnData::I8(Vec::with_capacity(cap)),
+        "i2" => ColumnData::I16(Vec::with_capacity(cap)),
+        "i4" => ColumnData::I32(Vec::with_capacity(cap)),
+        "i8" => ColumnData::I64(Vec::with_capacity(cap)),
+        "u1" => ColumnData::U8(Vec::with_capacity(cap)),
+        "u2" => ColumnData::U16(Vec::with_capacity(cap)),
+        "u4" => ColumnData::U32(Vec::with_capacity(cap)),
+        "u8" => ColumnData::U64(Vec::with_capacity(cap)),
+        "f4" => ColumnData::F32(Vec::with_capacity(cap)),
+        "f8" => ColumnData::F64(Vec::with_capacity(cap)),
+        "b1" => ColumnData::Bool(Vec::with_capacity(cap)),
+        "str" => ColumnData::Utf8(Vec::with_capacity(cap)),
         other => {
             return Err(Error::Codec(format!(
             "table column dtype '{other}' unsupported (numpy codes i1/i2/i4/i8 u1/u2/u4/u8 f4/f8)"
@@ -335,18 +375,63 @@ fn ze(e: impl std::fmt::Display) -> Error {
     Error::Codec(e.to_string())
 }
 
-/// A fresh Vortex runtime + session with the default encodings registered. The session needs a
-/// runtime handle (`CurrentThreadRuntime`, no tokio) or async IO panics.
-fn runtime_session() -> (CurrentThreadRuntime, VortexSession) {
-    let rt = CurrentThreadRuntime::new();
+// The per-thread Vortex runtimes + sessions the read paths use. A session needs a runtime handle
+// (`CurrentThreadRuntime`, no tokio) or async IO panics, so each entry pairs the two.
+// (Plain comment, not a doc comment: rustdoc does not document macro invocations, and a `///` here
+// is an `unused_doc_comments` error under `-D warnings`.)
+/// A fresh, **independent** encoding-registered session bound to `rt`'s handle.
+///
+/// Sessions must never be shared across runtimes. `VortexSession` is `Arc`-backed,
+/// so `clone().with_handle(..)` rebinds the *shared* state instead of producing an
+/// independent session: caching one template and re-binding a handle per call lets a
+/// short-lived runtime (`encode`/`decode_column`) leave every other holder — notably
+/// the long-lived pooled [`READ_RT`] session — pointing at a dropped runtime. The next
+/// pooled read then panics `Attempted to use a Handle after its runtime was dropped`.
+/// Regression-tested by `short_lived_runtime_does_not_poison_pooled_session`.
+///
+/// Building per runtime instead of cloning a template costs nothing measurable: the
+/// read win is the worker pool, not session reuse (`examples/read_profile` attributes
+/// ~93 % of a read to the host copy; template caching moved nothing).
+fn new_session(rt: &CurrentThreadRuntime) -> VortexSession {
     let s = VortexSession::empty()
         .with::<ArraySession>()
         .with::<LayoutSession>()
         .with::<ScalarFnSession>()
-        .with::<RuntimeSession>()
-        .with_handle(rt.handle());
+        .with::<RuntimeSession>();
     register_default_encodings(&s);
+    s.with_handle(rt.handle())
+}
+
+thread_local! {
+    /// Per-thread **pooled** read runtime: a `CurrentThreadWorkerPool` sized to
+    /// available parallelism drives the scan's segment I/O + decode across all
+    /// cores in the background while `block_on` awaits results. The bare
+    /// `CurrentThreadRuntime` [`runtime_session`] uses is single-threaded — which
+    /// is the actual read-throughput bottleneck, NOT the columnar decode. The
+    /// pool + workers are spawned once per thread and kept alive here.
+    static READ_RT: (CurrentThreadRuntime, CurrentThreadWorkerPool, VortexSession) = {
+        let rt = CurrentThreadRuntime::new();
+        let pool = rt.new_pool();
+        pool.set_workers_to_available_parallelism();
+        let s = new_session(&rt);
+        (rt, pool, s)
+    };
+}
+
+/// A fresh Vortex runtime + session with the default encodings registered. The session needs a
+/// runtime handle (`CurrentThreadRuntime`, no tokio) or async IO panics.
+///
+/// This is the *single-threaded* runtime. Read paths should prefer [`with_read_session`], which
+/// hands out the pooled one ([`READ_RT`]).
+fn runtime_session() -> (CurrentThreadRuntime, VortexSession) {
+    let rt = CurrentThreadRuntime::new();
+    let s = new_session(&rt);
     (rt, s)
+}
+
+/// Run `f` with the per-thread pooled read runtime+session (see [`READ_RT`]).
+fn with_read_session<R>(f: impl FnOnce(&CurrentThreadRuntime, &VortexSession) -> R) -> R {
+    READ_RT.with(|(rt, _pool, s)| f(rt, s))
 }
 
 /// Validate that `data` is encodable under `spec`: same column count, names, dtypes, and every
@@ -613,34 +698,156 @@ fn extend_column(col: &mut ColumnData, prim: &PrimitiveArray) {
     }
 }
 
-/// Decode the whole table from a block payload (inverse of [`encode`]).
-pub fn decode(spec: &TableSpec, blob: &[u8]) -> Result<TableData> {
-    let (rt, s) = runtime_session();
-    // Accumulators, one per declared column (column order == struct field order on write).
-    let mut cols: Vec<ColumnData> = spec
-        .columns
-        .iter()
-        .map(|c| empty_column(&c.dtype))
-        .collect::<Result<_>>()?;
+/// Below this many values (rows × columns) the fan-out in [`materialise`] costs more in thread
+/// spawns than it saves. Small tables stay exactly as serial as they were.
+const PARALLEL_MATERIALISE_MIN_VALUES: usize = 1 << 20;
 
-    let mut ctx = s.create_execution_ctx();
-    rt.block_on(async {
-        let stream = s
-            .open_options()
-            .open_buffer(ByteBuffer::copy_from(blob))
-            .map_err(ze)?
-            .scan()
-            .map_err(ze)?
-            .into_array_stream()
-            .map_err(ze)?;
-        futures::pin_mut!(stream);
-        while let Some(chunk) = stream.next().await {
-            let st: StructArray = chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?;
-            for (i, col) in cols.iter_mut().enumerate() {
+/// Decompress every column out of the already-scanned row-groups and copy it into the host
+/// accumulators — **column-parallel**.
+///
+/// This is where a full-materialise read spends its time (`examples/read_profile`: ~20 % Vortex
+/// decompress + ~78 % host copy, against ~2 % for the scan itself), and it parallelises perfectly:
+/// each column is touched by exactly one worker, and that worker walks the row-groups in order, so
+/// the output is **bit-identical** to a serial decode (asserted by
+/// `decode_is_bit_identical_across_thread_counts`). Measured 2.1× on a 10-core box for a
+/// 2 M-row × 21-column listmode table; the ceiling is memory bandwidth, not core count.
+///
+/// The driver hands over already-scanned `chunks`, whose fields are still *encoded* views into the
+/// blob the caller already holds in memory — so this buys its parallelism without inflating the
+/// resident set.
+fn materialise(s: &VortexSession, chunks: &[StructArray], cols: &mut [ColumnData]) -> Result<()> {
+    let ncols = cols.len();
+    if ncols == 0 {
+        return Ok(());
+    }
+    let values = chunks.iter().map(|c| c.len()).sum::<usize>() * ncols;
+    let threads = if values < PARALLEL_MATERIALISE_MIN_VALUES {
+        1
+    } else {
+        // NB: sized against the whole machine. A caller that already decodes many blocks in
+        // parallel should decode each block on one thread rather than nest the fan-outs.
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(ncols)
+    };
+    materialise_with(s, chunks, cols, threads)
+}
+
+/// [`materialise`] with the worker count pinned — the seam the equivalence test drives to prove
+/// serial and parallel produce the same bytes.
+fn materialise_with(
+    s: &VortexSession,
+    chunks: &[StructArray],
+    cols: &mut [ColumnData],
+    threads: usize,
+) -> Result<()> {
+    let ncols = cols.len();
+    if ncols == 0 {
+        return Ok(());
+    }
+    if threads <= 1 {
+        let mut ctx = s.create_execution_ctx();
+        for (i, col) in cols.iter_mut().enumerate() {
+            for st in chunks {
                 extend_field(col, st.unmasked_field(i).clone(), &mut ctx)?;
             }
         }
-        Ok::<(), Error>(())
+        return Ok(());
+    }
+
+    let per = ncols.div_ceil(threads);
+    std::thread::scope(|sc| -> Result<()> {
+        let handles: Vec<_> = cols
+            .chunks_mut(per)
+            .enumerate()
+            .map(|(t, group)| {
+                let s = s.clone(); // Arc-backed — the clone is the cheap part
+                sc.spawn(move || -> Result<()> {
+                    let mut ctx = s.create_execution_ctx();
+                    for (j, col) in group.iter_mut().enumerate() {
+                        let i = t * per + j;
+                        for st in chunks {
+                            extend_field(col, st.unmasked_field(i).clone(), &mut ctx)?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Codec("table decode worker panicked".into()))??;
+        }
+        Ok(())
+    })
+}
+
+/// Drive the scan to completion, returning one canonical [`StructArray`] per row-group. The
+/// struct is canonical but its *fields* are still encoded, so this is cheap (~2 % of a read) and
+/// holds no more memory than the blob already resident in the caller's hands.
+async fn scan_chunks(
+    s: &VortexSession,
+    blob: &[u8],
+    projection: Option<&[&str]>,
+) -> Result<Vec<StructArray>> {
+    let mut ctx = s.create_execution_ctx();
+    let scan = s
+        .open_options()
+        .open_buffer(ByteBuffer::copy_from(blob))
+        .map_err(ze)?
+        .scan()
+        .map_err(ze)?;
+    let scan = match projection {
+        Some(names) => scan.with_projection(select(names.to_vec(), root())),
+        None => scan,
+    };
+    let stream = scan.into_array_stream().map_err(ze)?;
+    futures::pin_mut!(stream);
+    let mut chunks = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        chunks.push(chunk.map_err(ze)?.execute(&mut ctx).map_err(ze)?);
+    }
+    Ok(chunks)
+}
+
+/// Decode the whole table from a block payload (inverse of [`encode`]).
+///
+/// Sizes its own fan-out against the whole machine. A caller that is *already* decoding many
+/// blocks in parallel should use [`decode_with_workers`] to pin each block to one worker instead
+/// of nesting two fan-outs.
+pub fn decode(spec: &TableSpec, blob: &[u8]) -> Result<TableData> {
+    decode_inner(spec, blob, None)
+}
+
+/// [`decode`] with the materialise fan-out pinned to `workers` threads (`1` = fully serial).
+///
+/// The point is composition. `decode` sizes itself to `available_parallelism()`, which is right
+/// for one decode on an idle machine and wrong inside a caller's own parallel loop — N concurrent
+/// `decode`s would each spawn N workers. Decoding a cohort of blocks across a thread pool should
+/// therefore pass `1` here and keep the parallelism at the outer level, where it already has
+/// better work granularity.
+pub fn decode_with_workers(spec: &TableSpec, blob: &[u8], workers: usize) -> Result<TableData> {
+    decode_inner(spec, blob, Some(workers))
+}
+
+fn decode_inner(spec: &TableSpec, blob: &[u8], workers: Option<usize>) -> Result<TableData> {
+    // Accumulators, one per declared column (column order == struct field order on write),
+    // pre-sized to the declared row count — see [`empty_column_with_capacity`], this is the
+    // read's dominant cost.
+    let rows = spec.rows as usize;
+    let mut cols: Vec<ColumnData> = spec
+        .columns
+        .iter()
+        .map(|c| empty_column_with_capacity(&c.dtype, rows))
+        .collect::<Result<_>>()?;
+
+    with_read_session(|rt, s| {
+        let chunks = rt.block_on(scan_chunks(s, blob, None))?;
+        match workers {
+            Some(n) => materialise_with(s, &chunks, &mut cols, n),
+            None => materialise(s, &chunks, &mut cols),
+        }
     })?;
 
     Ok(spec
@@ -662,7 +869,7 @@ pub fn decode_column(spec: &TableSpec, blob: &[u8], name: &str) -> Result<Column
         .find(|c| c.name == name)
         .ok_or_else(|| Error::Codec(format!("table has no column '{name}'")))?;
     let (rt, s) = runtime_session();
-    let mut out = empty_column(&col.dtype)?;
+    let mut out = empty_column_with_capacity(&col.dtype, spec.rows as usize)?;
     let mut ctx = s.create_execution_ctx();
     rt.block_on(async {
         let stream = s
@@ -682,6 +889,35 @@ pub fn decode_column(spec: &TableSpec, blob: &[u8], name: &str) -> Result<Column
         Ok::<(), Error>(())
     })?;
     Ok(out)
+}
+
+/// Decode a **projected subset** of columns in a **single session** — Vortex
+/// scans only the named columns' layout segments (projection pushdown) and pays
+/// the session/encoding setup **once**, unlike N separate [`decode_column`]
+/// calls. The result columns are in `names` order.
+///
+/// This is the read shape the replay pipeline wants (a few columns of a wide
+/// listmode), and where Vortex's columnar layout beats a full [`decode`].
+pub fn decode_projected(spec: &TableSpec, blob: &[u8], names: &[&str]) -> Result<TableData> {
+    let dtypes: Vec<String> = names
+        .iter()
+        .map(|&n| {
+            spec.columns
+                .iter()
+                .find(|c| c.name == n)
+                .map(|c| c.dtype.clone())
+                .ok_or_else(|| Error::Codec(format!("table has no column '{n}'")))
+        })
+        .collect::<Result<_>>()?;
+    let mut cols: Vec<ColumnData> = dtypes
+        .iter()
+        .map(|d| empty_column_with_capacity(d, spec.rows as usize))
+        .collect::<Result<_>>()?;
+    with_read_session(|rt, s| {
+        let chunks = rt.block_on(scan_chunks(s, blob, Some(names)))?;
+        materialise(s, &chunks, &mut cols)
+    })?;
+    Ok(names.iter().map(|n| n.to_string()).zip(cols).collect())
 }
 
 /// Build the `{hash, stats}` chunk-index (ADR-0028 §3) for a table block, splitting on the **same**
@@ -854,6 +1090,74 @@ mod tests {
             row_index: None,
         };
         (spec, data)
+    }
+
+    /// The column-parallel materialise must be **bit-identical** to the serial one, for every
+    /// dtype (including the `Bool`/`Utf8` columns that take their own decode path) and across
+    /// several row-groups — worker `t` owns columns `[t*per, (t+1)*per)` and walks the row-groups
+    /// in order, so any ordering or off-by-one in the split shows up here.
+    #[test]
+    fn materialise_is_bit_identical_across_thread_counts() {
+        let rows = ROWS_PER_GROUP + 4242; // 2 row-groups + remainder
+        let (mut spec, mut data) = all_dtype_table(rows);
+        data.push((
+            "b1".into(),
+            ColumnData::Bool((0..rows).map(|k| k % 3 == 0).collect()),
+        ));
+        data.push((
+            "str".into(),
+            ColumnData::Utf8((0..rows).map(|k| format!("crystal-{}", k % 97)).collect()),
+        ));
+        spec.columns = data.iter().map(|(n, c)| col(n, c.numpy_code())).collect();
+        let blob = encode(&spec, &data).unwrap();
+
+        // `repeat` duplicates the scanned chunks, exercising the multi-chunk append loop
+        // regardless of how the reader chooses to batch this particular file.
+        let decoded = |threads: usize, repeat: usize| -> TableData {
+            let mut cols: Vec<ColumnData> = spec
+                .columns
+                .iter()
+                .map(|c| empty_column_with_capacity(&c.dtype, rows * repeat))
+                .collect::<Result<_>>()
+                .unwrap();
+            with_read_session(|rt, s| {
+                let scanned = rt.block_on(scan_chunks(s, &blob, None)).unwrap();
+                let chunks: Vec<StructArray> =
+                    std::iter::repeat_n(scanned, repeat).flatten().collect();
+                materialise_with(s, &chunks, &mut cols, threads).unwrap();
+            });
+            spec.columns
+                .iter()
+                .map(|c| c.name.clone())
+                .zip(cols)
+                .collect()
+        };
+
+        let serial = decoded(1, 1);
+        assert_eq!(serial, data, "serial materialise must round-trip");
+        // Every column must land in the same worker split regardless of worker count — including
+        // more workers than columns (the empty-group edge).
+        for threads in [2, 3, 4, 8, 64] {
+            assert_eq!(
+                decoded(threads, 1),
+                serial,
+                "materialise with {threads} workers diverged from serial"
+            );
+            assert_eq!(
+                decoded(threads, 3),
+                decoded(1, 3),
+                "multi-chunk append order diverged at {threads} workers"
+            );
+        }
+        // And both public entry points agree — the self-sizing one and the pinned one.
+        assert_eq!(decode(&spec, &blob).unwrap(), data);
+        for workers in [1, 2, 7] {
+            assert_eq!(
+                decode_with_workers(&spec, &blob, workers).unwrap(),
+                data,
+                "decode_with_workers({workers}) diverged"
+            );
+        }
     }
 
     #[test]
@@ -1032,6 +1336,43 @@ mod tests {
             encode(&spec, &data).unwrap(),
             blob,
             "table non-deterministic"
+        );
+    }
+
+    /// A short-lived runtime must not poison the long-lived pooled read session.
+    ///
+    /// `encode`/`encode_streaming`/`decode_column` each build their own
+    /// `CurrentThreadRuntime` and drop it on return, while `decode`/`decode_projected`
+    /// use the per-thread pooled [`READ_RT`]. When every session was cloned from one
+    /// cached template, `clone().with_handle(..)` rebound `Arc`-shared state, so the
+    /// short-lived runtime's death left the pooled session dangling and this third
+    /// call panicked with `Attempted to use a Handle after its runtime was dropped`.
+    ///
+    /// The ordering is the whole test: it only reproduces when a pooled read, a
+    /// short-lived-runtime read, and another pooled read share **one process** — which
+    /// is why nextest (a process per test) could never surface it, and only the
+    /// `tessera-py-import` check did.
+    #[test]
+    fn short_lived_runtime_does_not_poison_pooled_session() {
+        use tessera_core::block::table::{Column, TableSpec};
+        let spec = TableSpec {
+            columns: vec![Column::new("idx", "u4"), Column::new("en", "f4")],
+            rows: 5,
+            row_index: None,
+        };
+        let data: TableData = vec![
+            ("idx".into(), ColumnData::U32((0..5u32).collect())),
+            ("en".into(), ColumnData::F32(vec![0.5, 1.5, 2.5, 3.5, 4.5])),
+        ];
+        let blob = encode(&spec, &data).unwrap();
+
+        assert_eq!(decode(&spec, &blob).unwrap(), data, "pooled decode");
+        // Builds and drops its own runtime — the poisoning step.
+        decode_column(&spec, &blob, "idx").unwrap();
+        assert_eq!(
+            decode(&spec, &blob).unwrap(),
+            data,
+            "pooled session poisoned by a dropped short-lived runtime"
         );
     }
 
