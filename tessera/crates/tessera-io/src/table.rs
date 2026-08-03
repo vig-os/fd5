@@ -101,6 +101,27 @@ impl ColumnData {
         self.len() == 0
     }
 
+    /// Reserve capacity for exactly `additional` more rows in the backing `Vec` — the
+    /// accumulator pre-size used by the slab decoders. Lives here (rather than as a
+    /// per-variant `match` at each call site) so adding a variant can't leave a downstream
+    /// pre-size loop silently unhandled.
+    pub fn reserve_exact(&mut self, additional: usize) {
+        match self {
+            ColumnData::I8(v) => v.reserve_exact(additional),
+            ColumnData::I16(v) => v.reserve_exact(additional),
+            ColumnData::I32(v) => v.reserve_exact(additional),
+            ColumnData::I64(v) => v.reserve_exact(additional),
+            ColumnData::U8(v) => v.reserve_exact(additional),
+            ColumnData::U16(v) => v.reserve_exact(additional),
+            ColumnData::U32(v) => v.reserve_exact(additional),
+            ColumnData::U64(v) => v.reserve_exact(additional),
+            ColumnData::F32(v) => v.reserve_exact(additional),
+            ColumnData::F64(v) => v.reserve_exact(additional),
+            ColumnData::Bool(v) => v.reserve_exact(additional),
+            ColumnData::Utf8(v) => v.reserve_exact(additional),
+        }
+    }
+
     /// The column's values as `i64` for chunk-statistics (ADR-0028 §3), if it is an integer column that
     /// fits losslessly: `i1/i2/i4/i8`, `u1/u2/u4` always, and `u8` (u64) only when every value ≤
     /// `i64::MAX` (a monotonic cast → `min`/`max` stay exact). Float columns return `None` (they need

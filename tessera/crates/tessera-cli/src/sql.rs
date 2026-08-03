@@ -22,8 +22,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    RecordBatch, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::csv::WriterBuilder;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -33,10 +33,11 @@ use tessera_io::{ColumnData, Reader};
 
 use crate::nav::Format;
 
-/// Convert one Tessera [`ColumnData`] to an Arrow [`ArrayRef`] — one branch per numeric dtype
+/// Convert one Tessera [`ColumnData`] to an Arrow [`ArrayRef`] — one branch per dtype
 /// (`ColumnData` is a closed enum, so every variant is covered exhaustively). Small vectors go
 /// through `.clone()`; f32/f64 are copied verbatim (no NaN canonicalisation — DataFusion honours
-/// IEEE-754 comparison semantics the same way the tests below assert).
+/// IEEE-754 comparison semantics the same way the tests below assert). `Bool`/`Utf8` map to
+/// Arrow `Boolean`/`Utf8`; every column is non-nullable, so no null buffer is built.
 fn column_to_array(col: ColumnData) -> ArrayRef {
     match col {
         ColumnData::I8(v) => Arc::new(Int8Array::from(v)) as ArrayRef,
@@ -49,11 +50,15 @@ fn column_to_array(col: ColumnData) -> ArrayRef {
         ColumnData::U64(v) => Arc::new(UInt64Array::from(v)) as ArrayRef,
         ColumnData::F32(v) => Arc::new(Float32Array::from(v)) as ArrayRef,
         ColumnData::F64(v) => Arc::new(Float64Array::from(v)) as ArrayRef,
+        ColumnData::Bool(v) => Arc::new(BooleanArray::from(v)) as ArrayRef,
+        ColumnData::Utf8(v) => Arc::new(StringArray::from(v)) as ArrayRef,
     }
 }
 
-/// Map an fd5 numpy-style dtype code (`i2`/`u4`/`f4`/…) to its Arrow [`DataType`]. Same closed
-/// mapping the encoder writes; a code outside the table's supported set is a typed schema error.
+/// Map an fd5 numpy-style dtype code (`i2`/`u4`/`f4`/`b1`/`str`/…) to its Arrow [`DataType`]. Same
+/// closed mapping the encoder writes — it must stay in lockstep with [`column_to_array`], since the
+/// declared field type and the built array are paired into one `RecordBatch`. A code outside the
+/// table's supported set is a typed schema error.
 fn numpy_to_arrow(code: &str) -> tessera_core::Result<DataType> {
     Ok(match code {
         "i1" => DataType::Int8,
@@ -66,9 +71,12 @@ fn numpy_to_arrow(code: &str) -> tessera_core::Result<DataType> {
         "u8" => DataType::UInt64,
         "f4" => DataType::Float32,
         "f8" => DataType::Float64,
+        "b1" => DataType::Boolean,
+        "str" => DataType::Utf8,
         other => {
             return Err(tessera_core::Error::Invalid(format!(
-                "tessera sql: unsupported column dtype '{other}' (table cols are numeric)"
+                "tessera sql: unsupported column dtype '{other}' \
+                 (table cols are numeric, b1 or str)"
             )))
         }
     })
@@ -334,6 +342,84 @@ mod tests {
         assert!(
             format!("{err}").contains("ndjson"),
             "typed rejection expected"
+        );
+    }
+
+    /// Seal a tiny `b1` + `str` table — the non-numeric column types (#354).
+    fn sample_bool_utf8(path: &std::path::Path) {
+        let spec = TableSpec {
+            columns: vec![Column::new("flag", "b1"), Column::new("origin", "str")],
+            rows: 4,
+            row_index: None,
+        };
+        let data: TableData = vec![
+            (
+                "flag".into(),
+                ColumnData::Bool(vec![true, false, true, false]),
+            ),
+            (
+                "origin".into(),
+                ColumnData::Utf8(
+                    ["annih511", "prompt_nuclear", "annih511", "other"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ),
+        ];
+        let (block_ref, payload) = table_block("events", &spec, &data).unwrap();
+        let mut b = ProductBuilder::new("listmode", "DP", "d", "2024-01-01T00:00:00Z");
+        b.add_block_ref(block_ref);
+        let sealed = b.seal().unwrap();
+        pack(&sealed, &[payload], path).unwrap();
+    }
+
+    /// `b1`/`str` columns survive the whole SQL path: `numpy_to_arrow` declares Boolean/Utf8,
+    /// `column_to_array` builds the matching arrays (a mismatch would fail `RecordBatch::try_new`),
+    /// and DataFusion filters on both — a boolean predicate and a string equality.
+    #[test]
+    fn bool_and_utf8_columns_query_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_bool_utf8(&tsra);
+
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT origin FROM events WHERE flag AND origin = 'annih511'",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        // Rows: (true,"annih511"), (false,"prompt_nuclear"), (true,"annih511"), (false,"other")
+        // → both `flag`-true rows carry origin "annih511".
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "origin\nannih511\nannih511\n"
+        );
+    }
+
+    /// The whole b1/str table renders — proves the Boolean array reaches the CSV writer as
+    /// `true`/`false` rather than erroring or coming back numeric.
+    #[test]
+    fn bool_column_renders_as_true_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_bool_utf8(&tsra);
+
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT flag, origin FROM events WHERE origin = 'other'",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "flag,origin\nfalse,other\n"
         );
     }
 }
