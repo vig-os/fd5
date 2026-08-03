@@ -379,24 +379,30 @@ fn ze(e: impl std::fmt::Display) -> Error {
 // (`CurrentThreadRuntime`, no tokio) or async IO panics, so each entry pairs the two.
 // (Plain comment, not a doc comment: rustdoc does not document macro invocations, and a `///` here
 // is an `unused_doc_comments` error under `-D warnings`.)
-thread_local! {
-    /// The encoding-registered session *template*, built once per thread.
-    /// `register_default_encodings` + session construction are the dominant
-    /// fixed cost of a read (measured in `examples/tsra_vs_parquet`: a decode is
-    /// ~4–6× a parquet read and the gap is per-call session *setup*, not the
-    /// data). Caching the template pays it once per thread; each call clones it
-    /// (`VortexSession` is `Arc`-backed → cheap) and rebinds a fresh runtime
-    /// handle. No call-site changes: `runtime_session()` keeps its signature.
-    static SESSION_TEMPLATE: VortexSession = {
-        let s = VortexSession::empty()
-            .with::<ArraySession>()
-            .with::<LayoutSession>()
-            .with::<ScalarFnSession>()
-            .with::<RuntimeSession>();
-        register_default_encodings(&s);
-        s
-    };
+/// A fresh, **independent** encoding-registered session bound to `rt`'s handle.
+///
+/// Sessions must never be shared across runtimes. `VortexSession` is `Arc`-backed,
+/// so `clone().with_handle(..)` rebinds the *shared* state instead of producing an
+/// independent session: caching one template and re-binding a handle per call lets a
+/// short-lived runtime (`encode`/`decode_column`) leave every other holder — notably
+/// the long-lived pooled [`READ_RT`] session — pointing at a dropped runtime. The next
+/// pooled read then panics `Attempted to use a Handle after its runtime was dropped`.
+/// Regression-tested by `short_lived_runtime_does_not_poison_pooled_session`.
+///
+/// Building per runtime instead of cloning a template costs nothing measurable: the
+/// read win is the worker pool, not session reuse (`examples/read_profile` attributes
+/// ~93 % of a read to the host copy; template caching moved nothing).
+fn new_session(rt: &CurrentThreadRuntime) -> VortexSession {
+    let s = VortexSession::empty()
+        .with::<ArraySession>()
+        .with::<LayoutSession>()
+        .with::<ScalarFnSession>()
+        .with::<RuntimeSession>();
+    register_default_encodings(&s);
+    s.with_handle(rt.handle())
+}
 
+thread_local! {
     /// Per-thread **pooled** read runtime: a `CurrentThreadWorkerPool` sized to
     /// available parallelism drives the scan's segment I/O + decode across all
     /// cores in the background while `block_on` awaits results. The bare
@@ -407,7 +413,7 @@ thread_local! {
         let rt = CurrentThreadRuntime::new();
         let pool = rt.new_pool();
         pool.set_workers_to_available_parallelism();
-        let s = SESSION_TEMPLATE.with(|t| t.clone().with_handle(rt.handle()));
+        let s = new_session(&rt);
         (rt, pool, s)
     };
 }
@@ -419,7 +425,7 @@ thread_local! {
 /// hands out the pooled one ([`READ_RT`]).
 fn runtime_session() -> (CurrentThreadRuntime, VortexSession) {
     let rt = CurrentThreadRuntime::new();
-    let s = SESSION_TEMPLATE.with(|t| t.clone().with_handle(rt.handle()));
+    let s = new_session(&rt);
     (rt, s)
 }
 
@@ -1330,6 +1336,43 @@ mod tests {
             encode(&spec, &data).unwrap(),
             blob,
             "table non-deterministic"
+        );
+    }
+
+    /// A short-lived runtime must not poison the long-lived pooled read session.
+    ///
+    /// `encode`/`encode_streaming`/`decode_column` each build their own
+    /// `CurrentThreadRuntime` and drop it on return, while `decode`/`decode_projected`
+    /// use the per-thread pooled [`READ_RT`]. When every session was cloned from one
+    /// cached template, `clone().with_handle(..)` rebound `Arc`-shared state, so the
+    /// short-lived runtime's death left the pooled session dangling and this third
+    /// call panicked with `Attempted to use a Handle after its runtime was dropped`.
+    ///
+    /// The ordering is the whole test: it only reproduces when a pooled read, a
+    /// short-lived-runtime read, and another pooled read share **one process** — which
+    /// is why nextest (a process per test) could never surface it, and only the
+    /// `tessera-py-import` check did.
+    #[test]
+    fn short_lived_runtime_does_not_poison_pooled_session() {
+        use tessera_core::block::table::{Column, TableSpec};
+        let spec = TableSpec {
+            columns: vec![Column::new("idx", "u4"), Column::new("en", "f4")],
+            rows: 5,
+            row_index: None,
+        };
+        let data: TableData = vec![
+            ("idx".into(), ColumnData::U32((0..5u32).collect())),
+            ("en".into(), ColumnData::F32(vec![0.5, 1.5, 2.5, 3.5, 4.5])),
+        ];
+        let blob = encode(&spec, &data).unwrap();
+
+        assert_eq!(decode(&spec, &blob).unwrap(), data, "pooled decode");
+        // Builds and drops its own runtime — the poisoning step.
+        decode_column(&spec, &blob, "idx").unwrap();
+        assert_eq!(
+            decode(&spec, &blob).unwrap(),
+            data,
+            "pooled session poisoned by a dropped short-lived runtime"
         );
     }
 
