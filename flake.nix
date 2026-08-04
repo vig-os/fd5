@@ -109,6 +109,13 @@
             gh
             jq
             ripgrep
+            # Hook binaries. These MUST come from Nix: prek's own installers fetch
+            # generic-linux dynamically-linked binaries (typos) or build wheels whose
+            # interpreter tag must match (shellcheck-py), and neither works on NixOS —
+            # a hook that fails to *install* silently disables every hook declared after
+            # it in .pre-commit-config.yaml.
+            typos
+            shellcheck
 
             # Native build deps the storage/ingest crates link once implemented
             # (object_store→openssl, hdf5-sys→hdf5+libclang, zarrs/codec FFI). Present now so a
