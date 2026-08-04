@@ -40,7 +40,12 @@ jobs:
   check:
     name: nix flake check (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60  # a cold aarch64 build of the vortex/zarrs stack runs longer than x86
+    # A cold build of the vortex/zarrs/hdf5 stack is slow on a GitHub-hosted runner and varies a
+    # lot between them: observed 40m (x86) and 51m (aarch64) on one run, then >60m on x86 for the
+    # very next one, which the previous 60-minute cap cancelled mid-build. A cancelled leg is not
+    # a code failure, but it blocks the merge and costs a full rebuild to find out — so the cap is
+    # set above the observed spread rather than just above the median.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
