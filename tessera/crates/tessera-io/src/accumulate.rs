@@ -35,7 +35,7 @@ fn empty_cols(columns: &[Column]) -> TableData {
         .map(|c| {
             (
                 c.name.clone(),
-                ColumnData::from_le_bytes(&c.dtype, &[]).expect("validated dtype"),
+                ColumnData::empty_for(c).expect("validated dtype"),
             )
         })
         .collect()
@@ -116,7 +116,7 @@ pub(crate) fn read_fragment(path: &Path, columns: &[Column]) -> Result<TableData
         let raw = bytes
             .get(off..off + len)
             .ok_or_else(|| Error::Codec(format!("fragment: truncated column '{}'", c.name)))?;
-        let col = ColumnData::from_le_bytes(&c.dtype, raw)?;
+        let col = ColumnData::from_column_bytes(c, raw, n_rows)?;
         if col.len() != n_rows {
             return Err(Error::Codec(format!(
                 "fragment: column '{}' decoded {} rows, header says {n_rows}",

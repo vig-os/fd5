@@ -52,6 +52,41 @@ fn column_to_array(col: ColumnData) -> ArrayRef {
         ColumnData::F64(v) => Arc::new(Float64Array::from(v)) as ArrayRef,
         ColumnData::Bool(v) => Arc::new(BooleanArray::from(v)) as ArrayRef,
         ColumnData::Utf8(v) => Arc::new(StringArray::from(v)) as ArrayRef,
+        // Build a genuine Arrow validity bitmap rather than substituting a sentinel, so
+        // DataFusion's own NULL semantics apply: `IS NULL` matches, and aggregates like AVG
+        // skip nulls instead of averaging in a placeholder.
+        ColumnData::Nullable { values, validity } => nullable_to_array(*values, &validity),
+    }
+}
+
+/// Convert a nullable [`ColumnData`] to an Arrow array carrying a validity bitmap.
+///
+/// Nullability currently covers the fixed-width numeric dtypes (`table::validate` rejects a
+/// nullable Bool/Utf8 before a block can be sealed), so a nullable column reaching the reader
+/// with any other payload means the writer bypassed validation.
+fn nullable_to_array(values: ColumnData, validity: &[bool]) -> ArrayRef {
+    macro_rules! opt {
+        ($v:expr, $arr:ty) => {
+            Arc::new(<$arr>::from_iter(
+                $v.into_iter().zip(validity).map(|(x, &ok)| ok.then_some(x)),
+            )) as ArrayRef
+        };
+    }
+    match values {
+        ColumnData::I8(v) => opt!(v, Int8Array),
+        ColumnData::I16(v) => opt!(v, Int16Array),
+        ColumnData::I32(v) => opt!(v, Int32Array),
+        ColumnData::I64(v) => opt!(v, Int64Array),
+        ColumnData::U8(v) => opt!(v, UInt8Array),
+        ColumnData::U16(v) => opt!(v, UInt16Array),
+        ColumnData::U32(v) => opt!(v, UInt32Array),
+        ColumnData::U64(v) => opt!(v, UInt64Array),
+        ColumnData::F32(v) => opt!(v, Float32Array),
+        ColumnData::F64(v) => opt!(v, Float64Array),
+        other => unreachable!(
+            "nullable '{}' is rejected by table::validate before a block can be sealed",
+            other.numpy_code()
+        ),
     }
 }
 
@@ -134,7 +169,13 @@ pub fn run_with(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for col in &columns {
         let data = view.column(&mut r, &col.name)?;
-        fields.push(Field::new(&col.name, numpy_to_arrow(&col.dtype)?, false));
+        // The declared nullability must match the array's: `RecordBatch::try_new` rejects a
+        // nullable array under a non-nullable field.
+        fields.push(Field::new(
+            &col.name,
+            numpy_to_arrow(&col.dtype)?,
+            col.nullable,
+        ));
         arrays.push(column_to_array(data));
     }
     let schema = Arc::new(Schema::new(fields));
@@ -342,6 +383,68 @@ mod tests {
         assert!(
             format!("{err}").contains("ndjson"),
             "typed rejection expected"
+        );
+    }
+
+    /// Seal a table with a nullable numeric column (#330).
+    fn sample_nullable(path: &std::path::Path) {
+        let spec = TableSpec {
+            columns: vec![Column::new("ms", "u4"), Column::new("en", "f4").nullable()],
+            rows: 4,
+            row_index: None,
+        };
+        let data: TableData = vec![
+            ("ms".into(), ColumnData::U32(vec![10, 20, 30, 40])),
+            (
+                "en".into(),
+                ColumnData::Nullable {
+                    // canonical: 0.0 beneath every null (encoding normalises masked slots)
+                    values: Box::new(ColumnData::F32(vec![1.0, 0.0, 3.0, 0.0])),
+                    validity: vec![true, false, true, false],
+                },
+            ),
+        ];
+        let (block_ref, payload) = table_block("events", &spec, &data).unwrap();
+        let mut b = ProductBuilder::new("listmode", "DP", "d", "2024-01-01T00:00:00Z");
+        b.add_block_ref(block_ref);
+        let sealed = b.seal().unwrap();
+        pack(&sealed, &[payload], path).unwrap();
+    }
+
+    /// NULL reaches DataFusion as a real Arrow validity bit, so SQL NULL semantics apply:
+    /// `IS NULL` matches the masked rows, and `AVG` skips them rather than averaging in the 0.0
+    /// placeholder that sits under a null on disk. Averaging the placeholder would give 1.0;
+    /// skipping gives 2.0.
+    #[test]
+    fn sql_over_nullable_column_honours_null_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_nullable(&tsra);
+
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT ms FROM events WHERE en IS NULL ORDER BY ms",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "ms\n20\n40\n");
+
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT avg(en) AS a FROM events",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("2.0"),
+            "AVG must skip NULLs (expected 2.0, not 1.0): {text:?}"
         );
     }
 

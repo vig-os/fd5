@@ -31,6 +31,23 @@ pub struct Column {
     /// physical (no quantization). Carried so the read/compute path recovers physical units.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<f64>,
+    /// Whether the column carries a validity mask, i.e. values may be NULL (#330).
+    ///
+    /// Missing is **not** the same as a float sentinel: `NaN` is a legitimate measured value in a
+    /// float column, and an integer column has no sentinel at all, so "unknown" was previously
+    /// unrepresentable. A nullable column stores a bit-packed validity mask alongside its values.
+    ///
+    /// `skip_serializing_if` keeps a non-nullable column's JSON **byte-identical** to a manifest
+    /// written before this field existed — which is what lets the committed conformance corpus
+    /// keep its `content_hash` without regeneration. Legacy manifests deserialize as `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nullable: bool,
+}
+
+/// `skip_serializing_if` predicate — `bool::not` is not usable here (it takes `self` by value,
+/// serde passes `&bool`).
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Column {
@@ -66,6 +83,11 @@ impl Column {
     /// Builder: fixed-point scale (physical = raw × scale).
     pub fn with_scale(mut self, scale: f64) -> Self {
         self.scale = Some(scale);
+        self
+    }
+    /// Builder: the column may contain NULLs (#330) — its payload carries a validity mask.
+    pub fn nullable(mut self) -> Self {
+        self.nullable = true;
         self
     }
 }
@@ -153,6 +175,44 @@ mod tests {
         let c = Column::new("lt", "i2").with_unit("ns").with_scale(0.001);
         let back: Column = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    /// A non-nullable column must serialize with NO `nullable` key at all — not `"nullable":false`.
+    ///
+    /// This is the corpus-stability guarantee for #330: every committed fixture in
+    /// `tessera/corpus/` has non-null columns, and its `manifest_hash` / `content_hash` are
+    /// pinned goldens. If this field serialized unconditionally, every one of those hashes would
+    /// change and the whole conformance corpus would need regeneration.
+    #[test]
+    fn non_nullable_column_emits_no_nullable_key() {
+        let c = Column::new("t", "u8");
+        let v = serde_json::to_value(&c).unwrap();
+        let obj = v.as_object().unwrap();
+        assert!(
+            !obj.contains_key("nullable"),
+            "non-nullable column must not emit the key: {obj:?}"
+        );
+        assert_eq!(obj.keys().collect::<Vec<_>>(), vec!["name", "dtype"]);
+    }
+
+    /// A nullable column round-trips, and the flag is explicit in the JSON when set.
+    #[test]
+    fn nullable_flag_round_trips() {
+        let c = Column::new("e", "i2").nullable();
+        assert!(c.nullable);
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v.get("nullable").and_then(|b| b.as_bool()), Some(true));
+        let back: Column = serde_json::from_value(v).unwrap();
+        assert_eq!(back, c);
+    }
+
+    /// A manifest written before #330 has no `nullable` key; it must deserialize as non-nullable
+    /// rather than failing, so existing `.tsra` files stay readable.
+    #[test]
+    fn legacy_column_json_without_nullable_deserializes_as_non_nullable() {
+        let c: Column = serde_json::from_str(r#"{"name":"t","dtype":"u8"}"#).unwrap();
+        assert!(!c.nullable);
+        assert_eq!(c.name, "t");
     }
 
     #[test]
