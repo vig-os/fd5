@@ -862,6 +862,54 @@ pub fn encode(spec: &TableSpec, data: &TableData) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// Decode ONLY the rows at `rows` from a table block, via Vortex **row-index pushdown**.
+///
+/// `rows` are block-local indices; they must be sorted and unique, and the result is in that same
+/// order. Only the segments covering the selected rows are read and decoded, so a scattered take
+/// of a few rows does not pay for materialising the whole block — the random-access property the
+/// table backend was chosen for.
+///
+/// Bit-exact with slicing the corresponding rows out of [`decode`]'s output.
+pub fn decode_rows(spec: &TableSpec, blob: &[u8], rows: &[u64]) -> Result<TableData> {
+    if let Some(w) = rows.windows(2).find(|w| w[0] >= w[1]) {
+        return Err(Error::Codec(format!(
+            "decode_rows: indices must be sorted and unique (got {} then {})",
+            w[0], w[1]
+        )));
+    }
+    if let Some(&last) = rows.last() {
+        if last >= spec.rows {
+            return Err(Error::Codec(format!(
+                "decode_rows: index {last} is out of range for a {}-row table",
+                spec.rows
+            )));
+        }
+    }
+    let mut cols: Vec<ColumnData> = spec
+        .columns
+        .iter()
+        .map(|c| empty_column_for(c, rows.len()))
+        .collect::<Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(spec
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .zip(cols)
+            .collect());
+    }
+    with_read_session(|rt, s| {
+        let chunks = rt.block_on(scan_chunks_at(s, blob, None, Some(rows)))?;
+        materialise(s, &chunks, &mut cols)
+    })?;
+    Ok(spec
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .zip(cols)
+        .collect())
+}
+
 /// **Bounded-memory / >RAM variant of [`encode`]**: consume row-group [`TableData`] chunks from a
 /// *lazy* iterator (each ≤ [`ROWS_PER_GROUP`] rows) and write the chunked Vortex bytes **without ever
 /// holding the whole table** — the DAQ / streaming-compaction path. The iterator is pulled one chunk
@@ -1073,6 +1121,21 @@ async fn scan_chunks(
     blob: &[u8],
     projection: Option<&[&str]>,
 ) -> Result<Vec<StructArray>> {
+    scan_chunks_at(s, blob, projection, None).await
+}
+
+/// [`scan_chunks`] with an optional **row selection** pushed into the scan.
+///
+/// `rows` must be sorted and unique; Vortex's `Selection::IncludeByIndex` is defined over sorted
+/// indices and yields the selected rows in index order, not in the order they were requested.
+/// Pushing the selection down means only the segments covering those rows are read and decoded —
+/// as opposed to materialising the block and indexing it afterwards.
+async fn scan_chunks_at(
+    s: &VortexSession,
+    blob: &[u8],
+    projection: Option<&[&str]>,
+    rows: Option<&[u64]>,
+) -> Result<Vec<StructArray>> {
     let mut ctx = s.create_execution_ctx();
     let scan = s
         .open_options()
@@ -1082,6 +1145,10 @@ async fn scan_chunks(
         .map_err(ze)?;
     let scan = match projection {
         Some(names) => scan.with_projection(select(names.to_vec(), root())),
+        None => scan,
+    };
+    let scan = match rows {
+        Some(idx) => scan.with_row_indices(Buffer::copy_from(idx)),
         None => scan,
     };
     let stream = scan.into_array_stream().map_err(ze)?;
@@ -1616,6 +1683,69 @@ mod tests {
         assert_eq!(a, c, "bytes changed with the filler under nulls");
         // ...and the decode is the canonical form regardless of which one was written.
         assert_eq!(decode(&spec, &c).unwrap(), build(0));
+    }
+
+    /// Row-index pushdown must be BIT-EXACT with decoding the block and slicing the same rows.
+    ///
+    /// This is the correctness contract for `decode_rows`: pushing the selection into Vortex reads
+    /// different segments than a full scan, so the two paths could diverge (wrong rows, wrong
+    /// order, or a chunk-boundary off-by-one) without anything else failing.
+    #[test]
+    fn decode_rows_matches_decode_then_slice() {
+        let rows = ROWS_PER_GROUP + 3000; // spans a row-group boundary
+        let (spec, data) = all_dtype_table(rows);
+        let blob = encode(&spec, &data).unwrap();
+        let full = decode(&spec, &blob).unwrap();
+
+        let cases: Vec<Vec<u64>> = vec![
+            vec![0],
+            vec![(rows - 1) as u64],
+            vec![0, 1, 2, 3],
+            // straddling the row-group boundary
+            vec![
+                (ROWS_PER_GROUP - 2) as u64,
+                (ROWS_PER_GROUP - 1) as u64,
+                ROWS_PER_GROUP as u64,
+                (ROWS_PER_GROUP + 1) as u64,
+            ],
+            // scattered across the whole table
+            (0..rows as u64).step_by(1013).collect(),
+            vec![7, 9000, (rows - 1) as u64],
+        ];
+        for want in cases {
+            let got = decode_rows(&spec, &blob, &want).unwrap();
+            let expected: TableData = full
+                .iter()
+                .map(|(n, c)| {
+                    let mut acc = ColumnData::from_le_bytes(c.numpy_code(), &[]).unwrap();
+                    for &r in &want {
+                        acc.extend(&c.slice(r as usize, r as usize + 1)).unwrap();
+                    }
+                    (n.clone(), acc)
+                })
+                .collect();
+            assert_eq!(got, expected, "decode_rows diverged for {want:?}");
+        }
+        // Empty selection is a well-defined empty table, not an error.
+        let empty = decode_rows(&spec, &blob, &[]).unwrap();
+        assert!(empty.iter().all(|(_, c)| c.is_empty()));
+    }
+
+    /// Unsorted, duplicated, or out-of-range indices are typed errors — `Selection::IncludeByIndex`
+    /// is only defined over sorted-unique indices, so accepting them would silently return the
+    /// wrong rows.
+    #[test]
+    fn decode_rows_rejects_malformed_selections() {
+        let (spec, data) = all_dtype_table(64);
+        let blob = encode(&spec, &data).unwrap();
+        for bad in [vec![3u64, 1], vec![2, 2], vec![0, 64]] {
+            let e = decode_rows(&spec, &blob, &bad).unwrap_err();
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("sorted and unique") || msg.contains("out of range"),
+                "expected a typed rejection for {bad:?}, got: {msg}"
+            );
+        }
     }
 
     /// Chunk statistics must describe the values that are PRESENT: a NULL is skipped, not folded
