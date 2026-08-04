@@ -32,7 +32,7 @@
 //! choice + intended access pattern were the missing signposts.)
 
 use futures::StreamExt;
-use tessera_core::block::table::TableSpec;
+use tessera_core::block::table::{Column, TableSpec};
 use tessera_core::block::{BlockKind, BlockRef};
 use tessera_core::chunk_index::{ChunkIndex, ChunkStats};
 use tessera_core::hash::digest;
@@ -82,6 +82,53 @@ pub enum ColumnData {
     /// repeats. (For *known* small enums prefer an integer code column + a
     /// categorical descriptor — a schema choice, not a `ColumnData` variant.)
     Utf8(Vec<String>),
+    /// A column whose values may be **NULL** (#330), paired with a validity mask:
+    /// `validity[i] == true` ⇔ `values[i]` is present.
+    ///
+    /// A *wrapper* rather than a validity mask on every variant, deliberately: nullability is
+    /// orthogonal to dtype, so folding it into each variant would square the enum and force every
+    /// existing match arm to handle a mask it does not care about. Wrapping also keeps the
+    /// non-nullable encode path byte-identical to pre-#330 output, which is what lets the
+    /// committed conformance corpus keep its goldens.
+    ///
+    /// NULL is *not* a float sentinel: `NaN` is a legitimate measured value, and integer columns
+    /// have no sentinel at all. The mask is the only honest representation.
+    ///
+    /// `values` is never itself `Nullable` — `validate_nullable` rejects nesting.
+    ///
+    /// **Values under a NULL are not preserved.** Encoding normalises every masked-out slot to the
+    /// dtype default, so a decoded column carries `0` (or `0.0`) wherever `validity` is false,
+    /// whatever the producer had there. This is deliberate: it makes the encoded bytes — and
+    /// therefore `content_hash` — independent of whatever happened to sit under a null, which the
+    /// format's determinism guarantee requires. Compare only the slots where `validity` is true.
+    Nullable {
+        values: Box<ColumnData>,
+        validity: Vec<bool>,
+    },
+}
+
+/// Bit-pack a validity mask LSB-first, 8 flags per byte — the on-wire/in-fragment form.
+/// `ceil(len/8)` bytes; trailing bits in the last byte are zero.
+pub(crate) fn pack_validity(validity: &[bool]) -> Vec<u8> {
+    let mut out = vec![0u8; validity.len().div_ceil(8)];
+    for (i, &v) in validity.iter().enumerate() {
+        if v {
+            out[i / 8] |= 1 << (i % 8);
+        }
+    }
+    out
+}
+
+/// Inverse of [`pack_validity`] for exactly `n` flags (the trailing padding bits are ignored).
+pub(crate) fn unpack_validity(bytes: &[u8], n: usize) -> Vec<bool> {
+    (0..n)
+        .map(|i| bytes.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0))
+        .collect()
+}
+
+/// Bytes a packed validity mask of `n` flags occupies.
+pub(crate) fn validity_pack_len(n: usize) -> usize {
+    n.div_ceil(8)
 }
 
 impl ColumnData {
@@ -100,6 +147,7 @@ impl ColumnData {
             ColumnData::F64(_) => "f8",
             ColumnData::Bool(_) => "b1",
             ColumnData::Utf8(_) => "str",
+            ColumnData::Nullable { values, .. } => values.numpy_code(),
         }
     }
 
@@ -117,6 +165,7 @@ impl ColumnData {
             ColumnData::F64(v) => v.len(),
             ColumnData::Bool(v) => v.len(),
             ColumnData::Utf8(v) => v.len(),
+            ColumnData::Nullable { values, .. } => values.len(),
         }
     }
 
@@ -142,6 +191,10 @@ impl ColumnData {
             ColumnData::F64(v) => v.reserve_exact(additional),
             ColumnData::Bool(v) => v.reserve_exact(additional),
             ColumnData::Utf8(v) => v.reserve_exact(additional),
+            ColumnData::Nullable { values, validity } => {
+                values.reserve_exact(additional);
+                validity.reserve_exact(additional);
+            }
         }
     }
 
@@ -165,6 +218,14 @@ impl ColumnData {
             ColumnData::F32(_) | ColumnData::F64(_) | ColumnData::Bool(_) | ColumnData::Utf8(_) => {
                 None
             }
+            // NULLs are SKIPPED, not coerced: a chunk min/max must describe the values that
+            // are actually present, or pruning would exclude chunks that do contain matches.
+            ColumnData::Nullable { values, validity } => values.as_i64().map(|all| {
+                all.into_iter()
+                    .zip(validity)
+                    .filter_map(|(x, &ok)| ok.then_some(x))
+                    .collect()
+            }),
         }
     }
 
@@ -191,6 +252,13 @@ impl ColumnData {
                     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     out.extend_from_slice(s.as_bytes());
                 }
+                out
+            }
+            // values ‖ bit-packed validity. The mask is a fixed ceil(rows/8) trailer, so a
+            // reader that knows the row count can split it off without extra framing.
+            ColumnData::Nullable { values, validity } => {
+                let mut out = values.to_le_bytes();
+                out.extend_from_slice(&pack_validity(validity));
                 out
             }
         }
@@ -240,6 +308,46 @@ impl ColumnData {
         })
     }
 
+    /// An empty column of the shape `col` declares — wrapping in [`ColumnData::Nullable`] when the
+    /// column is nullable. The nullable-aware counterpart of `from_le_bytes(dtype, &[])`, which
+    /// only ever yields a bare column and so would silently drop nullability in the staging paths.
+    pub fn empty_for(col: &Column) -> Result<ColumnData> {
+        let values = ColumnData::from_le_bytes(&col.dtype, &[])?;
+        Ok(if col.nullable {
+            ColumnData::Nullable {
+                values: Box::new(values),
+                validity: Vec::new(),
+            }
+        } else {
+            values
+        })
+    }
+
+    /// Decode a column from its flat LE bytes given the declaring [`Column`] and its row count —
+    /// the inverse of [`Self::to_le_bytes`] for both nullable and non-nullable columns.
+    ///
+    /// For a nullable column the buffer is `values ‖ packed_validity`, and the mask is a fixed
+    /// `ceil(rows/8)` trailer, so it is split off the END. `n_rows` is required because the mask
+    /// length cannot be derived from the buffer alone for a variable-width payload.
+    pub fn from_column_bytes(col: &Column, bytes: &[u8], n_rows: usize) -> Result<ColumnData> {
+        if !col.nullable {
+            return ColumnData::from_le_bytes(&col.dtype, bytes);
+        }
+        let mask_len = validity_pack_len(n_rows);
+        let split = bytes.len().checked_sub(mask_len).ok_or_else(|| {
+            Error::Codec(format!(
+                "column '{}': {} bytes is too short for a {n_rows}-row validity mask",
+                col.name,
+                bytes.len()
+            ))
+        })?;
+        let values = ColumnData::from_le_bytes(&col.dtype, &bytes[..split])?;
+        Ok(ColumnData::Nullable {
+            values: Box::new(values),
+            validity: unpack_validity(&bytes[split..], n_rows),
+        })
+    }
+
     /// The `[start, end)` row sub-range of this column — used to slice a table into row-groups.
     pub fn slice(&self, start: usize, end: usize) -> ColumnData {
         macro_rules! sl {
@@ -260,6 +368,10 @@ impl ColumnData {
             ColumnData::F64(v) => sl!(v, F64),
             ColumnData::Bool(v) => sl!(v, Bool),
             ColumnData::Utf8(v) => sl!(v, Utf8),
+            ColumnData::Nullable { values, validity } => ColumnData::Nullable {
+                values: Box::new(values.slice(start, end)),
+                validity: validity[start..end].to_vec(),
+            },
         }
     }
 
@@ -292,6 +404,24 @@ impl ColumnData {
             ColumnData::F64(v) => ext!(v, F64),
             ColumnData::Bool(v) => ext!(v, Bool),
             ColumnData::Utf8(v) => ext!(v, Utf8),
+            ColumnData::Nullable { values, validity } => match other {
+                ColumnData::Nullable {
+                    values: ov,
+                    validity: ovd,
+                } => {
+                    values.extend(ov)?;
+                    validity.extend_from_slice(ovd);
+                }
+                // Extending a nullable column with a non-nullable one would silently invent
+                // validity for the appended rows; require both sides to agree.
+                _ => {
+                    return Err(Error::Codec(format!(
+                        "extend: dtype {} (non-nullable) != {} (nullable)",
+                        other.numpy_code(),
+                        self.numpy_code()
+                    )))
+                }
+            },
         }
         Ok(())
     }
@@ -355,6 +485,46 @@ impl ColumnData {
             ColumnData::Utf8(v) => {
                 VarBinViewArray::from_iter_str(v.iter().map(|s| s.as_str())).into_array()
             }
+            // Nullable maps onto Vortex's NATIVE validity, not a tessera-level sentinel, so the
+            // compressor sees real nulls and the mask round-trips through the file format for
+            // free. `from_option_iter` builds values+validity in one pass; an all-valid or
+            // all-invalid mask collapses to a constant internally, costing no buffer.
+            //
+            // Scope: fixed-width numerics only — `validate_nullable` rejects a nullable Bool/Utf8
+            // before any encode reaches here, so those arms are unreachable by construction
+            // rather than by assumption.
+            ColumnData::Nullable { values, validity } => {
+                macro_rules! nullable {
+                    ($v:expr) => {
+                        PrimitiveArray::from_option_iter(
+                            $v.iter().zip(validity).map(|(x, &ok)| ok.then_some(*x)),
+                        )
+                        .into_array()
+                    };
+                }
+                match values.as_ref() {
+                    ColumnData::I8(v) => nullable!(v),
+                    ColumnData::I16(v) => nullable!(v),
+                    ColumnData::I32(v) => nullable!(v),
+                    ColumnData::I64(v) => nullable!(v),
+                    ColumnData::U8(v) => nullable!(v),
+                    ColumnData::U16(v) => nullable!(v),
+                    ColumnData::U32(v) => nullable!(v),
+                    ColumnData::U64(v) => nullable!(v),
+                    ColumnData::F32(v) => nullable!(v),
+                    ColumnData::F64(v) => nullable!(v),
+                    other => {
+                        // Not `unreachable!`: a future variant must fail loudly at the gate, not
+                        // panic a writer. `validate_nullable` is the single door and names the
+                        // dtype, so this only fires if someone bypasses it.
+                        panic!(
+                            "nullable '{}' columns are not supported yet — validate_nullable \
+                             should have rejected this before encode",
+                            other.numpy_code()
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -380,6 +550,27 @@ fn empty_column(code: &str) -> Result<ColumnData> {
 /// `cap` comes from the spec's *declared* `rows`, which is attacker-controlled for an untrusted
 /// blob, so it is clamped to [`BLOCK_ROWS`] — the partitioning law's maximum rows in one table
 /// block. A larger table still decodes correctly; it just resumes amortised growth past the clamp.
+/// Pre-sized accumulator for the column `col` declares — the nullable-aware counterpart of
+/// [`empty_column_with_capacity`].
+///
+/// The decode path MUST build accumulators from the `Column`, not from the dtype string alone: a
+/// bare accumulator for a nullable column would take `extend_field`'s non-nullable branch, and the
+/// validity mask would be dropped silently — the values would still decode, so nothing would fail
+/// loudly. Both the values and the mask are reserved, since the mask grows per row too.
+fn empty_column_for(col: &Column, cap: usize) -> Result<ColumnData> {
+    let values = empty_column_with_capacity(&col.dtype, cap)?;
+    Ok(if col.nullable {
+        let mut validity = Vec::new();
+        validity.reserve_exact(cap.min(BLOCK_ROWS));
+        ColumnData::Nullable {
+            values: Box::new(values),
+            validity,
+        }
+    } else {
+        values
+    })
+}
+
 fn empty_column_with_capacity(code: &str, cap: usize) -> Result<ColumnData> {
     let cap = cap.min(BLOCK_ROWS);
     Ok(match code {
@@ -497,8 +688,52 @@ fn validate(spec: &TableSpec, data: &TableData) -> Result<()> {
                 spec.rows
             )));
         }
+        validate_nullable(name, col.nullable, cd)?;
     }
     Ok(())
+}
+
+/// The single gate for nullable columns (#330): the spec flag and the data must agree, the mask
+/// must cover exactly the values, nesting is rejected, and the currently-supported scope is
+/// enforced here rather than assumed downstream.
+///
+/// Keeping all four checks in one place is deliberate — `to_vortex` relies on this having run, so
+/// a caller that bypasses it gets a named panic instead of silently encoding a wrong mask.
+fn validate_nullable(name: &str, spec_nullable: bool, cd: &ColumnData) -> Result<()> {
+    match cd {
+        ColumnData::Nullable { values, validity } => {
+            if !spec_nullable {
+                return Err(Error::Codec(format!(
+                    "column '{name}': data carries a validity mask but the spec column is not \
+                     marked nullable"
+                )));
+            }
+            if values.len() != validity.len() {
+                return Err(Error::Codec(format!(
+                    "column '{name}': {} values but {} validity flags",
+                    values.len(),
+                    validity.len()
+                )));
+            }
+            if matches!(values.as_ref(), ColumnData::Nullable { .. }) {
+                return Err(Error::Codec(format!(
+                    "column '{name}': nested nullable columns are not representable"
+                )));
+            }
+            if matches!(values.as_ref(), ColumnData::Bool(_) | ColumnData::Utf8(_)) {
+                return Err(Error::Codec(format!(
+                    "column '{name}': nullable '{}' is not supported yet — nullability currently \
+                     covers the fixed-width numeric dtypes only",
+                    values.numpy_code()
+                )));
+            }
+            Ok(())
+        }
+        _ if spec_nullable => Err(Error::Codec(format!(
+            "column '{name}': spec column is nullable but the data carries no validity mask"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The fixed table row-group size: a table block is **always** written as a chunked Vortex file with
@@ -704,6 +939,19 @@ fn extend_field(col: &mut ColumnData, field: ArrayRef, ctx: &mut ExecutionCtx) -
                 }
             });
         }
+        // Execute ONCE and take both halves from the same array: the values, and the validity
+        // mask derived from Vortex's own nullability. Executing twice would decode the chunk twice
+        // and (worse) could disagree.
+        ColumnData::Nullable { values, validity } => {
+            let prim: PrimitiveArray = field.execute(ctx).map_err(ze)?;
+            let mask = prim
+                .validity()
+                .map_err(ze)?
+                .execute_mask(prim.len(), ctx)
+                .map_err(ze)?;
+            validity.extend(mask.iter());
+            extend_column(values, &prim);
+        }
         _ => {
             let prim: PrimitiveArray = field.execute(ctx).map_err(ze)?;
             extend_column(col, &prim);
@@ -724,8 +972,10 @@ fn extend_column(col: &mut ColumnData, prim: &PrimitiveArray) {
         ColumnData::U64(v) => v.extend_from_slice(prim.as_slice::<u64>()),
         ColumnData::F32(v) => v.extend_from_slice(prim.as_slice::<f32>()),
         ColumnData::F64(v) => v.extend_from_slice(prim.as_slice::<f64>()),
-        ColumnData::Bool(_) | ColumnData::Utf8(_) => {
-            unreachable!("bool/utf8 columns are handled in extend_field, not as primitives")
+        ColumnData::Bool(_) | ColumnData::Utf8(_) | ColumnData::Nullable { .. } => {
+            unreachable!(
+                "bool/utf8/nullable columns are handled in extend_field, not as primitives"
+            )
         }
     }
 }
@@ -871,7 +1121,7 @@ fn decode_inner(spec: &TableSpec, blob: &[u8], workers: Option<usize>) -> Result
     let mut cols: Vec<ColumnData> = spec
         .columns
         .iter()
-        .map(|c| empty_column_with_capacity(&c.dtype, rows))
+        .map(|c| empty_column_for(c, rows))
         .collect::<Result<_>>()?;
 
     with_read_session(|rt, s| {
@@ -901,7 +1151,7 @@ pub fn decode_column(spec: &TableSpec, blob: &[u8], name: &str) -> Result<Column
         .find(|c| c.name == name)
         .ok_or_else(|| Error::Codec(format!("table has no column '{name}'")))?;
     let (rt, s) = runtime_session();
-    let mut out = empty_column_with_capacity(&col.dtype, spec.rows as usize)?;
+    let mut out = empty_column_for(col, spec.rows as usize)?;
     let mut ctx = s.create_execution_ctx();
     rt.block_on(async {
         let stream = s
@@ -931,19 +1181,18 @@ pub fn decode_column(spec: &TableSpec, blob: &[u8], name: &str) -> Result<Column
 /// This is the read shape the replay pipeline wants (a few columns of a wide
 /// listmode), and where Vortex's columnar layout beats a full [`decode`].
 pub fn decode_projected(spec: &TableSpec, blob: &[u8], names: &[&str]) -> Result<TableData> {
-    let dtypes: Vec<String> = names
+    let projected: Vec<&Column> = names
         .iter()
         .map(|&n| {
             spec.columns
                 .iter()
                 .find(|c| c.name == n)
-                .map(|c| c.dtype.clone())
                 .ok_or_else(|| Error::Codec(format!("table has no column '{n}'")))
         })
         .collect::<Result<_>>()?;
-    let mut cols: Vec<ColumnData> = dtypes
+    let mut cols: Vec<ColumnData> = projected
         .iter()
-        .map(|d| empty_column_with_capacity(d, spec.rows as usize))
+        .map(|c| empty_column_for(c, spec.rows as usize))
         .collect::<Result<_>>()?;
     with_read_session(|rt, s| {
         let chunks = rt.block_on(scan_chunks(s, blob, Some(names)))?;
@@ -1128,6 +1377,258 @@ mod tests {
     /// dtype (including the `Bool`/`Utf8` columns that take their own decode path) and across
     /// several row-groups — worker `t` owns columns `[t*per, (t+1)*per)` and walks the row-groups
     /// in order, so any ordering or off-by-one in the split shows up here.
+    /// Nullable columns survive a full encode → decode round-trip with the mask intact, through
+    /// every public read entry point (whole-table, projected, single-column).
+    #[test]
+    fn nullable_column_round_trips_through_every_read_path() {
+        let rows = 1000usize;
+        fn present(k: usize, rows: usize) -> bool {
+            k >= 3 && !k.is_multiple_of(7) && k != rows - 1
+        }
+        let spec = TableSpec {
+            columns: vec![col("t", "u8"), col("e", "i2").nullable()],
+            rows: rows as u64,
+            row_index: Some("t".into()),
+        };
+        let data: TableData = vec![
+            ("t".into(), ColumnData::U64((0..rows as u64).collect())),
+            (
+                "e".into(),
+                ColumnData::Nullable {
+                    // Canonical form: 0 under every null. Encoding normalises masked slots to the
+                    // dtype default (see the `Nullable` docs), so only canonical input compares
+                    // equal after a round-trip.
+                    values: Box::new(ColumnData::I16(
+                        (0..rows)
+                            .map(|k| {
+                                if present(k, rows) {
+                                    (k % 511) as i16
+                                } else {
+                                    0
+                                }
+                            })
+                            .collect(),
+                    )),
+                    // a run of leading nulls, a trailing null, and scattered ones
+                    validity: (0..rows).map(|k| present(k, rows)).collect(),
+                },
+            ),
+        ];
+        let blob = encode(&spec, &data).unwrap();
+        assert_eq!(decode(&spec, &blob).unwrap(), data, "whole-table decode");
+        assert_eq!(
+            decode_projected(&spec, &blob, &["e"]).unwrap(),
+            vec![data[1].clone()],
+            "projected decode"
+        );
+        assert_eq!(
+            decode_column(&spec, &blob, "e").unwrap(),
+            data[1].1,
+            "single-column decode"
+        );
+        // Deterministic, like every other encode path.
+        assert_eq!(
+            encode(&spec, &data).unwrap(),
+            blob,
+            "nullable encode not deterministic"
+        );
+    }
+
+    /// An all-null and an all-valid column both round-trip — Vortex collapses a constant validity
+    /// mask internally, so these take a different path from a mixed mask.
+    #[test]
+    fn nullable_all_null_and_all_valid_round_trip() {
+        for validity_of in [0usize, 1] {
+            let rows = 128usize;
+            let spec = TableSpec {
+                columns: vec![col("v", "f8").nullable()],
+                rows: rows as u64,
+                row_index: None,
+            };
+            let data: TableData = vec![(
+                "v".into(),
+                ColumnData::Nullable {
+                    values: Box::new(ColumnData::F64(
+                        (0..rows)
+                            .map(|k| {
+                                if validity_of == 1 {
+                                    k as f64 * 0.5
+                                } else {
+                                    0.0
+                                }
+                            })
+                            .collect(),
+                    )),
+                    validity: vec![validity_of == 1; rows],
+                },
+            )];
+            let blob = encode(&spec, &data).unwrap();
+            assert_eq!(
+                decode(&spec, &blob).unwrap(),
+                data,
+                "constant-validity mask ({validity_of}) did not round-trip"
+            );
+        }
+    }
+
+    /// The corpus-stability gate: a NON-nullable column must encode to exactly the bytes it did
+    /// before #330 existed. If this drifts, every committed fixture's `content_hash` changes and
+    /// the whole conformance corpus needs regeneration.
+    #[test]
+    fn non_nullable_encode_is_unchanged_by_the_nullable_feature() {
+        let rows = 4096usize;
+        let spec = TableSpec {
+            columns: vec![col("t", "u8"), col("e", "f4")],
+            rows: rows as u64,
+            row_index: Some("t".into()),
+        };
+        let data: TableData = vec![
+            ("t".into(), ColumnData::U64((0..rows as u64).collect())),
+            (
+                "e".into(),
+                ColumnData::F32((0..rows).map(|k| 511.0 + (k % 13) as f32).collect()),
+            ),
+        ];
+        let blob = encode(&spec, &data).unwrap();
+        // Round-trips, carries no validity, and the spec column serialises with no `nullable` key
+        // (asserted in tessera-core) — together these pin the golden bytes.
+        let back = decode(&spec, &blob).unwrap();
+        assert_eq!(back, data);
+        assert!(
+            !matches!(back[1].1, ColumnData::Nullable { .. }),
+            "a non-nullable spec column must not decode as Nullable"
+        );
+    }
+
+    /// `validate` is the single gate: spec/data nullability must agree, the mask must cover the
+    /// values, nesting is rejected, and the unsupported dtypes are named rather than panicking.
+    #[test]
+    fn validate_rejects_malformed_nullable_columns() {
+        let nullable_spec = |dtype: &str| TableSpec {
+            columns: vec![col("v", dtype).nullable()],
+            rows: 3,
+            row_index: None,
+        };
+        let bare_spec = TableSpec {
+            columns: vec![col("v", "i2")],
+            rows: 3,
+            row_index: None,
+        };
+        let nullable = |values: ColumnData, validity: Vec<bool>| ColumnData::Nullable {
+            values: Box::new(values),
+            validity,
+        };
+
+        // spec says nullable, data is bare
+        let e = encode(
+            &nullable_spec("i2"),
+            &vec![("v".into(), ColumnData::I16(vec![1, 2, 3]))],
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("no validity mask"), "got: {e}");
+
+        // data is nullable, spec is not
+        let e = encode(
+            &bare_spec,
+            &vec![(
+                "v".into(),
+                nullable(ColumnData::I16(vec![1, 2, 3]), vec![true; 3]),
+            )],
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("not marked nullable"), "got: {e}");
+
+        // mask shorter than the values
+        let e = encode(
+            &nullable_spec("i2"),
+            &vec![(
+                "v".into(),
+                nullable(ColumnData::I16(vec![1, 2, 3]), vec![true; 2]),
+            )],
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("validity flags"), "got: {e}");
+
+        // nested nullable
+        let e = encode(
+            &nullable_spec("i2"),
+            &vec![(
+                "v".into(),
+                nullable(
+                    nullable(ColumnData::I16(vec![1, 2, 3]), vec![true; 3]),
+                    vec![true; 3],
+                ),
+            )],
+        )
+        .unwrap_err();
+        assert!(format!("{e}").contains("nested"), "got: {e}");
+
+        // out-of-scope dtypes are REJECTED, not panicked — nullability is numeric-only today
+        for (dtype, values) in [
+            ("b1", ColumnData::Bool(vec![true, false, true])),
+            (
+                "str",
+                ColumnData::Utf8(vec!["a".into(), "b".into(), "c".into()]),
+            ),
+        ] {
+            let e = encode(
+                &nullable_spec(dtype),
+                &vec![("v".into(), nullable(values, vec![true; 3]))],
+            )
+            .unwrap_err();
+            assert!(
+                format!("{e}").contains("not supported yet"),
+                "nullable {dtype} should be a typed rejection, got: {e}"
+            );
+        }
+    }
+
+    /// Two columns that differ ONLY beneath their nulls must encode to identical bytes.
+    ///
+    /// This is what makes `content_hash` well-defined for nullable data: a producer must not be
+    /// able to change a sealed product's identity by varying whatever sits in a masked-out slot.
+    #[test]
+    fn bytes_are_independent_of_values_under_nulls() {
+        let rows = 512usize;
+        let spec = TableSpec {
+            columns: vec![col("v", "i4").nullable()],
+            rows: rows as u64,
+            row_index: None,
+        };
+        let validity: Vec<bool> = (0..rows).map(|k| k % 3 != 0).collect();
+        let build = |filler: i32| -> TableData {
+            vec![(
+                "v".into(),
+                ColumnData::Nullable {
+                    values: Box::new(ColumnData::I32(
+                        (0..rows)
+                            .map(|k| if validity[k] { k as i32 } else { filler })
+                            .collect(),
+                    )),
+                    validity: validity.clone(),
+                },
+            )]
+        };
+        let a = encode(&spec, &build(0)).unwrap();
+        let b = encode(&spec, &build(i32::MIN)).unwrap();
+        let c = encode(&spec, &build(999_999)).unwrap();
+        assert_eq!(a, b, "bytes changed with the filler under nulls");
+        assert_eq!(a, c, "bytes changed with the filler under nulls");
+        // ...and the decode is the canonical form regardless of which one was written.
+        assert_eq!(decode(&spec, &c).unwrap(), build(0));
+    }
+
+    /// Chunk statistics must describe the values that are PRESENT: a NULL is skipped, not folded
+    /// in as 0, or `min`/`max` pruning would exclude chunks that really do contain matches.
+    #[test]
+    fn as_i64_skips_nulls() {
+        let c = ColumnData::Nullable {
+            values: Box::new(ColumnData::I32(vec![5, -3, 100, 7])),
+            validity: vec![true, false, true, false],
+        };
+        assert_eq!(c.as_i64(), Some(vec![5, 100]));
+    }
+
     #[test]
     fn materialise_is_bit_identical_across_thread_counts() {
         let rows = ROWS_PER_GROUP + 4242; // 2 row-groups + remainder
@@ -1140,7 +1641,30 @@ mod tests {
             "str".into(),
             ColumnData::Utf8((0..rows).map(|k| format!("crystal-{}", k % 97)).collect()),
         ));
-        spec.columns = data.iter().map(|(n, c)| col(n, c.numpy_code())).collect();
+        // A nullable column too (#330): validity is assembled per worker in `materialise_with`,
+        // so it is exactly the kind of state that can interleave wrongly under parallelism.
+        data.push((
+            "maybe".into(),
+            ColumnData::Nullable {
+                values: Box::new(ColumnData::I32(
+                    (0..rows)
+                        .map(|k| if k % 5 != 0 { k as i32 * 7 } else { 0 })
+                        .collect(),
+                )),
+                validity: (0..rows).map(|k| k % 5 != 0).collect(),
+            },
+        ));
+        spec.columns = data
+            .iter()
+            .map(|(n, c)| {
+                let base = col(n, c.numpy_code());
+                if matches!(c, ColumnData::Nullable { .. }) {
+                    base.nullable()
+                } else {
+                    base
+                }
+            })
+            .collect();
         let blob = encode(&spec, &data).unwrap();
 
         // `repeat` duplicates the scanned chunks, exercising the multi-chunk append loop
@@ -1149,7 +1673,7 @@ mod tests {
             let mut cols: Vec<ColumnData> = spec
                 .columns
                 .iter()
-                .map(|c| empty_column_with_capacity(&c.dtype, rows * repeat))
+                .map(|c| empty_column_for(c, rows * repeat))
                 .collect::<Result<_>>()
                 .unwrap();
             with_read_session(|rt, s| {

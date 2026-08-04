@@ -1436,6 +1436,14 @@ fn col_to_values(col: &ColumnData) -> Vec<Value> {
         ColumnData::F64(v) => floats(v),
         ColumnData::Bool(v) => v.iter().map(|x| Value::from(*x)).collect(),
         ColumnData::Utf8(v) => v.iter().map(|x| Value::from(x.as_str())).collect(),
+        // NULL renders as JSON null — distinct from a NaN float, which also renders null but
+        // means "not a number", not "no value". ndjson shows `null`; CSV shows `nan` via
+        // `csv_cell`, matching how the non-finite float case already reads.
+        ColumnData::Nullable { values, validity } => col_to_values(values)
+            .into_iter()
+            .zip(validity)
+            .map(|(v, &ok)| if ok { v } else { Value::Null })
+            .collect(),
     }
 }
 

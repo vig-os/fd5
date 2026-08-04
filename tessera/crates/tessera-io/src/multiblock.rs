@@ -109,8 +109,7 @@ impl LogicalTableView {
     /// For very large columns prefer [`Self::column_blocks`] — it yields one block's worth at a
     /// time so callers can stream the column without materialising it all.
     pub fn column<R: Read + Seek>(&self, reader: &mut Reader<R>, name: &str) -> Result<ColumnData> {
-        let code = self.column_dtype(name)?;
-        let mut out = ColumnData::from_le_bytes(code, &[])?;
+        let mut out = ColumnData::empty_for(self.column_spec(name)?)?;
         for (bname, spec) in self.block_names.iter().zip(&self.specs) {
             let blob = reader.read_block(bname)?;
             let chunk = decode_column(spec, &blob, name)?;
@@ -171,7 +170,7 @@ impl LogicalTableView {
         // Build output columns in spec order; gather one row at a time in caller order.
         let mut out: TableData = Vec::with_capacity(columns.len());
         for (col_idx, col) in columns.iter().enumerate() {
-            let mut typed = ColumnData::from_le_bytes(&col.dtype, &[])?;
+            let mut typed = ColumnData::empty_for(col)?;
             for &(b, l) in &mapping {
                 let src = decoded.get(&b).ok_or_else(|| {
                     Error::Codec(format!("take: missing decoded cache for block {b}"))
@@ -225,6 +224,22 @@ impl LogicalTableView {
             }
         }
         Ok(out)
+    }
+
+    /// The declaring [`Column`] for `name`, taken from the first block's spec (every block in a
+    /// logical table shares the schema). Needed alongside [`Self::column_dtype`] because a
+    /// cross-block accumulator must match the per-block chunks' *nullability*, not just dtype —
+    /// `extend` rejects a bare column extended by a nullable one.
+    fn column_spec(&self, name: &str) -> Result<&tessera_core::block::table::Column> {
+        self.specs
+            .first()
+            .and_then(|s| s.columns.iter().find(|c| c.name == name))
+            .ok_or_else(|| {
+                Error::Codec(format!(
+                    "logical_table('{}'): no column '{name}'",
+                    self.prefix
+                ))
+            })
     }
 
     fn column_dtype(&self, name: &str) -> Result<&str> {
