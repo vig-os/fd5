@@ -15,7 +15,7 @@
 //! (`READ_RT`) so segment I/O + decode fan out across cores — do **not**
 //! reach for the bare single-threaded runtime and hand-roll a scan loop; that
 //! path is single-core and will read ~4× slower than a mature row store, which is
-//! a mis-use artefact, not a property of the format.
+//! a misuse artefact, not a property of the format.
 //!
 //! Match the read to the format's shape:
 //! - **Project** — ask only for the columns you need ([`decode_projected`] /
@@ -296,15 +296,47 @@ impl ColumnData {
         Ok(())
     }
 
-    /// Bytes per element of the numpy dtype code (`i1`=1 … `f8`=8).
+    /// Bytes per element of a **fixed-width** numpy dtype code (`i1`=1 … `f8`=8, `b1`=1).
+    ///
+    /// `b1` is 1 byte per value in this LE form (see [`Self::to_le_bytes`] — the *wire* form is
+    /// bit-packed by Vortex, but the flat byte form is one byte per bool), so it is fixed-width
+    /// like the numerics.
+    ///
+    /// `str` has **no** element size — it is length-prefixed and varies per value — so it is an
+    /// error here by design. Callers that only need "is this a dtype we support?" must use
+    /// [`Self::validate_dtype`]; using this function for that question silently excludes every
+    /// variable-width column.
     pub fn dtype_size(code: &str) -> Result<usize> {
         Ok(match code {
-            "i1" | "u1" => 1,
+            "i1" | "u1" | "b1" => 1,
             "i2" | "u2" => 2,
             "i4" | "u4" | "f4" => 4,
             "i8" | "u8" | "f8" => 8,
+            "str" => {
+                return Err(Error::Codec(
+                    "dtype 'str' is variable-width and has no element size".to_string(),
+                ))
+            }
             other => return Err(Error::Codec(format!("unknown dtype code '{other}'"))),
         })
+    }
+
+    /// Whether `code` names a dtype [`ColumnData`] can represent — including the variable-width
+    /// `str`. This is the correct front-door check for "can this column be written?"; it exists
+    /// because [`Self::dtype_size`] was being used for that question, which rejected `b1`/`str`
+    /// and so locked the boolean and string column types out of every streaming write path.
+    pub fn validate_dtype(code: &str) -> Result<()> {
+        match code {
+            "i1" | "i2" | "i4" | "i8" | "u1" | "u2" | "u4" | "u8" | "f4" | "f8" | "b1" | "str" => {
+                Ok(())
+            }
+            other => Err(Error::Codec(format!("unknown dtype code '{other}'"))),
+        }
+    }
+
+    /// Whether `code` is fixed-width (every value occupies [`Self::dtype_size`] bytes).
+    pub fn dtype_is_fixed_width(code: &str) -> bool {
+        Self::dtype_size(code).is_ok()
     }
 
     fn to_vortex(&self) -> ArrayRef {
