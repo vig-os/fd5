@@ -16,6 +16,9 @@ tessera-core.workspace = true
 tessera-io.workspace = true
 tessera-ingest.workspace = true
 serde_json.workspace = true
+# `[resources]` config-file parsing for the resource-cap resolver (#368) — flag > env > conf > default.
+serde.workspace = true
+toml.workspace = true
 clap.workspace = true
 # Surface library WARNs (e.g. the schema recommended-field nudge from the ingest engine) on stderr.
 tracing.workspace = true
