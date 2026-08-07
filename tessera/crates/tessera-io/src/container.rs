@@ -788,6 +788,103 @@ mod tests {
     }
 
     #[test]
+    fn tampered_table_block_payload_fails_on_read() {
+        // The Vortex-table twin of tampered_block_payload_fails_on_read (which uses an int16 array):
+        // flipping a single value's byte in an encoded table payload trips the block_payload digest
+        // on read, exactly as for an array/zarr block — the guarantee is kind-agnostic.
+        use tessera_core::block::table::{Column, TableBlock, TableSpec};
+        let spec = TableSpec {
+            columns: vec![Column {
+                name: "energy".into(),
+                dtype: "f4".into(),
+                ..Default::default()
+            }],
+            rows: 2_696_935,
+            row_index: Some("ms".into()),
+        };
+        // The valid payload is exactly what the block digest is computed over (the spec, in the
+        // spike — a real Vortex backend stores encoded column chunks with the same property).
+        let good = serde_json::to_vec(&spec).unwrap();
+        let events = TableBlock::new("events_3p", spec);
+
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2024-01-01T00:00:00Z");
+        b.add_block(&events).unwrap();
+        let sealed = b.seal().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        // Happy path: the correct payload reads back.
+        let good_path = dir.path().join("good.tsra");
+        pack(
+            &sealed,
+            &[BlockPayload::new("events_3p", good.clone())],
+            &good_path,
+        )
+        .unwrap();
+        assert_eq!(
+            Reader::open(&good_path)
+                .unwrap()
+                .read_block("events_3p")
+                .unwrap(),
+            good
+        );
+
+        // Flip ONE byte (a single value in the table) → block_payload integrity error on read.
+        let mut bad = good.clone();
+        bad[0] ^= 0xFF;
+        let bad_path = dir.path().join("bad.tsra");
+        pack(&sealed, &[BlockPayload::new("events_3p", bad)], &bad_path).unwrap();
+        match Reader::open(&bad_path).unwrap().read_block("events_3p") {
+            Err(Error::Integrity { what, .. }) => assert_eq!(what, "block_payload"),
+            other => panic!("expected block_payload integrity error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_verify_is_l1_only_payload_flip_needs_read_path() {
+        // The verify escalation ladder, as an executable spec:
+        //   L1 = manifest.verify(): recomputes id / content_hash / manifest_hash from the RECORDED
+        //        block digests. It never reads block payloads, so a flipped payload left alongside
+        //        an untouched recorded digest still PASSES L1.
+        //   L2 = read_block: re-derives the digest from the ACTUAL stored bytes → catches the flip.
+        // (L3 = per-chunk sub-block Merkle, #214 / ADR-0028 §3, would localise WHICH chunk — n/a here.)
+        use tessera_core::block::table::{Column, TableBlock, TableSpec};
+        let spec = TableSpec {
+            columns: vec![Column {
+                name: "energy".into(),
+                dtype: "f4".into(),
+                ..Default::default()
+            }],
+            rows: 10,
+            row_index: Some("ms".into()),
+        };
+        let good = serde_json::to_vec(&spec).unwrap();
+        let events = TableBlock::new("events_3p", spec);
+
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2024-01-01T00:00:00Z");
+        b.add_block(&events).unwrap();
+        let sealed = b.seal().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flipped.tsra");
+        // Pack a FLIPPED payload but leave the manifest — and its recorded digest — untouched.
+        let mut flipped = good.clone();
+        flipped[0] ^= 0xFF;
+        pack(&sealed, &[BlockPayload::new("events_3p", flipped)], &path).unwrap();
+
+        let mut r = Reader::open(&path).unwrap();
+        // L1: the manifest itself still verifies — recorded digests, roots and seal are internally
+        // consistent because none of them were touched. L1 does not read payloads.
+        r.manifest()
+            .verify()
+            .expect("L1 (manifest self-consistency) passes: payload bytes are never read");
+        // L2: reading the block re-derives the digest from the stored bytes and catches the flip.
+        match r.read_block("events_3p") {
+            Err(Error::Integrity { what, .. }) => assert_eq!(what, "block_payload"),
+            other => panic!("expected a block_payload integrity error at L2, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn refuses_unsealed_manifest() {
         let m = Manifest::new("recon", "x", "d", "2024-01-01T00:00:00Z"); // not sealed
         let dir = tempfile::tempdir().unwrap();

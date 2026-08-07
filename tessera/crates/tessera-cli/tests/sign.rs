@@ -108,6 +108,89 @@ fn cli_sign_then_verify_sig_roundtrips_and_rejects_wrong_key() {
 }
 
 #[test]
+fn foreign_resign_leaves_integrity_intact_but_untrusted() {
+    // "Someone else re-signed it." A foreign key replaces the trusted signature on an UNMODIFIED
+    // product. Integrity (`verify`) still passes — signing only touches the seal-ignored aux subtree
+    // (ADR-0042) — yet `verify-sig` against the trust store now rejects it as untrusted. The dual
+    // "the bytes are fine, the signer isn't" property, asserted together (today's tests assert each
+    // half separately).
+    let dir = tempfile::tempdir().unwrap();
+    let tsra = dir.path().join("data.tsra");
+    sealed_tsra(&tsra);
+
+    // Repo-local trust store (`.tessera/trust/`, resolved relative to CWD) trusts key A as "lab".
+    let lab = SigningKey::from_bytes(&[17u8; 32]);
+    let lab_key = dir.path().join("lab.key");
+    std::fs::write(&lab_key, hex32(&lab.to_bytes())).unwrap();
+    let trust_dir = dir.path().join(".tessera/trust");
+    std::fs::create_dir_all(&trust_dir).unwrap();
+    std::fs::write(
+        trust_dir.join("lab.pub"),
+        verifying_key_hex(&lab.verifying_key()),
+    )
+    .unwrap();
+
+    // Every invocation runs in the tempdir with an isolated HOME/XDG so ONLY this trust store is
+    // consulted — the host's real ~/.config/tessera can neither add nor remove trust.
+    let mk = || {
+        let mut c = tessera();
+        c.current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join(".config"));
+        c
+    };
+
+    // Sign with the trusted lab key; verify-sig (no --pubkey ⇒ defaults to the trust store) → trusted.
+    assert!(mk()
+        .args(["sign"])
+        .arg(&tsra)
+        .arg("--key")
+        .arg(&lab_key)
+        .args(["--signer", "lab"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(
+        mk().args(["verify-sig"])
+            .arg(&tsra)
+            .status()
+            .unwrap()
+            .success(),
+        "the lab signature is in the trust store → trusted"
+    );
+
+    // A FOREIGN key re-signs the unmodified product (single-signer semantics replace the lab sig).
+    let attacker = SigningKey::from_bytes(&[99u8; 32]);
+    let att_key = dir.path().join("attacker.key");
+    std::fs::write(&att_key, hex32(&attacker.to_bytes())).unwrap();
+    assert!(mk()
+        .args(["sign"])
+        .arg(&tsra)
+        .arg("--key")
+        .arg(&att_key)
+        .args(["--signer", "attacker"])
+        .status()
+        .unwrap()
+        .success());
+
+    // Integrity is intact — the payload + seal are byte-unchanged (the signature rides in aux).
+    assert!(
+        mk().args(["verify"]).arg(&tsra).status().unwrap().success(),
+        "the product bytes are unchanged, so integrity still verifies"
+    );
+    // But the signer is now untrusted — verify-sig against the trust store rejects it (non-zero).
+    assert!(
+        !mk()
+            .args(["verify-sig"])
+            .arg(&tsra)
+            .status()
+            .unwrap()
+            .success(),
+        "the foreign key is not in the trust store → untrusted"
+    );
+}
+
+#[test]
 fn cli_sign_sidecar_flag_writes_detached_and_verify_falls_back() {
     // `sign --sidecar` writes the legacy detached form; `verify-sig` falls back to it when no
     // embedded signature is present (ADR-0042). Same crypto, only the location differs.
