@@ -943,12 +943,28 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
             Ok(())
         }
         Cmd::Verify { file } => {
-            let mut r = open_local_or_url(&file)?; // magic + manifest seal
-            let n = r.manifest().blocks.len();
-            // Payload half of verification: stream every block at bounded RSS + typed, located
-            // errors (#268 parts 3+4). `open` already checked the seal.
-            r.verify_payloads(&file.display().to_string())?;
-            println!("OK  {} verified ({n} blocks)", file.display());
+            let label = file.display().to_string();
+            // Payload half of verification: re-derive every block's digest from its stored bytes at
+            // bounded RSS + typed, located errors (#268 parts 3+4). `open` already checked the seal.
+            // A local `.tsra` fans the probe across the worker pool — each block is independently
+            // addressable in the STORED zip (#367); a URL verifies serially (no cheap multi-handle
+            // reopen). Worker count is the machine default for now; #368 will feed it from the
+            // resource-cap resolver.
+            #[cfg(feature = "cloud")]
+            let is_url = cloud_url(&file).is_some();
+            #[cfg(not(feature = "cloud"))]
+            let is_url = false;
+            if is_url {
+                let mut r = open_local_or_url(&file)?; // magic + manifest seal
+                let n = r.manifest().blocks.len();
+                r.verify_payloads(&label)?;
+                println!("OK  {label} verified ({n} blocks)");
+            } else {
+                let workers = tessera_io::WriteConfig::for_system().worker_count();
+                // Returns the block count (verified with L1 seal + L2 payloads) — no extra reopen.
+                let n = tessera_io::verify_payloads_parallel(&file, &label, workers)?;
+                println!("OK  {label} verified ({n} blocks)");
+            }
             Ok(())
         }
         Cmd::Tree { file, full, verify } => {
