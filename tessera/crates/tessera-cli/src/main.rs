@@ -7,6 +7,7 @@
 mod bench;
 mod collection;
 mod nav;
+mod resource;
 #[cfg(feature = "sql")]
 mod sql;
 mod trust;
@@ -19,7 +20,7 @@ use clap::{Parser, Subcommand};
 use tessera_core::collection::{member_filename, MemberKind};
 use tessera_core::SchemaRegistry;
 use tessera_ingest::{engine, spec as ingest_spec};
-use tessera_io::{pack_dir, parse_byte_size, unpack, Reader, WriteConfig};
+use tessera_io::{pack_dir, parse_byte_size, unpack, Reader};
 
 /// Cloud-URL prefixes the `cloud` feature recognises. Used to detect a URL-shaped argument and
 /// route it through `tessera_io::open_url` instead of the local file path.
@@ -1596,7 +1597,9 @@ fn run_ingest(src: IngestSrc) -> tessera_core::Result<()> {
     let staging = tempfile::tempdir().map_err(|e| {
         tessera_core::Error::Invalid(format!("tessera ingest: create staging dir: {e}"))
     })?;
-    let cfg = WriteConfig::for_system();
+    // Resource caps (#368): the per-format subcommands expose no --workers/--ram flags, so this is
+    // env > conf > for_system() — TESSERA_WORKERS / TESSERA_RAM_BUDGET and .tessera/config.toml still apply.
+    let cfg = resource::resolve_write_config(None, None)?;
     let coll = engine::run(
         &spec,
         std::path::Path::new("cli-inline-spec"),
@@ -1808,13 +1811,9 @@ struct IngestSpecOpts {
 fn run_ingest_spec(opts: IngestSpecOpts) -> tessera_core::Result<()> {
     let parsed = ingest_spec::parse(&opts.spec_path)?;
     let out_dir = opts.out_dir.unwrap_or_else(|| PathBuf::from("ingest-out"));
-    let mut cfg = WriteConfig::for_system();
-    if let Some(n) = opts.workers {
-        cfg = cfg.workers(n);
-    }
-    if let Some(s) = opts.ram_budget {
-        cfg = cfg.ram_budget(parse_byte_size(&s)?);
-    }
+    // Resource caps (#368): flag > env > conf > default. The explicit --workers / --ram-budget are
+    // the top tier; TESSERA_WORKERS / TESSERA_RAM_BUDGET and .tessera/config.toml fill in below.
+    let cfg = resource::resolve_write_config(opts.workers, opts.ram_budget.as_deref())?;
     if opts.auto {
         // The honest knee model needs measured read/encode rates; without a fixture here we just
         // surface the request and stick to defaults (the bench subcommand is where the live
