@@ -47,6 +47,10 @@ struct ConfigFile {
 
 /// Config file search order (repo before user; first file to set a field wins it): repo-local
 /// `.tessera/config.toml`, then `$XDG_CONFIG_HOME/tessera/config.toml` or `~/.config/tessera/config.toml`.
+///
+/// The repo-local file is resolved **relative to the current directory** — the same cwd-relative
+/// convention as the trust store's `.tessera/trust` — so it applies when tessera is run from the repo
+/// root; it is not discovered by walking up from a subdirectory.
 fn config_files() -> Vec<PathBuf> {
     let mut files = vec![PathBuf::from(".tessera/config.toml")];
     if let Some(base) = std::env::var_os("XDG_CONFIG_HOME")
@@ -66,32 +70,57 @@ fn parse_resources_toml(text: &str, label: &str) -> Result<ResourcesTable> {
     Ok(cfg.resources)
 }
 
-/// Merge the config-file tier across the search path: the first file to set each field wins it
-/// (repo overrides user). Absent files are skipped; a malformed one errors.
-fn config_resources() -> Result<ResourcesTable> {
+/// Merge `[resources]` tables in precedence order — the first table to set each field wins it
+/// (repo before user). Pure: the file I/O lives in [`config_resources`], so the repo-over-user
+/// precedence is unit-testable directly without touching the filesystem.
+fn merge_resources(tables: impl IntoIterator<Item = ResourcesTable>) -> ResourcesTable {
     let mut merged = ResourcesTable::default();
+    for t in tables {
+        if merged.workers.is_none() {
+            merged.workers = t.workers;
+        }
+        if merged.ram_budget.is_none() {
+            merged.ram_budget = t.ram_budget;
+        }
+    }
+    merged
+}
+
+/// Read the config-file tier across the search path and merge it (repo overrides user). Absent files
+/// are skipped; a malformed one errors.
+fn config_resources() -> Result<ResourcesTable> {
+    let mut tables = Vec::new();
     for path in config_files() {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(_) => continue, // absent file is fine
         };
-        let parsed = parse_resources_toml(&text, &path.display().to_string())?;
-        if merged.workers.is_none() {
-            merged.workers = parsed.workers;
-        }
-        if merged.ram_budget.is_none() {
-            merged.ram_budget = parsed.ram_budget;
-        }
+        tables.push(parse_resources_toml(&text, &path.display().to_string())?);
     }
-    Ok(merged)
+    Ok(merge_resources(tables))
 }
 
-/// Parse a worker-count string (from env or config); a present-but-garbage value is an error, so a
-/// typo'd cap is loud rather than silently ignored.
+/// Parse a worker-count string (from a flag, env, or config); a present-but-garbage value — or an
+/// explicit `0`, which would silently clamp to 1 — is an error, so a typo'd or nonsensical cap is
+/// loud rather than silently ignored. `source` names where the value came from.
 fn parse_workers(s: &str, source: &str) -> Result<usize> {
-    s.trim()
+    let n = s
+        .trim()
         .parse::<usize>()
-        .map_err(|_| Error::Invalid(format!("{source}: expected a positive integer, got {s:?}")))
+        .map_err(|_| Error::Invalid(format!("{source}: expected a positive integer, got {s:?}")))?;
+    if n == 0 {
+        return Err(Error::Invalid(format!(
+            "{source}: worker count must be >= 1, got 0"
+        )));
+    }
+    Ok(n)
+}
+
+/// Parse a RAM-budget size string (from a flag, env, or config), labeling the parse error with its
+/// `source` — symmetric with [`parse_workers`], so a bad value names where it came from instead of
+/// surfacing a bare parser error.
+fn parse_ram(s: &str, source: &str) -> Result<u64> {
+    parse_byte_size(s).map_err(|e| Error::Invalid(format!("{source}: {e}")))
 }
 
 /// The **pure** precedence core: pick each field from the first tier that set it, else the machine
@@ -131,15 +160,15 @@ pub fn resolve_write_config(
     };
 
     let flag_ram = match flag_ram {
-        Some(s) => Some(parse_byte_size(s)?),
+        Some(s) => Some(parse_ram(s, "--ram-budget")?),
         None => None,
     };
     let env_ram = match std::env::var(ENV_RAM_BUDGET) {
-        Ok(s) => Some(parse_byte_size(&s)?),
+        Ok(s) => Some(parse_ram(&s, ENV_RAM_BUDGET)?),
         Err(_) => None,
     };
     let conf_ram = match &conf.ram_budget {
-        Some(s) => Some(parse_byte_size(s)?),
+        Some(s) => Some(parse_ram(s, "config [resources].ram_budget")?),
         None => None,
     };
 
@@ -218,9 +247,45 @@ mod tests {
     }
 
     #[test]
-    fn worker_string_parse_rejects_garbage() {
+    fn worker_string_parse_rejects_garbage_zero_and_empty() {
         assert_eq!(parse_workers("8", "env").unwrap(), 8);
         assert_eq!(parse_workers("  3 ", "env").unwrap(), 3);
         assert!(parse_workers("lots", "env").is_err());
+        // an explicit 0 (which WriteConfig would silently clamp to 1) is rejected loudly.
+        assert!(parse_workers("0", "env").is_err());
+        // empty / whitespace-only is a garbage cap, not "unset".
+        assert!(parse_workers("", "env").is_err());
+        assert!(parse_workers("   ", "env").is_err());
+    }
+
+    #[test]
+    fn config_merge_is_repo_over_user_per_field() {
+        // repo sets only workers; user sets both. Repo wins workers; user fills the ram the repo
+        // left unset — the repo-over-user, first-to-set-wins, per-field contract.
+        let repo = ResourcesTable {
+            workers: Some(2),
+            ram_budget: None,
+        };
+        let user = ResourcesTable {
+            workers: Some(9),
+            ram_budget: Some("1GiB".into()),
+        };
+        let m = merge_resources([repo, user]);
+        assert_eq!(m.workers, Some(2), "repo workers win over user");
+        assert_eq!(
+            m.ram_budget.as_deref(),
+            Some("1GiB"),
+            "user ram fills where repo left it unset"
+        );
+    }
+
+    #[test]
+    fn ram_parse_error_names_its_source() {
+        let e = parse_ram("not-a-size", ENV_RAM_BUDGET).unwrap_err();
+        assert!(
+            format!("{e}").contains(ENV_RAM_BUDGET),
+            "the error must name where the bad value came from, got: {e}"
+        );
+        assert_eq!(parse_ram("512MiB", "flag").unwrap(), 512 * 1024 * 1024);
     }
 }
