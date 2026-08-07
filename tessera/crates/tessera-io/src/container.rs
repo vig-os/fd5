@@ -468,11 +468,12 @@ impl<R: Read + Seek> Reader<R> {
 const PARALLEL_VERIFY_MIN_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The adaptive knee for [`verify_payloads_parallel`]: fan the L2 payload probe across workers only
-/// when it pays back — more than one worker, more than one block, and a file large enough that
-/// thread setup + per-worker reopen is noise against the hashing. Small products stay serial (the
-/// same small-stays-single principle as the streaming write path, ADR-0026).
-fn should_parallelize(file_size: u64, block_count: usize, workers: usize) -> bool {
-    workers > 1 && block_count > 1 && file_size >= PARALLEL_VERIFY_MIN_BYTES
+/// when it pays back — more than one worker, more than one block, and a file at least `min_bytes`
+/// (thread setup + per-worker reopen is then noise against the hashing). Small products stay serial
+/// (the same small-stays-single principle as the streaming write path, ADR-0026). `min_bytes` is a
+/// parameter so tests can drop it to `0` and exercise the fan-out branch on a small fixture.
+fn should_parallelize(file_size: u64, block_count: usize, workers: usize, min_bytes: u64) -> bool {
+    workers > 1 && block_count > 1 && file_size >= min_bytes
 }
 
 /// The parallel core: verify `names` by streaming each block's stored bytes through
@@ -488,26 +489,32 @@ fn verify_payloads_multithread(
     label: &str,
     n_threads: usize,
 ) -> Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let cursor = AtomicUsize::new(0);
+    // Lock-free "someone already failed" flag gates the hot path (checked every iteration); the
+    // Mutex is only ever taken on the rare error path, and `swap` ensures exactly the first worker
+    // to fail records its error.
+    let failed = AtomicBool::new(false);
     let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+    let record = |e: Error| {
+        if !failed.swap(true, Ordering::AcqRel) {
+            *first_err.lock().unwrap() = Some(e);
+        }
+    };
     std::thread::scope(|s| {
         for _ in 0..n_threads {
             s.spawn(|| {
                 let mut r = match Reader::open(path) {
                     Ok(r) => r,
                     Err(e) => {
-                        let mut fe = first_err.lock().unwrap();
-                        if fe.is_none() {
-                            *fe = Some(e);
-                        }
+                        record(e);
                         return;
                     }
                 };
                 let mut sink = std::io::sink();
                 loop {
-                    // Stop pulling work once any worker has recorded a failure.
-                    if first_err.lock().unwrap().is_some() {
+                    // Stop pulling work once any worker has recorded a failure (lock-free check).
+                    if failed.load(Ordering::Acquire) {
                         return;
                     }
                     let i = cursor.fetch_add(1, Ordering::Relaxed);
@@ -515,14 +522,11 @@ fn verify_payloads_multithread(
                         return;
                     }
                     if let Err(e) = r.stream_block(&names[i], &mut sink) {
-                        let mut fe = first_err.lock().unwrap();
-                        if fe.is_none() {
-                            *fe = Some(Error::BlockIntegrity {
-                                file: label.to_string(),
-                                block: names[i].clone(),
-                                detail: e.to_string(),
-                            });
-                        }
+                        record(Error::BlockIntegrity {
+                            file: label.to_string(),
+                            block: names[i].clone(),
+                            detail: e.to_string(),
+                        });
                         return;
                     }
                 }
@@ -535,20 +539,33 @@ fn verify_payloads_multithread(
     }
 }
 
+/// Threshold-injectable core of [`verify_payloads_parallel`]: the public entry fixes `min_bytes` to
+/// [`PARALLEL_VERIFY_MIN_BYTES`]; tests pass `0` to force the fan-out branch on a small fixture.
+/// Returns the number of blocks verified, so a caller needn't reopen the archive to report the count.
+fn verify_payloads_parallel_with(
+    path: &Path,
+    label: &str,
+    workers: usize,
+    min_bytes: u64,
+) -> Result<usize> {
+    let names = Reader::open(path)?.block_names(); // L1 seal check + block list
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if should_parallelize(file_size, names.len(), workers, min_bytes) {
+        verify_payloads_multithread(path, &names, label, workers.min(names.len()))?;
+    } else {
+        Reader::open(path)?.verify_payloads(label)?;
+    }
+    Ok(names.len())
+}
+
 /// Parallel peer of [`Reader::verify_payloads`] for a **local** `.tsra` — the L2 payload probe fanned
 /// across up to `workers` OS threads. Above the [`should_parallelize`] knee it work-steals blocks
 /// across `min(workers, blocks)` threads via [`verify_payloads_multithread`]; below it (small file,
 /// single block, or `workers <= 1`) it falls back to the serial [`Reader::verify_payloads`], since the
-/// thread-spawn + reopen overhead doesn't pay back. The result — Ok, or a typed
-/// [`Error::BlockIntegrity`] — is identical to the serial path; only the wall-clock differs.
-pub fn verify_payloads_parallel(path: &Path, label: &str, workers: usize) -> Result<()> {
-    let names = Reader::open(path)?.block_names(); // L1 seal check + block list
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if !should_parallelize(file_size, names.len(), workers) {
-        return Reader::open(path)?.verify_payloads(label);
-    }
-    let n_threads = workers.min(names.len());
-    verify_payloads_multithread(path, &names, label, n_threads)
+/// thread-spawn + reopen overhead doesn't pay back. The result — the block count on success, or a
+/// typed [`Error::BlockIntegrity`] — is identical to the serial path; only the wall-clock differs.
+pub fn verify_payloads_parallel(path: &Path, label: &str, workers: usize) -> Result<usize> {
+    verify_payloads_parallel_with(path, label, workers, PARALLEL_VERIFY_MIN_BYTES)
 }
 
 /// One aux member to add to an existing `.tsra` — a name **relative to `aux/`** (so
@@ -898,17 +915,23 @@ mod tests {
 
     #[test]
     fn should_parallelize_respects_the_knee() {
-        let big = PARALLEL_VERIFY_MIN_BYTES;
+        let floor = PARALLEL_VERIFY_MIN_BYTES;
         assert!(
-            should_parallelize(big, 4, 8),
-            "big + multi-block + workers → parallel"
+            should_parallelize(floor, 4, 8, floor),
+            "at the floor + multi-block + workers → parallel"
         );
         assert!(
-            !should_parallelize(big - 1, 4, 8),
-            "below the size floor → serial"
+            !should_parallelize(floor - 1, 4, 8, floor),
+            "one byte below the floor → serial"
         );
-        assert!(!should_parallelize(big, 1, 8), "single block → serial");
-        assert!(!should_parallelize(big, 4, 1), "single worker → serial");
+        assert!(
+            !should_parallelize(floor, 1, 8, floor),
+            "single block → serial"
+        );
+        assert!(
+            !should_parallelize(floor, 4, 1, floor),
+            "single worker → serial"
+        );
     }
 
     #[test]
@@ -965,7 +988,48 @@ mod tests {
             .verify_payloads(&label)
             .unwrap();
         verify_payloads_multithread(&path, &names, &label, 4).unwrap();
-        verify_payloads_parallel(&path, &label, 8).unwrap();
+        assert_eq!(verify_payloads_parallel(&path, &label, 8).unwrap(), 5);
+    }
+
+    #[test]
+    fn forced_parallel_dispatch_runs_end_to_end() {
+        // Exercise the PUBLIC entry's fan-out branch on a small fixture by dropping the size floor to
+        // 0 — so should_parallelize → true and verify_payloads_parallel_with dispatches to the
+        // multithread core (the branch the 256 MiB threshold hides from the other tests). Clean
+        // product → Ok(block count).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tsra");
+        sealed_multiblock(&path, 5);
+        let label = path.display().to_string();
+        assert_eq!(
+            verify_payloads_parallel_with(&path, &label, 4, 0).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn forced_parallel_dispatch_catches_tamper() {
+        // Same forced fan-out, but one block is corrupt: the dispatch → multithread → typed error
+        // path must surface the bad block (not silently pass).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tsra");
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2024-01-01T00:00:00Z");
+        let mut payloads = Vec::new();
+        for i in 0..5 {
+            let blk = ArrayBlock::new(format!("vol{i}"), ArraySpec::new(vec![8, 8, 8], "int16"));
+            b.add_block(&blk).unwrap();
+            let mut bytes = serde_json::to_vec(&blk.spec).unwrap();
+            if i == 2 {
+                bytes[0] ^= 0xFF;
+            }
+            payloads.push(BlockPayload::new(format!("vol{i}"), bytes));
+        }
+        let sealed = b.seal().unwrap();
+        pack(&sealed, &payloads, &path).unwrap();
+        match verify_payloads_parallel_with(&path, &path.display().to_string(), 4, 0) {
+            Err(Error::BlockIntegrity { block, .. }) => assert_eq!(block, "vol2"),
+            other => panic!("expected a BlockIntegrity error for vol2, got {other:?}"),
+        }
     }
 
     #[test]

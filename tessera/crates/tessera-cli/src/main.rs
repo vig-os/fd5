@@ -960,9 +960,9 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
                 r.verify_payloads(&label)?;
                 println!("OK  {label} verified ({n} blocks)");
             } else {
-                let n = Reader::open(&file)?.manifest().blocks.len(); // magic + manifest seal (L1)
                 let workers = tessera_io::WriteConfig::for_system().worker_count();
-                tessera_io::verify_payloads_parallel(&file, &label, workers)?;
+                // Returns the block count (verified with L1 seal + L2 payloads) — no extra reopen.
+                let n = tessera_io::verify_payloads_parallel(&file, &label, workers)?;
                 println!("OK  {label} verified ({n} blocks)");
             }
             Ok(())
