@@ -4,10 +4,10 @@
 content-addressed, self-describing product (manifest + shape-dispatched storage blocks), with a
 single identity / provenance / integrity / versioning spine.
 
-> ⚠️ **Pre-1.0 — the on-disk format is not yet frozen.** Tessera is in late-stage alpha on the
-> `spike/tessera-core` branch. The model, container, and CLI are real and tested, but the byte format
-> may still change before the v0.1 freeze. **Keep your original data** — do not yet rely on a `.tsra`
-> as the only copy of something irreplaceable.
+> ⚠️ **Pre-1.0 — the on-disk format is not yet frozen.** Tessera is in late-stage alpha (development on
+> `dev`). The model, container, and CLI are real and tested, but the byte format may still change before
+> the v0.1 freeze. **Keep your original data** — do not yet rely on a `.tsra` as the only copy of
+> something irreplaceable.
 
 ## Why
 
@@ -22,17 +22,49 @@ does not invent a codec; it **composes the proven engine per shape** under one F
 - **Identity & integrity** — blake3 hash-on-write, a Merkle-Mountain-Range `content_hash`, and a
   `manifest_hash` seal that transitively commits to every block digest + all metadata.
 
-## Install / build
+## Install
 
-The repository is Nix-managed. The reliable path is the dev shell:
+Tessera's one native dependency is **libhdf5** (used only to *read* vendor acquisitions at ingest). How
+you get it decides which install path fits. In order of least-effort-for-a-user first:
+
+**1. Prebuilt binary (recommended)** — self-contained `tessera`, HDF5 bundled in, zero system deps.
+Published to [GitHub Releases](https://github.com/vig-os/tessera/releases) by
+[cargo-dist](https://opensource.axo.dev/cargo-dist/) for Linux & macOS (x86-64 + arm64):
 
 ```bash
-direnv allow          # or: nix develop   — loads the pinned toolchain + native deps (hdf5/zstd/…)
-cd tessera && cargo test
-cargo build --release -p tessera-cli   # the `tessera` binary
+# curl | sh installer (from a release) — or `cargo binstall tessera-cli`, or grab the tarball
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/vig-os/tessera/releases/latest/download/tessera-cli-installer.sh | sh
 ```
 
-(Building outside the Nix shell needs HDF5 headers + libs on `HDF5_DIR`; see `tessera/CLAUDE.md`.)
+The first release (`0.1.0-alpha.1`) is staged but deliberately **held** — see `release-plz.toml`. Until
+it is cut, build from source with one of the paths below.
+
+**2. From source, self-contained** — no system HDF5 needed; builds a private copy from vendored source.
+Needs **CMake + a C compiler** (and a few minutes). Works on any distro, including `lib64` ones
+(Fedora / RHEL / SUSE / nix):
+
+```bash
+cargo install --git https://github.com/vig-os/tessera --features static-hdf5 tessera-cli
+```
+
+**3. From source, system HDF5 (fastest dev build)** — links a libhdf5 already on the box via
+`pkg-config`. This is the default (no `static-hdf5` feature):
+
+```bash
+cd tessera && cargo build --release -p tessera-cli    # needs libhdf5 + pkg-config installed
+```
+
+**4. Nix dev shell (contributors)** — pins the whole toolchain + native deps (hdf5/zstd/…):
+
+```bash
+direnv allow          # or: nix develop
+cd tessera && cargo test
+```
+
+*Why bundled HDF5 is safe:* HDF5 is a read-only *input* format — Tessera re-encodes everything to
+Zarr+pcodec / Vortex on write, so the libhdf5 build is never in a sealed `.tsra`'s byte-path and can
+never affect a `content_hash`.
 
 ## Quickstart
 
