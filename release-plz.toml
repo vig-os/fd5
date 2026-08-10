@@ -10,3 +10,12 @@
 [workspace]
 # Intentionally minimal — defaults are correct for a held `release-pr` flow. Tag naming + single-vs-
 # per-crate tags + crates.io `publish` scoping are release-time concerns, decided when the alpha is cut.
+#
+# HANDOFF → cargo-dist (the broad binary channel; see /dist-workspace.toml + /.github/workflows/
+# release.yml). release-plz owns the version bump, CHANGELOG, and — once `release-plz release` is wired
+# — the git TAG. That tag is the single cut trigger: cargo-dist's release.yml fires on any tag matching
+# `**[0-9]+.[0-9]+.[0-9]+*` (that regex accepts BOTH a unified `v0.1.0-alpha.1` and a per-crate
+# `tessera-cli-v0.1.0-alpha.1`, so either release-plz tag scheme works) and attaches the prebuilt
+# `tessera` binaries + `curl | sh` installer to the same GitHub Release. The nix/crane channel attaches
+# its reproducible musl binary + maturin wheel to that same Release. So at cut time, whichever tag
+# scheme is chosen here must stay inside that regex — nothing else needs to change.
