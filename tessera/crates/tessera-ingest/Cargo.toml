@@ -28,7 +28,7 @@ serde_json.workspace = true
 toml.workspace = true
 
 [features]
-# `static-hdf5`: build libhdf5 from vendored source (via `hdf5-metno-src`, bundled HDF5 2.0.0) and link
+# `static-hdf5`: build libhdf5 from vendored source (via `hdf5-metno-src`, bundled HDF5 2.2.0) and link
 # it statically, instead of finding a system libhdf5 through pkg-config. OFF by default so dev/nix builds
 # stay fast on the pre-built system library; the release channels (cargo-dist prebuilt binaries, the
 # maturin wheel) turn it ON so a plain `cargo install` / downloaded binary needs no system HDF5 at all.

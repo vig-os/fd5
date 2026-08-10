@@ -6,7 +6,8 @@
 # "cut" trigger); the generated `.github/workflows/release.yml` fires on that tag and attaches these
 # artifacts to the same Release. See release-plz.toml.
 #
-# The nested cargo workspace lives here under `tessera/`; `cargo:.` points dist at it.
+# The nested cargo workspace lives under `tessera/`; `cargo:tessera` points dist at it (this file sits
+# at the repo/git root so CI, which runs `dist` from the root, resolves the workspace).
 [workspace]
 members = ["cargo:tessera"]
 
