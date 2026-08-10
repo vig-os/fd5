@@ -56,7 +56,11 @@
           # runs bindgen (needs libclang) and links libstdc++. The tessera-ingest GE-HDF5 reader
           # links libhdf5 (found via pkg-config — `hdf5-metno-sys` reads PKG_CONFIG_PATH when
           # HDF5_DIR is unset). Provide all to every crane derivation (deps/clippy/test).
-          nativeBuildInputs = with pkgs; [ clang pkg-config ];
+          # `cmake` is needed by the `static-hdf5` feature (hdf5-metno-src builds libhdf5 from source via
+          # CMake); any check that enables all features — e.g. the `--all-features` clippy — compiles that
+          # vendored build, which doubles as CI coverage of the static/lib64 path on both arches. The
+          # default (pkg-config) builds don't invoke CMake, so it costs them nothing.
+          nativeBuildInputs = with pkgs; [ clang pkg-config cmake ];
           buildInputs = with pkgs; [ stdenv.cc.cc.lib hdf5 ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
         };

@@ -59,6 +59,10 @@ cloud = ["tessera-io/cloud"]
 # `tessera sql` still parses (uniform UX) but returns a typed "rebuild with --features sql" error,
 # same shape as the `cloud`-gated `push`/`pull` fallback.
 sql = ["dep:datafusion", "dep:tokio", "dep:arrow"]
+# `static-hdf5`: forward the vendored-libhdf5 build down to `tessera-ingest` (see its Cargo.toml). The
+# release channels build the CLI with this ON so the shipped `tessera`/`tsra` binaries and a source
+# `cargo install --features static-hdf5` carry their own HDF5 — no system libhdf5 / pkg-config needed.
+static-hdf5 = ["tessera-ingest/static-hdf5"]
 
 [dev-dependencies]
 tempfile = "3"
