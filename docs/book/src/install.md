@@ -13,6 +13,7 @@ below and why the bundled-HDF5 options are safe.
 | Prebuilt binary | nothing | end users |
 | `cargo install --features static-hdf5` | CMake + C compiler | source installs, any distro |
 | `cargo build` (default) | system libhdf5 + pkg-config | day-to-day development |
+| `nix run` / `nix profile install` | nix | nix users |
 | Nix dev shell | nix | contributors |
 
 ### 1. Prebuilt binary (recommended)
@@ -58,7 +59,19 @@ The default build (no `static-hdf5` feature) links a libhdf5 that is already ins
 cd tessera && cargo build --release -p tessera-cli
 ```
 
-### 4. Nix dev shell (contributors)
+### 4. Nix (run, or install onto PATH)
+
+The flake exposes `tessera` as a package, so nix users get a first-class install path without touching
+cargo-dist's binaries. Nix supplies the entire runtime closure (including libhdf5), so nothing is
+vendored and the build is reproducible by construction:
+
+```bash
+nix run     github:vig-os/tessera -- inspect study.tsra   # run without installing
+nix profile install github:vig-os/tessera                 # put `tessera` on PATH
+nix build   github:vig-os/tessera#wheel                   # the reproducible Python wheel (below)
+```
+
+### 5. Nix dev shell (contributors)
 
 The repository is Nix-managed; the dev shell pins the exact toolchain and every native dependency
 (hdf5, zstd, …):
@@ -67,6 +80,24 @@ The repository is Nix-managed; the dev shell pins the exact toolchain and every 
 direnv allow          # or: nix develop
 cd tessera && cargo test
 ```
+
+## Python
+
+The `tessera` Python package — read / verify / write `.tsra`, returning NumPy arrays and
+polars/pyarrow tables — is a pure [pyo3](https://pyo3.rs) `abi3` extension with **no** native
+dependencies of its own (it does not link libhdf5). One `abi3` wheel therefore serves CPython ≥ 3.9.
+Build the reproducible wheel with nix:
+
+```bash
+nix build github:vig-os/tessera#wheel      # → result/tessera-*-cp39-abi3-linux_<arch>.whl
+pip install result/*.whl                   # needs a libstdc++ on the loader path
+```
+
+The nix-built wheel carries the honest `linux_<arch>` platform tag — it is **not** yet a `manylinux`
+wheel, so it is not PyPI-uploadable as-is; running it through `auditwheel repair` (or building it in a
+`manylinux` image) is a tracked follow-up. It installs and imports today in any compatible-glibc
+environment — the `tessera-wheel-import` flake check proves it (pip-install + smoke test through the
+packaged wheel).
 
 ## Why bundling HDF5 can't affect your data
 

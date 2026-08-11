@@ -55,7 +55,15 @@ cargo install --git https://github.com/vig-os/tessera --features static-hdf5 tes
 cd tessera && cargo build --release -p tessera-cli    # needs libhdf5 + pkg-config installed
 ```
 
-**4. Nix dev shell (contributors)** — pins the whole toolchain + native deps (hdf5/zstd/…):
+**4. Nix (run, or install onto PATH)** — the flake exposes `tessera` as a package; nix supplies the
+whole runtime closure (incl. libhdf5), so nothing is vendored and builds are reproducible:
+
+```bash
+nix run     github:vig-os/tessera -- inspect study.tsra   # run without installing
+nix profile install github:vig-os/tessera                 # put `tessera` on PATH
+```
+
+**5. Nix dev shell (contributors)** — pins the whole toolchain + native deps (hdf5/zstd/…):
 
 ```bash
 direnv allow          # or: nix develop
@@ -65,6 +73,20 @@ cd tessera && cargo test
 *Why bundled HDF5 is safe:* HDF5 is a read-only *input* format — Tessera re-encodes everything to
 Zarr+pcodec / Vortex on write, so the libhdf5 build is never in a sealed `.tsra`'s byte-path and can
 never affect a `content_hash`.
+
+### Python
+
+The `tessera` Python package (read / verify / write `.tsra`, returning NumPy arrays and
+polars/pyarrow tables) is a pure [pyo3](https://pyo3.rs) `abi3` extension — one wheel serves CPython
+≥ 3.9. Build the reproducible wheel with nix:
+
+```bash
+nix build github:vig-os/tessera#wheel      # → result/tessera-*-cp39-abi3-linux_<arch>.whl
+pip install result/*.whl                   # needs a libstdc++ on the loader path
+```
+
+(The nix-built wheel is a `linux_<arch>` wheel, not yet `manylinux` — auditwheel/manylinux repair for
+a PyPI upload is a tracked follow-up. It installs and imports today in any compatible-glibc env.)
 
 ## Quickstart
 
