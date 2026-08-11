@@ -133,6 +133,12 @@
           Version: ${pyVersion}
           Summary: FAIR data products — read / verify / write .tsra from Python (pyo3, abi3)
           License: Apache-2.0
+          Home-page: https://github.com/vig-os/tessera
+          Project-URL: Source, https://github.com/vig-os/tessera
+          Project-URL: Documentation, https://github.com/vig-os/tessera#readme
+          Classifier: License :: OSI Approved :: Apache Software License
+          Classifier: Programming Language :: Python :: 3
+          Classifier: Programming Language :: Rust
           Requires-Python: >=3.9
           Requires-Dist: numpy
           Provides-Extra: tables
