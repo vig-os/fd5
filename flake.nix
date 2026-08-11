@@ -90,6 +90,67 @@
           cargoExtraArgs = "-p tessera-cli --features cloud";
           doCheck = false;
         });
+
+        # The installable `tessera` CLI (the nix-native distribution channel — `nix run` /
+        # `nix profile install`, complementing cargo-dist's prebuilt binaries for non-nix users).
+        # Default features: libhdf5 comes from the nix closure (buildInputs), so — unlike the
+        # cargo-dist binaries — this does NOT need the `static-hdf5` vendored build; nix ships hdf5
+        # in the runtime closure. Reproducible by construction. `mainProgram` lets `nix run` resolve
+        # the binary name (`tessera`) without an explicit `#`-attr.
+        tessera-cli = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "tessera-cli";
+          cargoExtraArgs = "-p tessera-cli";
+          doCheck = false;
+          meta.mainProgram = "tessera";
+        });
+
+        # The reproducible tessera-py Python wheel (#210). tessera-py is a pure pyo3/abi3 extension
+        # with NO native deps (tessera-core + tessera-io only — no libhdf5), so the wheel is just the
+        # crane-built `_native.so` + the pure-Python `tessera/` wrapper, assembled and `wheel pack`ed.
+        # abi3-py39 → one wheel serves CPython ≥3.9 (tag `cp39-abi3`). The platform tag is the honest
+        # `linux_<arch>` — this is a nix build, not a manylinux one; auditwheel/manylinux repair for a
+        # PyPI upload is a deliberate follow-up (the wheel installs & imports in a compatible-glibc env
+        # today, which the `tessera-wheel-import` check proves).
+        tessera-wheel = let
+          pyVersion = "0.1.0a1"; # PEP 440 form of the workspace 0.1.0-alpha.1
+          arch = pkgs.stdenv.hostPlatform.parsed.cpu.name; # x86_64 / aarch64
+          wheelName = "tessera-${pyVersion}-cp39-abi3-linux_${arch}.whl";
+        in
+        pkgs.runCommand "tessera-wheel-${pyVersion}"
+          {
+            nativeBuildInputs = [ (pkgs.python312.withPackages (ps: [ ps.wheel ])) ];
+            passthru = { inherit wheelName; };
+          } ''
+          root=$PWD/wheel
+          mkdir -p "$root/tessera" "$root/tessera-${pyVersion}.dist-info"
+          cp -r ${./tessera/crates/tessera-py/python/tessera}/. "$root/tessera/"
+          cp ${tessera-py-lib}/lib/_native.so "$root/tessera/_native.so"
+
+          cat > "$root/tessera-${pyVersion}.dist-info/METADATA" <<EOF
+          Metadata-Version: 2.1
+          Name: tessera
+          Version: ${pyVersion}
+          Summary: FAIR data products — read / verify / write .tsra from Python (pyo3, abi3)
+          License: Apache-2.0
+          Requires-Python: >=3.9
+          Requires-Dist: numpy
+          Provides-Extra: tables
+          Requires-Dist: polars ; extra == 'tables'
+          Requires-Dist: pyarrow ; extra == 'tables'
+          EOF
+
+          cat > "$root/tessera-${pyVersion}.dist-info/WHEEL" <<EOF
+          Wheel-Version: 1.0
+          Generator: tessera-nix
+          Root-Is-Purelib: false
+          Tag: cp39-abi3-linux_${arch}
+          EOF
+
+          # `wheel pack` (re)generates the RECORD (sha256 + size per file) and zips deterministically.
+          mkdir -p "$out"
+          python -m wheel pack --dest-dir "$out" "$root"
+        '';
       in
       {
         # guardrails.mkDevShell brings the governance toolbelt (prek + gates + gitleaks +
@@ -150,6 +211,27 @@
             echo "[tessera] rust $(rustc --version 2>/dev/null | cut -d' ' -f2) · python ${pkgs.python312.version} · uv $(uv --version 2>/dev/null | cut -d' ' -f2)"
             echo "[tessera] cargo workspace lives in ./tessera  (cd tessera && cargo test)"
           '';
+        };
+
+        # ── Installable artifacts (the nix-native distribution channel). ──
+        #    `nix run github:vig-os/tessera`         → run the CLI without installing
+        #    `nix profile install github:vig-os/tessera` → install `tessera` onto PATH
+        #    `nix build .#wheel`                      → the reproducible tessera-py wheel
+        #    Complements cargo-dist's prebuilt binaries (which target non-nix users); here nix
+        #    supplies the whole runtime closure (incl. libhdf5), so these need no vendored static build.
+        packages = {
+          default = tessera-cli;
+          tessera = tessera-cli;
+          tessera-cloud = tessera-cli-cloud;
+          wheel = tessera-wheel;
+        };
+
+        apps = rec {
+          default = tessera;
+          tessera = flake-utils.lib.mkApp {
+            drv = tessera-cli;
+            name = "tessera";
+          };
         };
 
         # ── CI = a shim over `nix flake check`. The logic lives HERE so the exact same command
@@ -423,6 +505,25 @@
             cp -r ${./tessera/crates/tessera-py/python/tessera}/. tessera/
             cp ${tessera-py-lib}/lib/_native.so tessera/_native.so
             export PYTHONPATH=$PWD
+            python3 ${./tessera/crates/tessera-py/tests/smoke.py} ${./tessera/corpus/files}
+            touch $out
+          '';
+
+          # The RELEASE wheel (packages.wheel) must be pip-installable AND functional — not just the
+          # raw `_native.so` (that's tessera-py-import above). Installs the actual `.whl` into a target
+          # dir, then runs the same smoke test through it. Proves the assembled wheel's layout + RECORD
+          # + metadata are valid and importable. `LD_LIBRARY_PATH` supplies libstdc++ (the nix-built
+          # extension needs it — the same reason the wheel isn't manylinux-portable until auditwheel'd).
+          tessera-wheel-import = pkgs.runCommand "tessera-wheel-import"
+            {
+              nativeBuildInputs =
+                [ (pkgs.python312.withPackages (ps: [ ps.numpy ps.polars ps.pyarrow ps.pip ])) ];
+            } ''
+            export HOME=$TMPDIR
+            python3 -m pip install --no-index --no-deps --target=$TMPDIR/site \
+              ${tessera-wheel}/${tessera-wheel.wheelName}
+            export PYTHONPATH=$TMPDIR/site
+            export LD_LIBRARY_PATH=${pkgs.stdenv.cc.cc.lib}/lib
             python3 ${./tessera/crates/tessera-py/tests/smoke.py} ${./tessera/corpus/files}
             touch $out
           '';
