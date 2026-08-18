@@ -74,6 +74,8 @@ cd tessera && cargo test
 Zarr+pcodec / Vortex on write, so the libhdf5 build is never in a sealed `.tsra`'s byte-path and can
 never affect a `content_hash`.
 
+> **Consuming Tessera from another repo?** See [docs/CONSUMING.md](docs/CONSUMING.md) — git/flake refs while the crates.io/PyPI release stays held.
+
 ### Python
 
 The `tessera` Python package (read / verify / write `.tsra`, returning NumPy arrays and
