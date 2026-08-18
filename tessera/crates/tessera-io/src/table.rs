@@ -2203,18 +2203,14 @@ mod tests {
         };
         let encoded = encode(&spec, &data).unwrap();
         let raw = N * std::mem::size_of::<f64>();
-        let ratio = encoded.len() as f64 / raw as f64;
-        eprintln!(
-            "[#380] f64 table block: encoded={} raw={} ratio={ratio:.3}",
-            encoded.len(),
-            raw
-        );
-        // The raw fall-through was ~1.0006x; Pco compresses a smooth monotone column far below that.
-        // Bound kept comfortably above the observed ratio so it guards the regression without being
-        // brittle to Pco-version drift.
+        // The raw fall-through was ~1.0006x; Pco compresses a smooth monotone column far below that
+        // (measured ~0.12x). Bound kept comfortably above the observed ratio so it guards the
+        // regression without being brittle to Pco-version drift.
         assert!(
             encoded.len() < raw * 7 / 10,
-            "f64 column not compressed — Pco unregistered? (#380): ratio={ratio:.3}"
+            "f64 column not compressed — Pco unregistered? (#380): {} of {raw} raw bytes ({:.3}x)",
+            encoded.len(),
+            encoded.len() as f64 / raw as f64
         );
         // Exact round-trip still holds.
         let back = decode(&spec, &encoded).unwrap();
