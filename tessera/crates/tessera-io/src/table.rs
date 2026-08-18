@@ -46,7 +46,7 @@ use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::ExecutionCtx;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex_btrblocks::schemes::float::{ALPRDScheme, ALPScheme};
+use vortex_btrblocks::schemes::float::{ALPRDScheme, ALPScheme, PcoScheme};
 use vortex_btrblocks::{BtrBlocksCompressorBuilder, SchemeExt};
 use vortex_buffer::{Buffer, ByteBuffer, ByteBufferMut};
 use vortex_file::{
@@ -797,17 +797,36 @@ pub fn block_name(prefix: &str, idx: u64, total: u64) -> String {
 
 /// Encode columns into the deterministic table-block payload bytes for `spec`.
 ///
+/// The deterministic table compressor, shared by the batch and streaming encoders so they stay
+/// byte-identical (there is one encoder).
+///
+/// - **ALP / ALPRD excluded** — their exponent search runs float arithmetic whose result varies with
+///   the build profile's float codegen (opt-level / FMA), so they'd encode the same column to
+///   different bytes under different compilers — fatal for content-addressing.
+/// - **Pco registered** via [`with_new_scheme`](BtrBlocksCompressorBuilder::with_new_scheme) (it is
+///   `#[cfg(feature = "pco")]`-gated and *not* in `ALL_SCHEMES`, so it must be added explicitly).
+///   Pco is a deterministic numeric codec — the same family that carries the array path, already
+///   proven byte-reproducible x86==ARM by the cross-arch conformance gate — so continuous float
+///   columns compress instead of falling through to flat/raw (issue #380). Integer schemes, chosen by
+///   exact integer math, are untouched.
+fn deterministic_table_compressor() -> BtrBlocksCompressorBuilder {
+    BtrBlocksCompressorBuilder::default()
+        .exclude_schemes([ALPScheme.id(), ALPRDScheme.id()])
+        .with_new_scheme(&PcoScheme)
+}
+
 /// The table is written as a **chunked** Vortex file: the columns are sliced into fixed
 /// [`ROWS_PER_GROUP`] row-groups and streamed as chunks. The grid is fixed, so the bytes are a pure
 /// function of the data (batch and streaming produce the *same* bytes — there is one encoder).
 ///
-/// **ALP float-encoding is excluded** from the write strategy: Vortex's ALP codec searches for a
-/// float exponent via float arithmetic, whose result varies with the *build profile's* float codegen
-/// (opt-level / FMA contraction), so the same float columns would encode to different bytes under
-/// different compilers — fatal for a content-addressed format. With ALP excluded, floats fall back to
-/// flat `Primitive` (raw little-endian, codegen-independent) while integer encodings (Sequence/FoR/…,
-/// chosen by exact integer math) remain. The payload is then a pure function of the logical data
-/// (cross-environment deterministic).
+/// **Float columns use Pco, not ALP** (see [`deterministic_table_compressor`]): Vortex's ALP codec
+/// searches for a float exponent via float arithmetic, whose result varies with the *build profile's*
+/// float codegen (opt-level / FMA contraction), so the same float columns would encode to different
+/// bytes under different compilers — fatal for a content-addressed format. ALP is excluded; Pco
+/// (a deterministic numeric codec, and the same family already used on the array path) is registered
+/// in its place so continuous floats actually compress. Integer encodings (Sequence/FoR/…, chosen by
+/// exact integer math) remain. The payload is a pure function of the logical data (cross-environment
+/// deterministic — proven by the cross-arch conformance gate).
 pub fn encode(spec: &TableSpec, data: &TableData) -> Result<Vec<u8>> {
     validate(spec, data)?;
     let (rt, s) = runtime_session();
@@ -827,12 +846,8 @@ pub fn encode(spec: &TableSpec, data: &TableData) -> Result<Vec<u8>> {
         })
         .collect::<Result<_>>()?;
     let chunked = ChunkedArray::from_iter(chunks).into_array();
-    // Exclude the ALP float schemes from the compressor so it never *chooses* them; floats then use
-    // the deterministic Pco/flat schemes. Integer schemes (chosen by exact integer math) are kept.
-    let compressor =
-        BtrBlocksCompressorBuilder::default().exclude_schemes([ALPScheme.id(), ALPRDScheme.id()]);
     let strategy = WriteStrategyBuilder::default()
-        .with_btrblocks_builder(compressor)
+        .with_btrblocks_builder(deterministic_table_compressor())
         .build();
     let mut buf = ByteBufferMut::empty();
     rt.block_on(
@@ -950,10 +965,8 @@ where
     });
     let array_iter = ArrayIteratorAdapter::new(dtype, chunk_iter);
 
-    let compressor =
-        BtrBlocksCompressorBuilder::default().exclude_schemes([ALPScheme.id(), ALPRDScheme.id()]);
     let strategy = WriteStrategyBuilder::default()
-        .with_btrblocks_builder(compressor)
+        .with_btrblocks_builder(deterministic_table_compressor())
         .build();
     let mut buf = ByteBufferMut::empty();
     rt.block_on(
@@ -2168,6 +2181,43 @@ mod tests {
         for (a, b) in gb.iter().zip(&f8) {
             assert_eq!(a.to_bits(), b.to_bits(), "f64 bit pattern diverged");
         }
+    }
+
+    #[test]
+    fn f64_column_is_compressed_by_pco_not_stored_raw() {
+        // Regression guard for #380. A high-cardinality continuous f64 column (a physics-like energy
+        // grid spanning many orders of magnitude — the shape that surfaced the bug) must be
+        // compressed by the registered Pco scheme, not fall through to flat/raw. Before Pco was
+        // registered, excluding ALP left floats with NO applicable scheme and the block was
+        // byte-for-byte the raw payload (measured +0.06%). Also confirms exact round-trip.
+        const N: usize = 200_000;
+        let (lo, hi) = (1e-5f64, 2e8f64); // 13 orders of magnitude, monotone increasing
+        let energy: Vec<f64> = (0..N)
+            .map(|i| lo * (hi / lo).powf(i as f64 / (N as f64 - 1.0)))
+            .collect();
+        let data: TableData = vec![("energy_ev".into(), ColumnData::F64(energy.clone()))];
+        let spec = TableSpec {
+            columns: vec![col("energy_ev", "f8")],
+            rows: N as u64,
+            row_index: None,
+        };
+        let encoded = encode(&spec, &data).unwrap();
+        let raw = N * std::mem::size_of::<f64>();
+        // The raw fall-through was ~1.0006x; Pco compresses a smooth monotone column far below that
+        // (measured ~0.12x). Bound kept comfortably above the observed ratio so it guards the
+        // regression without being brittle to Pco-version drift.
+        assert!(
+            encoded.len() < raw * 7 / 10,
+            "f64 column not compressed — Pco unregistered? (#380): {} of {raw} raw bytes ({:.3}x)",
+            encoded.len(),
+            encoded.len() as f64 / raw as f64
+        );
+        // Exact round-trip still holds.
+        let back = decode(&spec, &encoded).unwrap();
+        let ColumnData::F64(g) = &back[0].1 else {
+            panic!("expected F64 column back")
+        };
+        assert_eq!(g, &energy);
     }
 
     #[test]
