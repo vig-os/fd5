@@ -80,3 +80,8 @@ trycmd = "0.15"
 # elided; the dev-dep crates still build, but they're already cached from tessera-io's graph.
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
 tokio = { version = "1", features = ["rt"] }
+
+# Reset the SIGPIPE disposition at startup (main.rs) so `tessera … | head` terminates quietly like a
+# standard Unix tool instead of erroring on the closed pipe. Unix-only; already in the dep tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

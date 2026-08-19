@@ -867,6 +867,16 @@ enum IngestSrc {
 }
 
 fn main() -> ExitCode {
+    // Restore the default SIGPIPE disposition so piping tessera's output into `head`, `less`, etc.
+    // terminates it quietly — like every standard Unix tool — instead of erroring. Rust's runtime
+    // sets SIGPIPE to SIG_IGN, which turns a reader closing the pipe into a `Broken pipe` write error
+    // on the streaming subcommands (`read`/`slice`/`project`) rather than a clean exit.
+    #[cfg(unix)]
+    // SAFETY: run once at startup before any thread is spawned; resetting a signal disposition to the
+    // OS default is sound.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // Surface library WARNs (e.g. the ingest engine's recommended-field nudge) on stderr. Quiet
     // (warn+ only), compact + timestamp-free so it reads as CLI output rather than a log.
     let _ = tracing_subscriber::fmt()
