@@ -23,8 +23,10 @@ opaque blob. It does **not** replace `blob`; blob stays the explicit fallback fo
 ## Current state (what exists — do not rebuild)
 
 - **Primitives** the ingest must target:
-  - **Table** = **flat, typed columns only** (`ColumnData`: `I8 I16 I32 I64 U8 U16 U32 U64 F32 F64 Bool
-    Utf8 Nullable`). **No nested types** (no List / Struct / Map). Encoded to Vortex (btrblocks;
+  - **Table** = **flat, typed columns only** — the runtime `ColumnData` enum (`tessera-io/src/table.rs`):
+    `I8 I16 I32 I64 U8 U16 U32 U64 F32 F64 Bool Utf8 Nullable`; the manifest's `Column`
+    (`tessera-core/src/block/table.rs`) likewise carries only a string `dtype`, no nested escape. **No
+    nested types** (no List / Struct / Map). Encoded to Vortex (btrblocks;
     ALP-excluded + Pco-registered for float determinism, #380/#384; grid-parallel decode #352/#385).
   - **Array** = dense **N-D** numeric grid → Zarr v3 + pcodec (64³ chunks, sharded ROI). Codec selectable
     (`pcodec` default / `zstd` / `auto`).
@@ -54,11 +56,17 @@ opaque blob. It does **not** replace `blob`; blob stays the explicit fallback fo
    re-encode**: `source → Arrow/ndarray → Tessera columns/array → re-encode via the shape's primitive →
    seal`. Re-encoding is the *point*: Tessera imports the *logical values* and re-seals them under its own
    **deterministic** codecs (a byte-copy would import the source's non-deterministic encoding and defeat
-   the seal). The flat-type constraint (Decision from "Current state") is the boundary: nested/exotic
+   the seal). The flat-type constraint (see "Current state") is the boundary: nested/exotic
    source columns → flatten if trivial, else fall back to `blob`.
 5. **The "previous format is misused" case is a FEATURE, not a bug to hide.** People dump a flattened
    volume into Parquet rows, or a table into an HDF5 2-D dataset. Ingest must not *perpetuate* the misuse
    silently; the `analyze`/`--as` mechanism is exactly where Tessera adds judgment at the door.
+6. **Dispatch: spec-first, CLI verbs are thin wrappers.** A generic backend registers in the
+   `tessera-ingest` engine the *same way the vendor ones do* — a `format = "parquet"` backend under the
+   declarative `--spec` engine (ADR-0035; the GE listmode path is already spec-driven, not bespoke Rust).
+   The new `tessera ingest table/array …` CLI verbs are thin front-ends that build a one-product spec and
+   run it through that engine. So there is **one** ingest code path; the CLI is sugar, not a second
+   subsystem. (Prevents the "new subcommand vs new spec backend" fork.)
 
 ## Format → default primitive (heuristic, always overridable with `--as`)
 
@@ -84,12 +92,17 @@ opaque blob. It does **not** replace `blob`; blob stays the explicit fallback fo
 4. **CSV type inference** — build it now or **defer**? Recommendation: **phase it later** — start with the
    self-describing formats (Parquet/NumPy/NIfTI) where dtypes are explicit and there's no guessing, so v1
    ships without an inference-heuristics rabbit hole.
-5. **Schema attachment** — which `ProductSchema` does a generic ingest stamp? A permissive builtin
-   `table`/`array`? User-declarable via `--schema`? Fields' sensitivity tiers (ADR-0040) — default `public`?
+5. **Schema attachment (⚠ Phase-1 blocker)** — which `ProductSchema` does a generic ingest stamp? A
+   permissive builtin `table`/`array`? User-declarable via `--schema`? Fields' sensitivity tiers
+   (ADR-0040) — default `public`? **This gates Phase 1**: shipping generic ingest without a decided
+   schema/tier default silently leaks unclassified fields, so resolve it before, not after, Phase 1.
 6. **NIfTI affine** → ADR-0030 referencing: how much of the world-frame do we carry on ingest v1?
-7. **Determinism** — the re-encode must be cross-arch byte-reproducible. Tessera's own codecs already are
-   (conformance gate); the risk is the *source decode* (Arrow/parquet/nifti reader) leaking arch-dependent
-   values — verify a parquet→tsra round-trip is byte-identical x86==ARM (add to the corpus/gate).
+7. **Determinism + decoder crate choice** — the re-encode must be cross-arch byte-reproducible. Tessera's
+   own codecs already are (conformance gate); the risk is the *source decode* leaking arch-dependent
+   values. This depends on the reader crate, so pick + pin them here: candidates are **arrow-rs**
+   (`arrow`/`parquet` — Tessera already pulls Arrow via Vortex, so lowest new surface) for Parquet/Arrow,
+   **ndarray-npy** for NumPy, **nifti** (nifti-rs) for NIfTI, **tiff** for TIFF. Add a parquet→tsra
+   round-trip to the corpus/cross-arch gate.
 
 ## Plan (once the open questions are resolved → /land)
 
