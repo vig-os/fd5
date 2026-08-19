@@ -1,8 +1,15 @@
 # Spike — generic ingest: mapping foreign data into Tessera primitives (#386)
 
-> **Status:** design note for a `/spike`, written to be resumed in **fresh context** — a new agent should
-> be able to execute from this file + issue #386 alone, without the originating conversation. Read the
-> "Current state", then the "Decisions (locked)", then resolve the "Open questions", then follow "Plan".
+> **⚠ SUPERSEDED by [ADR-0056](../adr/0056-generic-ingest-normalise-vs-preserve.md)** (the decision).
+> This is the exploration note that *seeded* the spike; the spike's parallel-review panel refined and in
+> places overrode it — **where they differ, ADR-0056 wins.** Notably: ADR-0056 **rejects** the
+> "lossy-map-with-warning" lane floated below (a warning doesn't travel with the seal, and sealing
+> degraded values asserts they're the truth), replacing it with *lossless-with-a-transform-recorded-in-
+> the-seal*; and it settles the open questions (spec-first dispatch, arrow→primitive determinism gate,
+> the four+one additive `Column` fields, CSV/TIFF/auto-detect deferred). Kept only as the design trail.
+>
+> **Status (original):** design note for a `/spike`, resumable in fresh context — read "Current state",
+> "Decisions", "Open questions", "Plan". (The Open questions are now answered in ADR-0056.)
 
 ## TL;DR
 
