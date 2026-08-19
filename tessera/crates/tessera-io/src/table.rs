@@ -1082,10 +1082,23 @@ fn materialise(s: &VortexSession, chunks: &[StructArray], cols: &mut [ColumnData
     // handles the variable-width / bit-packed / dual-vector cases and is already parallel across
     // columns; those shapes are rare in the wide-numeric listmode tables this grid targets.
     if is_grid_eligible(cols) {
+        #[cfg(test)]
+        GRID_DECODES.with(|c| c.set(c.get() + 1));
         materialise_grid(s, chunks, cols, cores)
     } else {
         materialise_with(s, chunks, cols, cores.min(ncols))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only observability: per-thread count of how many times [`materialise`] routed to the
+    /// numeric grid path. Tests gate the *routing* (a large numeric table must take the grid; a small
+    /// or Bool/Utf8/Nullable one must not) without relying on timing — a non-flaky drift guard
+    /// against the grid being silently disabled or the eligibility/threshold logic regressing. It is
+    /// thread-local (not a global atomic) because the increment runs on the synchronous caller's
+    /// thread, so it stays correct even though cargo runs tests in parallel.
+    pub(crate) static GRID_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The grid decode path applies when every column is a plain fixed-width numeric vector (no
@@ -2395,6 +2408,199 @@ mod tests {
         assert_eq!(
             grid, serial,
             "grid decode diverged from serial column decode"
+        );
+    }
+
+    #[test]
+    fn grid_decode_covers_every_numeric_dtype_and_edges() {
+        // Exercise EVERY `push_grid!` arm — all 10 numeric dtypes — through the grid, at two edge
+        // shapes: a partial-tail row-group and an exact multiple of ROWS_PER_GROUP. Values use
+        // truncating `as` / `wrapping_mul` so there is no debug-mode overflow. Grid (auto) must be
+        // bit-identical to the input and to the serial column path, and must actually take the grid.
+        for rows in [ROWS_PER_GROUP * 2 + 777, ROWS_PER_GROUP * 3] {
+            let data: TableData = vec![
+                (
+                    "i1".into(),
+                    ColumnData::I8((0..rows).map(|k| k as i8).collect()),
+                ),
+                (
+                    "i2".into(),
+                    ColumnData::I16((0..rows).map(|k| (k as i16).wrapping_mul(7)).collect()),
+                ),
+                (
+                    "i4".into(),
+                    ColumnData::I32((0..rows).map(|k| k as i32 - 5).collect()),
+                ),
+                (
+                    "i8".into(),
+                    ColumnData::I64((0..rows).map(|k| (k as i64).wrapping_mul(11)).collect()),
+                ),
+                (
+                    "u1".into(),
+                    ColumnData::U8((0..rows).map(|k| k as u8).collect()),
+                ),
+                (
+                    "u2".into(),
+                    ColumnData::U16((0..rows).map(|k| k as u16).collect()),
+                ),
+                (
+                    "u4".into(),
+                    ColumnData::U32(
+                        (0..rows)
+                            .map(|k| (k as u32).wrapping_mul(2654435761))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "u8".into(),
+                    ColumnData::U64(
+                        (0..rows)
+                            .map(|k| (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "f4".into(),
+                    ColumnData::F32((0..rows).map(|k| k as f32 * 0.5).collect()),
+                ),
+                (
+                    "f8".into(),
+                    ColumnData::F64((0..rows).map(|k| k as f64 * 1e-6).collect()),
+                ),
+            ];
+            let spec = TableSpec {
+                columns: data.iter().map(|(n, c)| col(n, c.numpy_code())).collect(),
+                rows: rows as u64,
+                row_index: None,
+            };
+            let blob = encode(&spec, &data).unwrap();
+            GRID_DECODES.with(|c| c.set(0));
+            let grid = decode(&spec, &blob).unwrap();
+            assert!(
+                GRID_DECODES.with(|c| c.get()) >= 1,
+                "rows={rows}: decode did not take the grid path"
+            );
+            let serial = decode_with_workers(&spec, &blob, 1).unwrap();
+            assert_eq!(grid, data, "rows={rows}: grid decode != input");
+            assert_eq!(
+                grid, serial,
+                "rows={rows}: grid decode != serial column decode"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_routing_is_gated_by_size_and_dtype() {
+        // Non-flaky drift guard on the ROUTING predicate (thread-local counter, no timing): a large
+        // all-numeric table must take the grid; a small one (below PARALLEL_MATERIALISE_MIN_VALUES)
+        // and a mixed-type one (a Bool present → not grid-eligible) must NOT.
+        let numeric = |rows: usize| -> (TableSpec, TableData) {
+            let data: TableData = vec![
+                (
+                    "a".into(),
+                    ColumnData::F64((0..rows).map(|k| k as f64).collect()),
+                ),
+                ("b".into(), ColumnData::I64((0..rows as i64).collect())),
+                ("c".into(), ColumnData::U32((0..rows as u32).collect())),
+            ];
+            let spec = TableSpec {
+                columns: data.iter().map(|(n, c)| col(n, c.numpy_code())).collect(),
+                rows: rows as u64,
+                row_index: None,
+            };
+            (spec, data)
+        };
+        let took_grid = |spec: &TableSpec, blob: &[u8]| -> usize {
+            GRID_DECODES.with(|c| c.set(0));
+            let _ = decode(spec, blob).unwrap();
+            GRID_DECODES.with(|c| c.get())
+        };
+
+        let big = ROWS_PER_GROUP * 6; // ×3 cols > 2^20 threshold
+        let (spec_b, data_b) = numeric(big);
+        let blob_b = encode(&spec_b, &data_b).unwrap();
+        assert!(
+            took_grid(&spec_b, &blob_b) >= 1,
+            "large numeric table must take the grid"
+        );
+
+        let (spec_s, data_s) = numeric(128);
+        let blob_s = encode(&spec_s, &data_s).unwrap();
+        assert_eq!(
+            took_grid(&spec_s, &blob_s),
+            0,
+            "small table must stay serial, not grid"
+        );
+
+        let mut data_m = data_b.clone();
+        data_m.push((
+            "flag".into(),
+            ColumnData::Bool((0..big).map(|k| k % 2 == 0).collect()),
+        ));
+        let spec_m = TableSpec {
+            columns: data_m.iter().map(|(n, c)| col(n, c.numpy_code())).collect(),
+            rows: big as u64,
+            row_index: None,
+        };
+        let blob_m = encode(&spec_m, &data_m).unwrap();
+        assert_eq!(
+            took_grid(&spec_m, &blob_m),
+            0,
+            "mixed-type (Bool) table must use the column fallback, not the grid"
+        );
+    }
+
+    #[test]
+    fn grid_decode_perf_ratchet_narrow_table() {
+        // Coarse performance drift floor (#352): the grid must actually parallelise a NARROW table —
+        // i.e. it must NOT collapse back to serial speed. Relative (machine-independent): the auto
+        // (grid) decode of a 2-column table must beat the 1-worker column-serial decode by a generous
+        // margin, best-of-N. Gated at >=8 cores on purpose: it runs on dev machines with headroom
+        // (a real perf guard) and is SKIPPED on the small, build-saturated CI runners where a timing
+        // assertion would be flaky. The non-flaky CI guard is the *routing* test
+        // (`grid_routing_is_gated_by_size_and_dtype`); absolute-throughput tracking belongs in a
+        // dedicated perf job, not a unit gate.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if cores < 8 {
+            return;
+        }
+        let rows = 4_000_000usize;
+        let data: TableData = vec![
+            (
+                "a".into(),
+                ColumnData::F64((0..rows).map(|k| k as f64 * 1e-6).collect()),
+            ),
+            ("b".into(), ColumnData::I64((0..rows as i64).collect())),
+        ];
+        let spec = TableSpec {
+            columns: data.iter().map(|(n, c)| col(n, c.numpy_code())).collect(),
+            rows: rows as u64,
+            row_index: None,
+        };
+        let blob = encode(&spec, &data).unwrap();
+        let best = |run: &dyn Fn()| -> f64 {
+            let mut m = f64::MAX;
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                run();
+                m = m.min(t.elapsed().as_secs_f64());
+            }
+            m
+        };
+        let _ = decode(&spec, &blob).unwrap(); // warm
+        let grid = best(&|| {
+            decode(&spec, &blob).unwrap();
+        });
+        let serial = best(&|| {
+            decode_with_workers(&spec, &blob, 1).unwrap();
+        });
+        let speedup = serial / grid;
+        assert!(
+            speedup > 1.2,
+            "grid decode not parallelising a narrow table: {speedup:.2}× vs 1-worker serial \
+             (regression — grid path disabled, serialised, or the zero-fill returned?)"
         );
     }
 
