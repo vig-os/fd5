@@ -1193,7 +1193,10 @@ fn materialise_grid(
             // tasks below cover every one of the `total` rows and each writes its slice exactly once
             // before any read, so exposing `total` uninitialised slots here — instead of a full
             // zero-fill of the output, which would waste the very memory bandwidth this path is
-            // optimising — is sound. On a task error we return `Err` and never read the vector.
+            // optimising — is sound. Caller invariant on error: if any task returns `Err`, this
+            // function returns `Err` and the caller must discard `cols` without reading it (every
+            // current caller does — `decode_inner` drops it via `?`); the elements are `Copy`/no-`Drop`,
+            // so dropping a partially-written column never observes the uninitialised tail.
             unsafe {
                 v.set_len(total);
             }
