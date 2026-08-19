@@ -6,4 +6,5 @@ PN = "PN"      # DICOM value representation: Person Name
 OME = "OME"    # Open Microscopy Environment (OME-Zarr / OME-NGFF)
 
 [default.extend-identifiers]
-aspec = "aspec"   # "array spec" local (tessera-io sparse-encoding spike example)
+aspec = "aspec"     # "array spec" local (tessera-io sparse-encoding spike example)
+flate2 = "flate2"   # crates.io crate name (gzip/deflate) — typos reads the "flate" stem as "flat"

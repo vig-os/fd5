@@ -435,6 +435,55 @@ reorders it to `[z,y,x]`, converts RAS+→LPS and carries `scl_slope`/`scl_inter
    second-most-common neuroimaging shape. Either declare `[t,z,y,x]` with the time axis carried via
    ADR-0032 `axis_referencing`, or hard-error. Silently losing volumes is not an option.
 
+## §12 — Dependency and feature layout: gate the readers, but not because of bloat
+
+Measured against the workspace as it stands (729 packages in `Cargo.lock`):
+
+- **`arrow` is already in the tree** — 14 `arrow*` crates arrive via Vortex/DataFusion, so the Arrow
+  half of Parquet ingest costs **zero new dependencies**. `parquet` itself is absent and brings
+  `thrift`, `snap` and `brotli` (`lz4_flex`, `flate2` and `twox-hash` are already present).
+- **wasm is safe by construction** — `tessera-wasm` depends only on `tessera-core`, and only
+  `tessera-cli` depends on `tessera-ingest`. No decoder can reach the wasm graph or the pure-abi3
+  Python wheel. A `cargo tree` assertion in the `wasm-core` check keeps that true rather than
+  assumed.
+- **The existing importers are not gated at all** — `dicom` and `hdf5-metno` are unconditional
+  dependencies of `tessera-ingest`; the `static-hdf5` feature only switches how libhdf5 *links*, not
+  whether it compiles. They are also, by a wide margin, the expensive ones.
+
+So the new readers do not meaningfully bloat anything, and "bloat" is the wrong reason to gate them.
+They are gated anyway, for three reasons that do hold:
+
+1. **CI cost** — `--all-features` clippy is a gate, and the x86_64 flake check already runs ~90 min
+   with the static-HDF5 build in it. Every ungated reader is unconditionally in that build.
+2. **Supply-chain surface** — an embedder who never ingests Parquet should not have to audit
+   `thrift`/`snap`/`brotli` under `cargo deny`.
+3. **The determinism story (the load-bearing one)** — §6 seals `ingest_decoder`. A feature-gated
+   decoder makes *which decoders could have produced this artifact* a **build-time fact** rather than
+   a runtime accident, which is exactly the property the sealed decoder id is trying to buy.
+
+```toml
+[features]
+default        = ["ingest-parquet", "ingest-npy"]   # everything P1 ships, on
+ingest-parquet = ["dep:parquet", "dep:arrow"]       # arrow already in-tree via Vortex
+ingest-npy     = []                                 # in-tree header parser; no ndarray dep
+ingest-csv     = ["dep:arrow", "dep:csv"]           # P2 (§8)
+ingest-tiff    = ["dep:tiff"]                       # #394
+```
+
+Two constraints on the layout:
+
+- **A feature may decide whether a format is *readable*; it may never change how one *encodes*.**
+  Building without `ingest-parquet` must produce a clean "unsupported source format" error — never
+  different bytes for the same input. Feature selection is outside the sealed byte-path, the same way
+  `static-hdf5` is (HDF5 is read-only input and cannot move a `content_hash`).
+- **Defaults on for everything P1 ships.** A downloaded `tessera` that cannot read Parquet is a bad
+  binary; the gates exist for embedders and CI, not for end users. Release channels enable the full
+  set.
+
+`ndarray-npy` is deliberately **not** taken: NPY is a header parse plus a memcpy, and the crate would
+drag `ndarray` into the tree for one format. Retro-gating the existing `dicom` / `hdf5-metno`
+dependencies is out of scope here but is the larger prize, and is named for a future pass.
+
 ## Alternatives considered and rejected
 
 - **A byte-level Parquet→Vortex mapping.** Would import the source writer's non-deterministic
