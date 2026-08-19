@@ -1045,15 +1045,16 @@ fn extend_column(col: &mut ColumnData, prim: &PrimitiveArray) {
 /// spawns than it saves. Small tables stay exactly as serial as they were.
 const PARALLEL_MATERIALISE_MIN_VALUES: usize = 1 << 20;
 
-/// Decompress every column out of the already-scanned row-groups and copy it into the host
-/// accumulators — **column-parallel**.
+/// Decompress every column out of the already-scanned row-groups into the host accumulators, sizing
+/// the fan-out against the whole machine — this is where a full-materialise read spends its time
+/// (`examples/read_profile`: the field-decompress dominates; scan is ~2 %).
 ///
-/// This is where a full-materialise read spends its time (`examples/read_profile`: ~20 % Vortex
-/// decompress + ~78 % host copy, against ~2 % for the scan itself), and it parallelises perfectly:
-/// each column is touched by exactly one worker, and that worker walks the row-groups in order, so
-/// the output is **bit-identical** to a serial decode (asserted by
-/// `decode_is_bit_identical_across_thread_counts`). Measured 2.1× on a 10-core box for a
-/// 2 M-row × 21-column listmode table; the ceiling is memory bandwidth, not core count.
+/// Routes to one of two parallel strategies, both **bit-identical** to a serial decode:
+/// - **grid** ([`materialise_grid`]) for all-numeric tables — parallel over the (column × row-group)
+///   grid, so the fan-out is *not* capped at the column count. Measured on an 88-core box:
+///   a 4-column f64 table went 2.06× (804 → 1656 MB/s), reaching the same ~2 GB/s memory-bandwidth
+///   ceiling as a wide table instead of stalling at 4 workers.
+/// - **column** ([`materialise_with`]) as the fallback for Bool / Utf8 / Nullable shapes.
 ///
 /// The driver hands over already-scanned `chunks`, whose fields are still *encoded* views into the
 /// blob the caller already holds in memory — so this buys its parallelism without inflating the
@@ -1064,17 +1065,47 @@ fn materialise(s: &VortexSession, chunks: &[StructArray], cols: &mut [ColumnData
         return Ok(());
     }
     let values = chunks.iter().map(|c| c.len()).sum::<usize>() * ncols;
-    let threads = if values < PARALLEL_MATERIALISE_MIN_VALUES {
-        1
+    if values < PARALLEL_MATERIALISE_MIN_VALUES {
+        return materialise_with(s, chunks, cols, 1);
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    // GRID path (#352): for numeric columns, parallelise the decompress over the (column ×
+    // row-group) grid so the fan-out is NOT capped at the column count — a narrow (few-column)
+    // table can still use every core by splitting each column's row-groups across workers. Each
+    // (column, row-group) writes a DISJOINT offset slice of the pre-sized output, so there is no
+    // lock and no concat, and the result is bit-identical to a serial decode. Measured: a 4-column
+    // f64 table went from ~ncols-capped (stuck at 4 threads) to the memory-bandwidth ceiling.
+    //
+    // Bool / Utf8 / Nullable columns keep the column-parallel append path (`materialise_with`) — it
+    // handles the variable-width / bit-packed / dual-vector cases and is already parallel across
+    // columns; those shapes are rare in the wide-numeric listmode tables this grid targets.
+    if is_grid_eligible(cols) {
+        materialise_grid(s, chunks, cols, cores)
     } else {
-        // NB: sized against the whole machine. A caller that already decodes many blocks in
-        // parallel should decode each block on one thread rather than nest the fan-outs.
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(ncols)
-    };
-    materialise_with(s, chunks, cols, threads)
+        materialise_with(s, chunks, cols, cores.min(ncols))
+    }
+}
+
+/// The grid decode path applies when every column is a plain fixed-width numeric vector (no
+/// Bool/Utf8/Nullable) — the only shapes for which a disjoint offset-write is trivially correct.
+fn is_grid_eligible(cols: &[ColumnData]) -> bool {
+    cols.iter().all(|c| {
+        matches!(
+            c,
+            ColumnData::I8(_)
+                | ColumnData::I16(_)
+                | ColumnData::I32(_)
+                | ColumnData::I64(_)
+                | ColumnData::U8(_)
+                | ColumnData::U16(_)
+                | ColumnData::U32(_)
+                | ColumnData::U64(_)
+                | ColumnData::F32(_)
+                | ColumnData::F64(_)
+        )
+    })
 }
 
 /// [`materialise`] with the worker count pinned — the seam the equivalence test drives to prove
@@ -1121,6 +1152,104 @@ fn materialise_with(
         for h in handles {
             h.join()
                 .map_err(|_| Error::Codec("table decode worker panicked".into()))??;
+        }
+        Ok(())
+    })
+}
+
+/// A boxed disjoint-slice write task for the grid path. Each captures one row-group's *encoded*
+/// field plus the exact output sub-slice it fills, so tasks never alias and need no lock.
+type GridTask<'a> = Box<dyn FnOnce(&mut ExecutionCtx) -> Result<()> + Send + 'a>;
+
+/// Decode numeric columns across the **(column × row-group) grid** (see [`materialise`]). Pre-sizes
+/// each output column to the full row count, then writes each row-group's decompressed values into
+/// its own disjoint offset slice — so the fan-out ceiling is `columns × row-groups`, not `columns`.
+/// Bit-identical to a serial decode: every slice is written exactly once from exactly one row-group.
+// `clippy::uninit_vec`: the `reserve` + `set_len` below deliberately exposes uninitialised slots to
+// skip a zero-fill; it is sound because the tasks cover and overwrite every slot before any read (see
+// the SAFETY note), and the element types are `Copy` with no `Drop`. clippy cannot see that invariant.
+#[allow(clippy::uninit_vec)]
+fn materialise_grid(
+    s: &VortexSession,
+    chunks: &[StructArray],
+    cols: &mut [ColumnData],
+    threads: usize,
+) -> Result<()> {
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+
+    // Build the disjoint write tasks. `split_at_mut` carves each column's output into per-row-group
+    // sub-slices (proving disjointness to the borrow checker); each task owns its slice + the
+    // still-encoded field it decompresses into it.
+    let mut tasks: Vec<GridTask> = Vec::with_capacity(cols.len() * chunks.len());
+    // One task per (column, row-group): pre-size the column, then carve it into per-row-group
+    // sub-slices with `split_at_mut` (disjoint → no lock) and hand each slice + its still-encoded
+    // field to a task that decompresses straight into place.
+    macro_rules! push_grid {
+        ($v:expr, $t:ty, $ci:expr) => {{
+            let v: &mut Vec<$t> = $v;
+            v.clear();
+            v.reserve(total);
+            // SAFETY: `$t` is a fixed-width numeric (`Copy`, no `Drop`). The disjoint per-row-group
+            // tasks below cover every one of the `total` rows and each writes its slice exactly once
+            // before any read, so exposing `total` uninitialised slots here — instead of a full
+            // zero-fill of the output, which would waste the very memory bandwidth this path is
+            // optimising — is sound. On a task error we return `Err` and never read the vector.
+            unsafe {
+                v.set_len(total);
+            }
+            let mut rest: &mut [$t] = v.as_mut_slice();
+            for chunk in chunks.iter() {
+                let (head, tail) = rest.split_at_mut(chunk.len());
+                rest = tail;
+                let field = chunk.unmasked_field($ci).clone();
+                tasks.push(Box::new(move |ctx: &mut ExecutionCtx| -> Result<()> {
+                    let p: PrimitiveArray = field.execute(ctx).map_err(ze)?;
+                    head.copy_from_slice(p.as_slice::<$t>());
+                    Ok(())
+                }));
+            }
+        }};
+    }
+    for (ci, col) in cols.iter_mut().enumerate() {
+        match col {
+            ColumnData::I8(v) => push_grid!(v, i8, ci),
+            ColumnData::I16(v) => push_grid!(v, i16, ci),
+            ColumnData::I32(v) => push_grid!(v, i32, ci),
+            ColumnData::I64(v) => push_grid!(v, i64, ci),
+            ColumnData::U8(v) => push_grid!(v, u8, ci),
+            ColumnData::U16(v) => push_grid!(v, u16, ci),
+            ColumnData::U32(v) => push_grid!(v, u32, ci),
+            ColumnData::U64(v) => push_grid!(v, u64, ci),
+            ColumnData::F32(v) => push_grid!(v, f32, ci),
+            ColumnData::F64(v) => push_grid!(v, f64, ci),
+            _ => unreachable!("materialise_grid is numeric-only (guarded by is_grid_eligible)"),
+        }
+    }
+
+    // Round-robin the tasks into one bucket per worker; each worker runs its bucket with its own
+    // ExecutionCtx. Tasks are near-uniform (one row-group each), so round-robin balances well.
+    let nb = threads.max(1).min(tasks.len().max(1));
+    let mut buckets: Vec<Vec<GridTask>> = (0..nb).map(|_| Vec::new()).collect();
+    for (k, t) in tasks.into_iter().enumerate() {
+        buckets[k % nb].push(t);
+    }
+    std::thread::scope(|sc| -> Result<()> {
+        let handles: Vec<_> = buckets
+            .into_iter()
+            .map(|bucket| {
+                let s = s.clone(); // Arc-backed
+                sc.spawn(move || -> Result<()> {
+                    let mut ctx = s.create_execution_ctx();
+                    for t in bucket {
+                        t(&mut ctx)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .map_err(|_| Error::Codec("table grid-decode worker panicked".into()))??;
         }
         Ok(())
     })
@@ -2218,6 +2347,52 @@ mod tests {
             panic!("expected F64 column back")
         };
         assert_eq!(g, &energy);
+    }
+
+    #[test]
+    fn grid_decode_numeric_matches_serial_across_row_groups() {
+        // The all-numeric GRID decode path (materialise_grid, via decode's auto routing) must be
+        // bit-identical to the serial column path. Size the table above PARALLEL_MATERIALISE_MIN_VALUES
+        // (rows × cols > 2^20) and across several row-groups so the grid actually fans out over the
+        // (column × row-group) grid, then cross-check the auto path (grid) against a pinned
+        // single-worker column decode.
+        let rows = ROWS_PER_GROUP * 7 + 321; // 8 row-groups incl. a partial tail; ×3 cols > 2^20
+        let mut lcg = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lcg
+        };
+        let a: Vec<f64> = (0..rows).map(|_| (next() >> 12) as f64 * 1e-9).collect();
+        let data: TableData = vec![
+            ("a".into(), ColumnData::F64(a)),
+            (
+                "b".into(),
+                ColumnData::I64((0..rows as i64).map(|k| k * 7 - 3).collect()),
+            ),
+            (
+                "c".into(),
+                ColumnData::U32(
+                    (0..rows as u32)
+                        .map(|k| k.wrapping_mul(2654435761))
+                        .collect(),
+                ),
+            ),
+        ];
+        let spec = TableSpec {
+            columns: vec![col("a", "f8"), col("b", "i8"), col("c", "u4")],
+            rows: rows as u64,
+            row_index: None,
+        };
+        let blob = encode(&spec, &data).unwrap();
+        let grid = decode(&spec, &blob).unwrap(); // auto → grid (all numeric, over threshold)
+        let serial = decode_with_workers(&spec, &blob, 1).unwrap(); // pinned single-worker column path
+        assert_eq!(grid, data, "grid decode diverged from the input");
+        assert_eq!(
+            grid, serial,
+            "grid decode diverged from serial column decode"
+        );
     }
 
     #[test]
