@@ -22,6 +22,10 @@ does not invent a codec; it **composes the proven engine per shape** under one F
 - **Identity & integrity** — blake3 hash-on-write, a Merkle-Mountain-Range `content_hash`, and a
   `manifest_hash` seal that transitively commits to every block digest + all metadata.
 
+**Why not just Parquet or HDF5?** They store bytes; Tessera adds the seal, provenance, versioning,
+signing and cloud/FAIR distribution *around* them — see the capability comparison in
+**[docs/book/src/why-tessera.md](docs/book/src/why-tessera.md)**.
+
 ## Install
 
 Tessera's one native dependency is **libhdf5** (used only to *read* vendor acquisitions at ingest). How
@@ -103,7 +107,17 @@ tessera verify  corpus/files/recon_int16.tsra
 # Navigate the structure like a zarr hierarchy
 tessera tree corpus/files/listmode_events.tsra      # root status · meta · blocks+columns · sources
 tessera ls   corpus/files/listmode_events.tsra events
-tessera read corpus/files/listmode_events.tsra events -c e0 --limit 5   # cross-block column → CSV
+
+# Read a table column → CSV: a preview, or the whole column, or a row range
+tessera read corpus/files/listmode_events.tsra events -c e0 --limit 5    # preview
+tessera read corpus/files/listmode_events.tsra events -c e0 --all > e0.csv
+tessera read corpus/files/listmode_events.tsra events -c e0 --rows 0:100 # a slice
+
+# Look at an array without decoding the whole volume
+tessera stats   corpus/files/recon_int16.tsra volume              # shape · dtype · codec · min/max/mean
+tessera slice   corpus/files/recon_int16.tsra volume --index "32,:,:"   # one plane → CSV
+tessera project corpus/files/recon_int16.tsra volume --axis z --mode max  # MIP → CSV
+# (Prefer NumPy/DataFrames? the `tessera` Python package returns np.ndarray / polars / pyarrow.)
 
 # Ingest a vendor acquisition (normalise at the door), or a declarative multi-product spec
 tessera ingest ge-hdf5 LIST.h5 out.tsra --name DP06-lm --timestamp 2024-01-01T00:00:00Z
