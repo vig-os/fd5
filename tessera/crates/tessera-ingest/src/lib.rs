@@ -6,6 +6,7 @@
 //! it preserves the native sample dtype and carries the provenance + units as metadata rather than
 //! rewriting pixels.
 
+pub mod backends;
 pub mod blob;
 pub mod dicom;
 pub mod engine;
