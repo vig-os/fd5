@@ -6,6 +6,7 @@
 
 mod bench;
 mod collection;
+mod info;
 mod nav;
 mod resource;
 #[cfg(feature = "sql")]
@@ -147,6 +148,7 @@ Signing & trust:
   verify-sig  Verify a sealed .tsra against its signature (embedded first, sidecar fallback)
 
 Diagnostics:
+  info        What this build is (version, backends, build modes) — --json for machines
   bench       Bench the write engine on this host (throughput + peak RSS)
 
 Run `tsra help <command>` for details, flags, and what to pass.
@@ -616,6 +618,17 @@ enum Cmd {
     Collection {
         #[command(subcommand)]
         action: CollectionAction,
+    },
+    /// What this build is: version, compiled-in backends, build modes (ADR-0057 §7).
+    ///
+    /// Feature selection decides which formats are **readable**; it never changes the **bytes**
+    /// produced for a readable one. This is how someone who did not build the binary can see which
+    /// side of that line a failure is on. `--json` emits the same facts in a shape suitable for
+    /// embedding in `aux/provenance.json`.
+    Info {
+        /// Emit JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
     },
     /// Bench the write engine on this host (throughput + peak RSS).
     ///
@@ -1451,6 +1464,7 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
                 CollectionAction::Verify { file } => collection::verify(&file, &mut out),
             }
         }
+        Cmd::Info { json } => info::info(json, &mut std::io::stdout().lock()),
         Cmd::Bench { action } => match action {
             BenchAction::Write {
                 schema,

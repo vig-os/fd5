@@ -35,7 +35,8 @@
         # Cargo sources + the conformance corpus (tests/conformance.rs reads corpus/corpus.json) +
         # docs/examples (tessera-ingest::spec embeds the example ingest TOML via include_str! and a
         # test validates it) + the CLI docs-as-tests (`tests/cmd/*.trycmd` walkthroughs + their `.in/`
-        # fixtures) — cleanCargoSource would otherwise strip these non-Rust files, so the trycmd
+        # fixtures) + Gate B's committed feature snapshots (`tests/feature-snapshots/*.txt`, ADR-0057
+        # §5) — cleanCargoSource would otherwise strip these non-Rust files, so the trycmd
         # docs-as-tests would silently run ZERO cases in the hermetic gate.
         src = pkgs.lib.cleanSourceWith {
           src = ./tessera;
@@ -44,9 +45,25 @@
             || (pkgs.lib.hasInfix "/corpus/" path)
             || (pkgs.lib.hasInfix "/docs/examples/" path)
             || (pkgs.lib.hasInfix "/docs/dictionaries/" path)
-            || (pkgs.lib.hasInfix "/tests/cmd/" path);
+            || (pkgs.lib.hasInfix "/tests/cmd/" path)
+            || (pkgs.lib.hasInfix "/tests/feature-snapshots/" path);
           name = "source";
         };
+        # Every feature declared anywhere in the workspace **except `static-hdf5`** (ADR-0057 §4), in
+        # cargo's `package/feature` form so one invocation from the virtual-manifest root covers all
+        # members. This is what the PR clippy gate builds instead of `--all-features`.
+        #   tessera-core   array-zarr, table-arrow   (= `full`)
+        #   tessera-io     cloud
+        #   tessera-cli    cloud (→ tessera-io/cloud), sql
+        #   tessera-ingest static-hdf5 only          → deliberately absent
+        #   tessera-py / tessera-wasm                → no features
+        workspaceFeatures = builtins.concatStringsSep "," [
+          "tessera-core/full"
+          "tessera-io/cloud"
+          "tessera-cli/cloud"
+          "tessera-cli/sql"
+        ];
+
         commonArgs = {
           inherit src;
           strictDeps = true;
@@ -56,10 +73,10 @@
           # runs bindgen (needs libclang) and links libstdc++. The tessera-ingest GE-HDF5 reader
           # links libhdf5 (found via pkg-config — `hdf5-metno-sys` reads PKG_CONFIG_PATH when
           # HDF5_DIR is unset). Provide all to every crane derivation (deps/clippy/test).
-          # `cmake` is needed by the `static-hdf5` feature (hdf5-metno-src builds libhdf5 from source via
-          # CMake); any check that enables all features — e.g. the `--all-features` clippy — compiles that
-          # vendored build, which doubles as CI coverage of the static/lib64 path on both arches. The
-          # default (pkg-config) builds don't invoke CMake, so it costs them nothing.
+          # `cmake` is kept for the `static-hdf5` feature (hdf5-metno-src builds libhdf5 from source via
+          # CMake). No *PR* check enables it any more (ADR-0057 §4 — see `workspace-clippy` below); it is
+          # exercised release-only, by the cargo-dist channel (`dist-workspace.toml`). The default
+          # (pkg-config) builds don't invoke CMake, so keeping it here costs them nothing.
           nativeBuildInputs = with pkgs; [ clang pkg-config cmake ];
           buildInputs = with pkgs; [ stdenv.cc.cc.lib hdf5 ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
@@ -244,9 +261,23 @@
         #    runs on a dev's machine and in CI — no "passes locally / fails in CI" drift. ──
         checks = {
           # Hermetic Rust gates over the tessera workspace.
+          #
+          # NOT `--all-features` (ADR-0057 §4): that pulls `static-hdf5`, which builds libhdf5 2.2.0
+          # from vendored source via CMake and dominated the ~90 min x86_64 check. `static-hdf5` only
+          # switches how libhdf5 *links* — there is not one `#[cfg(feature = "static-hdf5")]` in the
+          # tree — so dropping it from the PR matrix costs **zero** clippy coverage: nix supplies
+          # libhdf5 from the closure (`buildInputs`), and every line of hdf5 code still compiles here.
+          # It stays exercised release-only, by the cargo-dist channel (`dist-workspace.toml` sets
+          # `features = ["static-hdf5"]`).
+          #
+          # `workspaceFeatures` is therefore the explicit "every workspace feature EXCEPT static-hdf5"
+          # set. It must be kept exhaustive by hand — cargo has no `--all-features-except`. Adding a
+          # feature to any crate means adding it here (the `feature-snapshots` check below will also
+          # notice, since a new feature moves the resolved graph).
           workspace-clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
-            cargoClippyExtraArgs = "--all-targets --all-features -- -D warnings";
+            cargoClippyExtraArgs =
+              "--all-targets --features ${workspaceFeatures} -- -D warnings";
           });
           workspace-test = craneLib.cargoNextest (commonArgs // {
             inherit cargoArtifacts;
@@ -260,6 +291,44 @@
             cargoTestExtraArgs = "--doc";
           });
           workspace-fmt = craneLib.cargoFmt { inherit src; };
+
+          # **Gate B — the feature-snapshot determinism gate** (ADR-0057 §5). Regenerates the resolved
+          # feature graph of every crate on the seal path and diffs it against the committed baseline
+          # in `tessera/tests/feature-snapshots/` — the hermetic equivalent of the ADR's
+          # `git diff --exit-code` (there is no `.git` inside the nix sandbox).
+          #
+          # Gate A (Phase 1) catches a golden that moved; Gate B catches the *risk* on the PR that
+          # introduced it. It is what would have flagged `sql` turning on `arrow-array/chrono-tz`
+          # — ADR-0056 hazard H1 (tzdb: compiled-in vs. host `/usr/share/zoneinfo`) arriving through
+          # a feature rather than a host — on the PR that added `sql`, instead of on the release that
+          # shipped an ingest path through it. Feature unification is monotonic, so the same class of
+          # hazard would silently re-register ALP in the Vortex float compressor (#380/#384).
+          #
+          # A failure is NOT automatically a bug: it is a deliberate corpus event. Regenerate with
+          # `scripts/feature-snapshots.sh tessera/tests/feature-snapshots` and either show no golden
+          # moved (stating why in the PR) or carry the corpus regeneration alongside.
+          #
+          # `cargo tree` reads the lockfile + the vendored manifests; it compiles nothing, so this
+          # check is nearly free (`cargoArtifacts = null` — there is no target dir to inherit).
+          feature-snapshots = craneLib.mkCargoDerivation (commonArgs // {
+            cargoArtifacts = null;
+            doInstallCargoArtifacts = false;
+            pnameSuffix = "-feature-snapshots";
+            buildPhaseCargoCommand = ''
+              TESSERA_WORKSPACE="$PWD" bash ${./scripts/feature-snapshots.sh} "$TMPDIR/snapshots"
+              # `--exclude='*.md'` skips the directory's README (the reviewer-facing explainer);
+              # every `<crate>.txt` is still compared, and a snapshot that vanished still shows up
+              # as an "Only in …" line.
+              if ! diff -ru --exclude='*.md' tests/feature-snapshots "$TMPDIR/snapshots"; then
+                echo "" >&2
+                echo "Gate B (ADR-0057 §5): the resolved feature graph of a seal-path crate CHANGED." >&2
+                echo "This is a deliberate corpus event — see the diff above, then regenerate with:" >&2
+                echo "    scripts/feature-snapshots.sh tessera/tests/feature-snapshots" >&2
+                echo "and justify it in the PR (no golden moved, or the corpus regen rides along)." >&2
+                exit 1
+              fi
+            '';
+          });
 
           # `tessera-core` must stay **wasm32-compatible** (#210): the pure-Rust spine — manifest /
           # identity / hash / inclusion+consistency proofs / referencing / ed25519 *verify* — has zero
