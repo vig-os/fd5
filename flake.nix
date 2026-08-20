@@ -35,7 +35,8 @@
         # Cargo sources + the conformance corpus (tests/conformance.rs reads corpus/corpus.json) +
         # docs/examples (tessera-ingest::spec embeds the example ingest TOML via include_str! and a
         # test validates it) + the CLI docs-as-tests (`tests/cmd/*.trycmd` walkthroughs + their `.in/`
-        # fixtures) — cleanCargoSource would otherwise strip these non-Rust files, so the trycmd
+        # fixtures) + Gate B's committed feature snapshots (`tests/feature-snapshots/*.txt`, ADR-0057
+        # §5) — cleanCargoSource would otherwise strip these non-Rust files, so the trycmd
         # docs-as-tests would silently run ZERO cases in the hermetic gate.
         src = pkgs.lib.cleanSourceWith {
           src = ./tessera;
@@ -44,7 +45,8 @@
             || (pkgs.lib.hasInfix "/corpus/" path)
             || (pkgs.lib.hasInfix "/docs/examples/" path)
             || (pkgs.lib.hasInfix "/docs/dictionaries/" path)
-            || (pkgs.lib.hasInfix "/tests/cmd/" path);
+            || (pkgs.lib.hasInfix "/tests/cmd/" path)
+            || (pkgs.lib.hasInfix "/tests/feature-snapshots/" path);
           name = "source";
         };
         # Every feature declared anywhere in the workspace **except `static-hdf5`** (ADR-0057 §4), in
@@ -270,7 +272,8 @@
           #
           # `workspaceFeatures` is therefore the explicit "every workspace feature EXCEPT static-hdf5"
           # set. It must be kept exhaustive by hand — cargo has no `--all-features-except`. Adding a
-          # feature to any crate means adding it here.
+          # feature to any crate means adding it here (the `feature-snapshots` check below will also
+          # notice, since a new feature moves the resolved graph).
           workspace-clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
             cargoClippyExtraArgs =
@@ -288,6 +291,44 @@
             cargoTestExtraArgs = "--doc";
           });
           workspace-fmt = craneLib.cargoFmt { inherit src; };
+
+          # **Gate B — the feature-snapshot determinism gate** (ADR-0057 §5). Regenerates the resolved
+          # feature graph of every crate on the seal path and diffs it against the committed baseline
+          # in `tessera/tests/feature-snapshots/` — the hermetic equivalent of the ADR's
+          # `git diff --exit-code` (there is no `.git` inside the nix sandbox).
+          #
+          # Gate A (Phase 1) catches a golden that moved; Gate B catches the *risk* on the PR that
+          # introduced it. It is what would have flagged `sql` turning on `arrow-array/chrono-tz`
+          # — ADR-0056 hazard H1 (tzdb: compiled-in vs. host `/usr/share/zoneinfo`) arriving through
+          # a feature rather than a host — on the PR that added `sql`, instead of on the release that
+          # shipped an ingest path through it. Feature unification is monotonic, so the same class of
+          # hazard would silently re-register ALP in the Vortex float compressor (#380/#384).
+          #
+          # A failure is NOT automatically a bug: it is a deliberate corpus event. Regenerate with
+          # `scripts/feature-snapshots.sh tessera/tests/feature-snapshots` and either show no golden
+          # moved (stating why in the PR) or carry the corpus regeneration alongside.
+          #
+          # `cargo tree` reads the lockfile + the vendored manifests; it compiles nothing, so this
+          # check is nearly free (`cargoArtifacts = null` — there is no target dir to inherit).
+          feature-snapshots = craneLib.mkCargoDerivation (commonArgs // {
+            cargoArtifacts = null;
+            doInstallCargoArtifacts = false;
+            pnameSuffix = "-feature-snapshots";
+            buildPhaseCargoCommand = ''
+              TESSERA_WORKSPACE="$PWD" bash ${./scripts/feature-snapshots.sh} "$TMPDIR/snapshots"
+              # `--exclude='*.md'` skips the directory's README (the reviewer-facing explainer);
+              # every `<crate>.txt` is still compared, and a snapshot that vanished still shows up
+              # as an "Only in …" line.
+              if ! diff -ru --exclude='*.md' tests/feature-snapshots "$TMPDIR/snapshots"; then
+                echo "" >&2
+                echo "Gate B (ADR-0057 §5): the resolved feature graph of a seal-path crate CHANGED." >&2
+                echo "This is a deliberate corpus event — see the diff above, then regenerate with:" >&2
+                echo "    scripts/feature-snapshots.sh tessera/tests/feature-snapshots" >&2
+                echo "and justify it in the PR (no golden moved, or the corpus regen rides along)." >&2
+                exit 1
+              fi
+            '';
+          });
 
           # `tessera-core` must stay **wasm32-compatible** (#210): the pure-Rust spine — manifest /
           # identity / hash / inclusion+consistency proofs / referencing / ed25519 *verify* — has zero
