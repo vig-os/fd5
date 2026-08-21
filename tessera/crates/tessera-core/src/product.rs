@@ -211,6 +211,35 @@ mod tests {
         );
     }
 
+    /// ADR-0056 §6a: the sealed decoder identity must move the seal and *only* the seal.
+    ///
+    /// The bump-review discipline rests on this separation — a decoder bump is triaged by asserting
+    /// that every ingest golden's `content_hash` held while `manifest_hash` moved. If a refactor ever
+    /// folded product metadata into `content_hash`, or made `ingest_decoder` an identity input, that
+    /// check would go quietly vacuous and every bump would look like a value change (or vice versa).
+    #[test]
+    fn ingest_decoder_moves_the_seal_but_never_the_lineage_or_the_values() {
+        let sealed_with = |decoder: &str| {
+            let mut b = ProductBuilder::new("table", "trades", "d", "2024-01-01T00:00:00Z");
+            b.add_block_ref(block("data", "blake3:aa"));
+            b.with_field("ingest_decoder", serde_json::json!(decoder));
+            b.seal().unwrap()
+        };
+
+        let v1 = sealed_with("arrow-rs 58.3.0+feat:9f2c1ab4");
+        let v2 = sealed_with("arrow-rs 58.4.0+feat:9f2c1ab4");
+
+        assert_eq!(v1.id, v2.id, "the decoder is not an identity input");
+        assert_eq!(
+            v1.content_hash, v2.content_hash,
+            "content_hash is a Merkle over block digests — the decoder string is not in it"
+        );
+        assert_ne!(
+            v1.manifest_hash, v2.manifest_hash,
+            "the seal names the decoder, so it moves: two honestly different products"
+        );
+    }
+
     #[test]
     fn seal_embeds_the_product_schema_for_a_known_product() {
         // A known product's sealed manifest carries its own contract (self-describing, obligatory).
