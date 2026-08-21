@@ -211,40 +211,63 @@ mod tests {
         );
     }
 
-    /// ADR-0056 §6a: the sealed decoder identity must move the seal and *only* the seal.
+    /// ADR-0056 §6a: decoder drift is detectable from **sealed data alone**, without a sealed
+    /// decoder id.
     ///
-    /// The bump-review discipline rests on this separation — a decoder bump is triaged by asserting
-    /// that every ingest golden's `content_hash` held while `manifest_hash` moved. If a refactor ever
-    /// folded product metadata into `content_hash`, or made `ingest_decoder` an identity input, that
-    /// check would go quietly vacuous and every bump would look like a value change (or vice versa).
+    /// This is the property that lets the decoder identity live in `aux/provenance.json`. The seal
+    /// pins both ends of the ingest transform — the input, via the `ingested_from` edge's source
+    /// digest, and the output, via `content_hash` — so *same source digest + different content_hash*
+    /// means the interpretation changed, and no third field is needed to observe it.
+    ///
+    /// If a refactor ever dropped the source digest from the edge, or folded product metadata into
+    /// `content_hash`, that inference would break silently and #403's decision would lose its
+    /// premise. Both halves are asserted here.
     #[test]
-    fn ingest_decoder_moves_the_seal_but_never_the_lineage_or_the_values() {
-        let sealed_with = |decoder: &str| {
+    fn the_sealed_source_and_content_hashes_bracket_the_ingest_transform() {
+        // Same source file, decoded twice. `decoded` is the block digest, standing in for whatever
+        // logical values the decoder extracted; `aux_only` is a fact recorded outside the seal.
+        let sealed = |decoded: &str, aux_only: &str| {
             let mut b = ProductBuilder::new("table", "trades", "d", "2024-01-01T00:00:00Z");
-            b.add_block_ref(block("data", "blake3:aa"));
-            b.with_field("ingest_decoder", serde_json::json!(decoder));
+            b.add_block_ref(block("data", decoded));
+            b.add_source(
+                Source::new("ingested_from", "trades.parquet").with_content_hash("blake3:src"),
+            );
+            b.with_field("source_format", serde_json::json!(aux_only));
             b.seal().unwrap()
         };
 
-        let v1 = sealed_with("arrow-rs 58.3.0+feat:9f2c1ab4");
-        let v2 = sealed_with("arrow-rs 58.4.0+feat:9f2c1ab4");
+        let same_values = sealed("blake3:aa", "parquet");
+        let drifted = sealed("blake3:bb", "parquet");
 
-        // Read the field back first: without this the assertions below would still pass if sealing
-        // dropped `metadata` entirely, since blocks and id_inputs would be untouched either way.
-        assert_eq!(
-            v1.metadata.get("ingest_decoder"),
-            Some(&serde_json::json!("arrow-rs 58.3.0+feat:9f2c1ab4")),
-            "the decoder identity is carried in the sealed manifest, not just handed to the builder"
-        );
-        assert_eq!(v1.id, v2.id, "the decoder is not an identity input");
-        assert_eq!(
-            v1.content_hash, v2.content_hash,
-            "content_hash is a Merkle over block digests — the decoder string is not in it"
-        );
+        // The input is pinned inside the seal — this is what makes the comparison meaningful.
+        let src = |m: &Manifest| {
+            m.sources
+                .iter()
+                .find(|s| s.role == "ingested_from")
+                .and_then(|s| s.content_hash.clone())
+                .expect("ingest stamps a source digest")
+        };
+        assert_eq!(src(&same_values), src(&drifted), "same source file");
+
+        // Same source + moved content_hash ⇒ the interpretation changed. Detection, from the seal.
         assert_ne!(
-            v1.manifest_hash, v2.manifest_hash,
-            "the seal names the decoder, so it moves: two honestly different products"
+            same_values.content_hash, drifted.content_hash,
+            "different extracted values must move content_hash"
         );
+        assert_ne!(same_values.manifest_hash, drifted.manifest_hash);
+        assert_eq!(
+            same_values.id, drifted.id,
+            "drift is a new version of one logical product, not a new product"
+        );
+
+        // The other half: a value-preserving change to recorded context moves no data fingerprint,
+        // which is why such facts do not need to be sealed to keep the seal honest.
+        let relabelled = sealed("blake3:aa", "parquet-v2");
+        assert_eq!(
+            same_values.content_hash, relabelled.content_hash,
+            "content_hash is a Merkle over block digests; manifest metadata is not in it"
+        );
+        assert_eq!(same_values.id, relabelled.id);
     }
 
     #[test]

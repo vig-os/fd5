@@ -13,10 +13,13 @@ Follow-ups: [#393](https://github.com/vig-os/tessera/issues/393) (directory-shap
 > practitioner · CLI + maintenance burden · reproducibility/archival integrity · FAIR governance).
 > No ingest code was written; §10 is the landing plan.
 
-> **Amended 2026-08-21 by [#403](https://github.com/vig-os/tessera/issues/403)** (four-lens spike:
-> archival determinism · FAIR data-steward · maintainer operations · CI enforcement). §6 item 2 now
-> specifies *which identifier* `ingest_decoder` seals — a mechanically derived build fact, not a
-> semantic profile id — and §6a records the argument, the bump policy and the enforcing gate.
+> **Amended 2026-08-21 by [#403](https://github.com/vig-os/tessera/issues/403)** (adversarial panel
+> over two passes: archival determinism · FAIR data-steward · maintainer operations · CI enforcement ·
+> format parsimony · clinical-regulatory audit). #403 asked *which identifier* the sealed
+> `ingest_decoder` should hold; the answer is that it does not belong in the seal. §6 drops from four
+> sealed fields to three, and **§6a** records the argument, the verified churn matrix, the dissent, the
+> two conditions the decision depends on, and the gate. The decoder identity moves to
+> `aux/provenance.json`.
 
 ## Context — the gap between the two things we can already do
 
@@ -210,7 +213,7 @@ step.** Naming it is half the fix.
 | **H6** | NPY/raw endianness (`>f8` vs `<f8`) — a naive `cast_slice` is silently wrong on one arch | low × fatal | decode and normalise to native LE; test both twins |
 | **H7** | SIMD-dispatched decode paths | medium × float-only | covered by H3/H4 canonicalisation |
 | **H8** | Locale (`LC_NUMERIC=de_DE` reading `1,5` as 1.5) | low × medium | `LC_ALL=C` for the decode |
-| **H9** | arrow-rs / parquet minor bumps changing decoded values | medium × fatal | `=` version pins + §6 sealed decoder id |
+| **H9** | arrow-rs / parquet minor bumps changing decoded values | medium × fatal | `=` version pins + the §6a corpus gate; the decoder id is recorded in `aux/`, not sealed |
 
 **H5 deserves its own paragraph** because it interacts with a documented invariant. `ColumnData::Nullable`
 normalises masked slots to the dtype default on **encode** (`table.rs:98-103`) so that `content_hash`
@@ -241,9 +244,9 @@ CI matrix. Compare `content_hash` + `manifest_hash`, not decoded values — the 
 Pin `arrow` and `parquet` with `=` (not `^`), and treat a bump as a deliberate corpus-regeneration
 commit, the same discipline as the ALP-exclusion pin.
 
-## §6 — What the seal must record (four additive format fields)
+## §6 — What the seal must record (three additive format fields)
 
-All four are `skip_serializing_if`-guarded, so existing manifests serialise byte-identically and the
+All three are `skip_serializing_if`-guarded, so existing manifests serialise byte-identically and the
 committed corpus needs no regeneration — the same trick `Column.nullable` already uses
 (`tessera/crates/tessera-core/src/block/table.rs:41-44`).
 
@@ -252,197 +255,262 @@ committed corpus needs no regeneration — the same trick `Column.nullable` alre
    `i64 + unit="s" + scale=1e-6` **with the epoch dropped** — indistinguishable from a duration, and
    a live violation of ADR-0046 §2's ticks-plus-epoch model. This is the smallest change that keeps
    the time model truthful, and it also closes the pre-existing listmode `t_ms` semantics gap.
-2. **`ingest_decoder` inside the seal** — the **build-honest decoder identity**: decoder name, its
-   `=`-pinned version, and a digest over the resolved features that can affect decode, all derived
-   mechanically at build time (`"arrow-rs 58.3.0+feat:9f2c1ab4"`). Without it, re-ingesting an
-   unchanged file after `cargo update` produces different decoded values and no one can distinguish
-   decoder drift from changed data. Recording it makes two seals from two decoders *honestly
-   different products* rather than a silent contradiction. **The feature digest is not garnish**:
-   ADR-0057 §5 found that `--features sql` flips `arrow-array/chrono-tz`, so two builds at one
-   arrow-rs version can decode a `Timestamp(_, Some(tz))` differently — hazard H1 arriving through a
-   feature rather than a version. A bare semver names those two decoders identically, which is the
-   same falsehood a profile id risks, reached by a shorter road. §6a records why this field holds a
-   version triple and not a semantic profile id (#403).
-3. **`ingest_transform: [{name, params}]`** — the §2 recorded-transform list (`tz_to_utc{from}`,
+2. **`ingest_transform: [{name, params}]`** — the §2 recorded-transform list (`tz_to_utc{from}`,
    `decimal_fixed_point{scale}`, `f16_widen`, `dictionary_materialised`, `fixed_list_expand{n}`,
    `null_slot_normalisation`, `struct_flatten`). This is what makes the middle lane honest: the
    artifact carries its own recovery instructions instead of relying on a warning that scrolled away.
-4. **`Column.sensitivity: Sensitivity` + a fifth variant `Sensitivity::Unknown`** — §7.
+3. **`Column.sensitivity: Sensitivity` + a fifth variant `Sensitivity::Unknown`** — §7.
 
 **Why inside the seal and not `aux/provenance.json`.** ADR-0042 puts wall-clock and host facts
 outside the seal precisely so re-ingest is byte-identical; that is right for `ingested_at`. It is
-wrong for these four, because each of them **changes what the values mean**. A reader who cannot see
-the epoch, the decoder, or the transform list cannot reconstruct the source's semantics, and
-FAIR-Reusable collapses. Transitive dependency versions, decode-time diagnostics and per-column
-inference statistics stay in `aux/` — audit-useful, not meaning-bearing.
+wrong for these three, because each of them **changes what the values mean**. A reader who cannot see
+the epoch or the transform list cannot reconstruct the source's semantics, and FAIR-Reusable
+collapses. Transitive dependency versions, decode-time diagnostics and per-column inference
+statistics stay in `aux/` — audit-useful, not meaning-bearing.
 
-## §6a — Why `ingest_decoder` seals a build fact and not a decoder profile id (#403)
+**The decoder identity is in that second category, and §6a is where that was decided.** An earlier
+draft of this ADR made `ingest_decoder` a fourth sealed field. #403 asked which identifier it should
+hold, and the answer turned out to be that it does not belong in the seal at all: it names *who
+produced* the values, not *what they mean*, and the seal already pins both ends of the transform
+without it.
 
-§6 item 2 says *that* the decoder is sealed. #403 asked *which identifier* it seals, because the
-determinism lens on the #398 spike proposed replacing the version with a **decoder profile id**
-(`arrow-primitive-v1`) naming the §5 H1–H9 semantic contract, so that a value-preserving dependency
-bump moves nothing. Four candidates were argued by a four-lens adversarial panel (archival
-determinism · FAIR data-steward · maintainer operations · CI enforcement):
+## §6a — The decoder identity is provenance, not identity (#403)
+
+An earlier draft sealed `ingest_decoder` (decoder name + version), and #403 asked *which identifier*
+it should seal — a version string, or a **profile id** (`arrow-primitive-v1`) naming the §5 H1–H9
+semantic contract so that value-preserving dependency bumps move nothing. A five-lens adversarial
+panel worked the question twice. The second pass rejected the premise both candidates share: **the
+decoder identity should not be sealed at all.** It is recorded in `aux/provenance.json`, alongside
+the wall-clock, host and producer facts it resembles.
 
 | # | Candidate | Verdict |
 | --- | --- | --- |
-| 1 | Version string in the seal | **Adopted**, corrected to a version *triple* (see below) |
-| 2 | Profile id replaces the version | Rejected — an unbounded claim inside an immutable record |
-| 3 | Both sealed | Rejected — pays option 1's churn in full and adds an identifier to reconcile |
-| 3′ | Profile id sealed, version in `aux/` | Rejected — trades a permanent risk for a bounded cost |
+| 1 | Version string sealed | Rejected — seals an attribution fact the seal does not need, and pays for it |
+| 2 | Profile id sealed | Rejected — an unbounded maintainer claim inside an immutable record |
+| 3 | Both sealed | Rejected — pays option 1's cost twice and adds an identifier to reconcile |
+| 3′ | Profile sealed, version in `aux/` | Rejected — keeps the claim, loses the fact |
+| **4** | **Neither sealed; decoder recorded in `aux/provenance.json`** | **Adopted** |
 
-### The structural finding that reframes the question
+### Finding 1 — `content_hash` is a function of extracted values, not of the decoder
 
-The tension was posed as *build-honesty versus meaning-stability*, with `content_hash` as the
-casualty either way. **Tessera's three hashes already separate those two concerns**, and the panel's
-first job was to establish it against the code rather than the prose:
+ADR-0056 §2 decided there is no byte-level source→Vortex mapping: ingest is a **logical re-encode**,
+`source → logical values → Tessera's own deterministic codecs → seal`. Block digests are over *our*
+encoded bytes (`tessera-io/src/conformance.rs:55-56`), so:
 
-| Hash | Computed over | Moves when the decoder *string* changes? | Moves when a decoded *value* changes? |
-| --- | --- | --- | --- |
-| `id` | `id_inputs` (`product`, `name`, `timestamp`) — `identity.rs:15` | no | no |
-| `content_hash` | Merkle root over **block digests only** — `manifest.rs:137-146` | **no** | yes |
-| `manifest_hash` | canonical bytes of the whole manifest — `manifest.rs:124-151` | yes | yes |
+> `content_hash = f(extracted logical values, Tessera's encoder config)`
 
-Product metadata is not an identity input, so `ingest_decoder` cannot reach `id` or `content_hash`
-under any candidate. Verified empirically as well as by reading: a probe crate sealed three
-manifests differing only in an `ingest_decoder` metadata field and a block digest, and
-`content_hash` was byte-identical across the decoder-string change while `manifest_hash` moved.
-`product.rs`'s `from_manifest_keeps_id_drops_old_supersedes_changes_seal` and
-`ingest_decoder_moves_the_seal_but_never_the_lineage_or_the_values` lock the property in.
+The decoder appears nowhere in that function except through the values it extracts. Source
+byte-encoding differences wash out. **A decoder change that extracts identical logical values cannot
+move `content_hash`.**
 
-Three consequences follow, and they carry the decision:
+This retracts the sentence that motivated the sealed field in the first place. The earlier §6.2 said:
 
-- **Option 1's cost is `manifest_hash` churn only.** A `cargo update` plus re-ingest yields a new
-  *version* of the same logical product, with the same values — `id` intact, `content_hash` intact.
-  Calling that a "lineage discontinuity" conflates *the seal changed* with *the identity broke*.
-- **"Was this bump value-preserving?" is already mechanical**, for every candidate equally: it is
-  exactly *did every ingest fixture's `content_hash` stay byte-identical*. No judgement in the loop.
-- **A value-preserving bump therefore has a diff signature a script can check** — every
-  `manifest_hash` in `corpus/corpus.json` moves, every `content_hash` is unchanged. The reviewer
-  confronts a green check, not twelve opaque hashes. This is what dissolves the rubber-stamp-decay
-  objection to option 1, which was otherwise its most serious weakness.
+> ~~*"Without it, re-ingesting an unchanged file after `cargo update` produces a different
+> `content_hash` and no one can distinguish decoder drift from changed data."*~~
 
-### Why the profile id loses
+That is **false as stated**, and every lens agreed on this pass. A `cargo update` produces a
+different `content_hash` if and only if the new decoder extracts different values — which is exactly
+the H1–H9 hazard set, and exactly the case anyone would want flagged. The premise that the seal
+needed a decoder id to avoid a silent contradiction was mistaken: there was never a contradiction to
+silence.
 
-The gate above is real, but it is **not proof**, and it never can be: a bump can change decoded
-values for an input shape no fixture exercises. Every candidate carries that residual identically.
-What differs is **what the seal says when the residual bites**:
+### Finding 2 — the seal already brackets the transform
 
-- Under **option 1**, the undetected bump produces two products whose sealed decoders differ and
-  whose values differ. *The seal is still true.* The discrepancy is self-describing, and a reader can
-  attribute it correctly from the manifest alone.
-- Under **option 2 or 3′**, the same bump produces two products asserting **one** profile id over two
-  genuinely different decoders. The seal now records a falsehood, permanently, with no in-seal way to
-  detect or attribute it. Under 3′ the `aux/` record might explain it — if it survived, which ADR-0042
-  explicitly does not guarantee, since aux members are carried but ignored by the seal and may be
-  stripped without breaking verification. A stripped file is indistinguishable from one that never
-  carried the record: absence of evidence presented as evidence of absence.
+The sealed manifest already contains **both ends** of the ingest transform:
 
-That is precisely the failure mode §2 rejected the lossy-map-with-warning tier to avoid — *a seal
-over silently-degraded values asserts they are the truth* — re-entering through the provenance door.
-The two lenses that recommended a sealed profile both named this as the objection they could not
-answer. **A permanent, unfixable risk of a false seal is not a good trade for a bounded, reviewable,
-non-semantic churn cost.**
+- **the input** — every ingest stamps an `ingested_from` edge whose `content_hash` is a merkle root
+  over the source bytes (`tessera-ingest/src/provenance.rs:30-41`; called by every backend —
+  `raw.rs:56`, `dicom.rs:617-620`, `nifti.rs:173-175`). `sources` is a manifest field, so it is
+  inside the seal and under the ADR-0037 signature.
+- **the output** — `content_hash`, over the block digests.
 
-Two supporting arguments were weighed and found not to carry:
+Therefore **same `source_hash` + changed `content_hash` ⟹ the interpretation changed**. Detection of
+decoder drift is *already sealed*, and needs no decoder id. What a sealed decoder id would add is
+**attribution** — naming the culprit build without re-deriving it — which is a different thing, and
+a weaker claim on the seal.
 
-- **The ADR-0052 precedent** (`product.rs:141-148`: the *format* version is sealed, the *crate*
-  version lives in `aux/provenance.json`) looks like this decision already made in the profile's
-  favour. It does not transfer. `TESSERA_VERSION` is Tessera's own contract, bumped deliberately by
-  the people who define it; a profile id for arrow-rs is Tessera shadow-versioning a project it does
-  not control and cannot speak for. The precedent supports sealing a contract id *where we own the
-  contract*, which is the opposite of this case.
-- **Option 3** does not reduce churn at all. The sealed version still moves `manifest_hash` on every
-  bump, so 3 pays option 1's full cost for a semantic label, and adds the dual-identifier hazard the
-  FAIR lens flagged: readers latch onto the familiar-looking version and ignore the profile,
-  recreating option 1 socially. Two identifiers, one of them decorative.
+### The churn matrix
 
-### What the profile camp was right about, and what is taken from it
+Every cell below was verified by execution against a probe crate built on `tessera-core`, not
+inferred. `id` never moves in any cell, under any option: product metadata is not an identity input
+(`identity.rs:15`).
 
-- **The compiled-vs-documented gap is real**, and it is a genuine defect in §6 item 2 as originally
-  written. ADR-0057 §5 proved that an unrelated optional feature (`sql`) perturbs the tz machinery
-  inside the shared arrow tree. A bare `"arrow-rs 58.3.0"` would name two differently-behaving
-  decoders identically. The fix is to adopt the profile camp's *derivation* machinery without its
-  *claim*: the sealed identifier is **mechanically computed at build time** from the pinned version
-  plus a digest of the resolved decode-relevant features, reusing ADR-0057 Gate B's snapshot
-  plumbing. No maintainer types this string.
-- **Catalogue legibility is real.** A steward comparing two products wants "same contract?" answerable
-  at a glance, and `arrow-primitive-v1` reads better to a non-Rust scientist than a crate version.
-  That need is served **outside** the seal: an unsealed `aux/provenance.json` field
-  `ingest_profile: "arrow-primitive-v1"`, explicitly diagnostic and never load-bearing. A wrong label
-  in `aux/` is a correctable annotation; a wrong claim in the seal is forever. Claims belong where
-  they can be revised; facts belong where they must be preserved. The strippability objection raised
-  against 3′ applies to this label too, and is accepted here for the reason it was refused there: a
-  stripped *diagnostic* costs a convenience, a stripped *forensic record of last resort* costs the
-  ability to detect that the seal is wrong.
-- **`ingest_decoder` stays inside the seal** under this decision, as §6 requires. The churn was never
-  an argument for demoting it, and it is not used as one here.
+| Option | Value-preserving bump | Value-changing bump |
+| --- | --- | --- |
+| 1 version sealed | `manifest_hash` | `content_hash` + `manifest_hash` |
+| 2 profile sealed | nothing | `content_hash` + `manifest_hash` — *or, if the maintainer misses the bump, `content_hash` moves under an unchanged profile string: a false seal* |
+| 3 both sealed | `manifest_hash` | `content_hash` + `manifest_hash` |
+| 3′ profile sealed, version in `aux/` | nothing | as option 2, including the false-seal cell |
+| **4 neither sealed** | **nothing** | `content_hash` + `manifest_hash` |
 
-### The corpus-event policy — what forces a regeneration, and who decides
+Two things fall out. First, **`content_hash` churn is zero for every option on a value-preserving
+bump** — the "every `cargo update` is a corpus event" fear was never about the data fingerprint.
+Second, option 1 is the only adopted-candidate row that churns anything at all on a benign bump, and
+what it churns is the *label*, not the values.
 
-The `=`-pin discipline of §5 H9 already makes a decoder bump a deliberate act. This is the procedure
-attached to it. There is no profile to bump; what is governed is the **corpus event**.
+### Why sealing the decoder loses
 
-- **What forces one.** Any change to the sealed decoder identity: a `=`-pin version bump on a
-  seal-path decoder (`arrow`, `parquet`, and any future decoder feeding the §2 boundary); a change to
-  the resolved decode-relevant feature set that moves the feature digest (ADR-0057 Gate B); or a
-  Tessera-authored change to the §5 H1–H9 canonicalisation code.
-- **Who decides.** The PR author proposes; no separate governance. The bump is an ordinary PR that
-  must carry its regenerated goldens. The gate below, not a reviewer's judgement, decides whether it
-  is routine.
-- **What must be stapled to the PR.** The Gate B feature-snapshot diff; the Gate A output across all
-  configured feature configurations on both CI architectures; and the value-preservation check below.
-- **The two off-diagonal cases.** Gate B snapshot changed but no golden moved → update the snapshot
-  with a written reason; routine. Golden `content_hash` moved → **not** routine: the PR must state
-  which H-rule changed behaviour and why the new values are the correct ones, and that statement is
-  reviewed on its merits.
+- **It fails §6's own admission criterion.** §6 seals what "changes what the values mean" and
+  consigns "transitive dependency versions… audit-useful, not meaning-bearing" to `aux/`. A decoder
+  id is precisely a transitive dependency version. The meaning is carried by `ingest_transform` — an
+  auditor can reconstruct the semantics from the recorded transform list without knowing which build
+  applied it — plus `Column.unit` / `scale` / `referencing`. Sealing the decoder id required a second,
+  unwritten admission criterion, and no lens could state one that did not also drag `producer`,
+  `host` and `ingested_at` into the seal, which ADR-0042 deliberately excluded.
+- **The churn it buys is worse than useless.** Under Finding 1, a value-preserving bump's corpus diff
+  is *known in advance* to be a `manifest_hash` column swap and nothing else. A regeneration PR whose
+  content is predictable before it is opened is the precise shape that trains rubber-stamp approval —
+  roughly 150 of them over a decade. The earlier draft argued the mechanical diff signature made
+  option 1 reviewable; on the second pass the maintainer lens reversed itself, because a signature
+  that is known before you look is ceremony, not scrutiny.
+- **It is internally inconsistent with how we treat ourselves.** `tessera-ingest`'s H1–H9
+  canonicalisation is *our* code, it transforms values, and its implementation version is attributed
+  by no sealed field — `TESSERA_VERSION` is a format-contract version, not an implementation one
+  (`product.rs:141-148`). Sealing arrow-rs's version while our own decoder rides in `aux/` holds a
+  third party to a standard we exempt ourselves from, on the same class of hazard. The consistent
+  options are seal both or seal neither; pre-1.0, neither.
+- **It burdens every future implementation.** `ingest_decoder` would be normative format surface. A
+  2040 Python or Julia writer has no crate graph and no `cargo tree`, so a build-derived decoder
+  triple is unproducible by any non-Rust producer: fabricate, omit, or invent. The field is
+  `recommended` rather than `required` (`schema.rs:119`), so omitting is legal — but a field that is
+  routinely absent cannot carry the recall argument that was its main justification.
 
-### The enforcing gate (design)
+### The dissent, recorded
 
-The check is the same one that would have been needed to license a profile claim — it is retained,
-because under this decision it is not a *permission* to assert sameness but the **review instrument**
-that tells a routine bump from a semantic one. It composes with ADR-0057's two gates:
+One lens (archival determinism) held for option 1 through both passes, and its argument is preserved
+here because the decision is finely balanced and reversible in only one direction.
 
-1. **Value-preservation check (new, on bump PRs).** Regenerate the ingest corpus at the new pin.
-   Compare against the committed goldens **field-wise**, not file-wise: assert every fixture's
-   `content_hash` and `id` are byte-identical, and permit `manifest_hash` to move *only* for fixtures
-   whose `ingest_decoder` changed. Failure condition: any `content_hash` or `id` moved, or a
-   `manifest_hash` moved without a corresponding decoder-identity change. This is the check that
-   makes the diff legible; it is a hard gate, not a report.
+Its case has three parts. **Detection needs a comparand** — a reader holding *one* artifact in 2050
+cannot ask "was this produced by the decoder with the known tz bug?", because the seal is silent and
+the `aux/` record that answers it is unauthenticated (`SignedPayload` binds `manifest_hash` only,
+`signing.rs:43-53`) and strippable, with a stripped file byte-indistinguishable from one that never
+carried the record. **Reproduction, not meaning, is the archival requirement** — re-running the
+pipeline from the seal alone requires naming which pipeline to re-run. And **the substrate argument**,
+which is the strongest form of the objection:
 
-   **This requires the golden record to carry the decoder.** `Golden` today is
-   `{name, product, id, content_hash, manifest_hash}` (`tessera-io/src/conformance.rs:34-40`), which
-   does not carry enough to evaluate the rule above against the committed corpus alone. Ingest
-   fixtures must therefore add `ingest_decoder` to their golden record, and that field must land
-   **with the first ingest fixture, not after it** — the same "decide before P1" discipline that
-   motivated #403, for the same reason: goldens written before the field exists are ambiguous
-   forever.
+> *"Over 30 years, disk/tape/handover is the substrate; OCI is a distribution mechanism of the moment,
+> and only when consumers pin digests rather than tags. Optimising integrity for the substrate that
+> already provides it, and abandoning it on the one that does not, inverts the preservation posture."*
+
+Priced by threat model: accidental repack that drops `aux/`, and a careless intermediary "cleaning
+up" provenance, are both survivable-but-exposed under option 4 on disk paths and covered on
+digest-pinned OCI pulls. A **deliberate** adversary whitewashing which decoder ran is the case option
+4 cannot detect — the ADR-0037 signature still verifies, because it never covered `aux/`.
+
+The dissent's preferred resolution is not option 1 as drafted but *seal both sides*: add a
+mechanically derived `tessera_canonicalisation_digest` alongside `ingest_decoder`, closing the
+self-exemption noted below in favour of sealing rather than in favour of `aux/`.
+
+It also named the cleanest statement of the fork, which this ADR adopts as its own framing: §6's
+admission rule as written fits option 4, and sealing the decoder id requires **widening** that rule to
+*"changes what the values mean **or is required to reproduce them"***. The choice is to widen the rule
+openly or to accept option 4. Widening it silently — which the earlier draft did — was the one option
+foreclosed.
+
+Why it did not carry, and what is conceded to it:
+
+- **Attribution is re-derivable from sealed facts.** Because the source digest and `content_hash` are
+  both sealed, a claimed decoder can be *checked*: re-decode the source under the claim and confirm it
+  reproduces the sealed `content_hash`. An `aux/` attribution is therefore not "trust me" — it is a
+  falsifiable claim anchored to sealed data. This holds only while the source-of-record survives; the
+  normalise tier does not retain source bytes, so an archive that discards its sources keeps only the
+  unauthenticated claim. That residual is real and is the strongest thing the dissent has.
+- **Integrity vs attribution.** The signature already provides record-level tamper-evidence for the
+  *integrity* claim, transitively covering the sealed `ingested_from.content_hash`. The decoder id is
+  a *triage* claim. Regulated practice demands intrinsic tamper-evidence for the former and routinely
+  accepts operator-managed controls for the latter.
+- **`aux/` travels.** Aux members are zip entries inside the `.tsra` and are round-tripped by
+  `unpack_pack_round_trips_the_aux_subtree`; `tessera push` ships the whole file as one sha256-addressed
+  OCI layer (`tessera-io/src/oci.rs:22-60`), so a consumer pinning the OCI digest gets transport-level
+  integrity over `aux/` too. Strippable means *removable without breaking verification*, not
+  *routinely lost*.
+- **Reversibility runs the other way from the intuition.** Because the field is `skip_serializing_if`
+  -guarded and #386 has not yet sealed a single `ingest_decoder`, the cohort stranded by choosing
+  option 4 today is **empty**. Adding a sealed decoder digest later is additive and leaves older
+  artifacts valid; it is the upgradeable bet. Sealing now and removing later is equally cheap for new
+  artifacts but cannot un-burden the ones already written.
+
+A regulated-clinical adopter who cannot mandate digest-pinned custody may legitimately want sealed
+attribution. That adopter should ask for it **together with** a sealed `tessera_ingest_version`, so
+the treatment stays symmetric — and that is a coherent future ADR, not this one.
+
+### What is recorded, and where
+
+`aux/provenance.json` gains the decoder record alongside its existing `ingested_at` / `producer` /
+`host` fields:
+
+```json
+{
+  "ingested_at": "2026-08-21T12:34:56Z",
+  "producer":    "tessera/<TESSERA_VERSION>",
+  "host":        "<HOSTNAME>",
+  "ingest_decoder": "arrow-rs 58.3.0+feat:9f2c1ab4",
+  "ingest_profile": "arrow-primitive-v1"
+}
+```
+
+Both decoder fields survive from the rejected candidates, demoted to where claims can be revised:
+
+- **`ingest_decoder`** — decoder name, `=`-pinned version, and a digest over the resolved
+  decode-relevant features, **derived mechanically at build time, never typed**. The feature digest
+  earns its place even outside the seal: ADR-0057 §5 found that `--features sql` flips
+  `arrow-array/chrono-tz`, so two builds at one arrow-rs version can decode a
+  `Timestamp(_, Some(tz))` differently — hazard H1 arriving through a feature rather than a version.
+  A bare semver would name those two decoders identically. It must describe the features resolved in
+  *the build that actually decoded this file*, which is the same mechanism as ADR-0057 Gate B but not
+  the same configuration (Gate B snapshots at `--all-features` because its job is to catch any drift
+  the workspace can reach).
+- **`ingest_profile`** — the human-legible contract label the #398 spike proposed. As a diagnostic it
+  costs nothing and answers the steward's "same contract?" question at a glance; as a sealed claim it
+  would have been an assertion no gate can discharge.
+
+### Two conditions this decision depends on
+
+Option 4 rests on the sealed bracket of Finding 2. Both of these must hold, or the argument does not:
+
+1. **The `ingested_from` edge must be guaranteed, not conventional.** Every backend stamps it today,
+   but `Manifest::sources` defaults to empty and nothing enforces it. For generic ingest the edge —
+   carrying a source digest — must be **required**, and `schema.validate()` must say so. Without it
+   the detection bracket is a convention, and a convention is not a seal.
+2. **Canonicalisation must close the presentation-not-values leaks.** Finding 1 holds for *values*,
+   but three paths were found by which a decoder change could move `content_hash` without any change
+   in information, none of them enumerated in the §5 hazard table: an all-valid column newly wrapped
+   in `ColumnData::Nullable` (the packed validity trailer, `table.rs:259-263`); physical **column
+   order**, since `TableSpec.columns` is a `Vec` and drives Vortex `StructArray` field order; and
+   **dtype width** (`Int32` vs `Int64` for the same values), plus decoder-provided row-group
+   boundaries leaking into multi-block layout. The §2 boundary must normalise all three, and they must
+   join the hazard table. Until they do, Finding 1 is assumed-complete rather than gated-complete.
+
+### The gate
+
+Option 4 simplifies the enforcing check rather than complicating it, because there is no claim to
+discharge — only values to compare:
+
+1. **Value-preservation check.** Regenerate the ingest corpus at the new pin; every fixture's
+   `content_hash` and `id` must be byte-identical. A moved `content_hash` is not a formality: the PR
+   must state which H-rule changed behaviour and why the new values are correct. There is no
+   "`manifest_hash` may move because the label moved" branch to special-case, and no expanded golden
+   record is needed.
 2. **ADR-0057 Gate A (behavioural)** — goldens byte-identical across every configured feature
-   configuration and with the committed corpus. Unchanged, and now load-bearing for ingest too.
+   configuration and with the committed corpus, on both CI architectures.
 3. **ADR-0057 Gate B (structural)** — committed `cargo tree -e features` snapshots of seal-path
-   crates. Extended: the sealed feature digest is derived from the same resolved-feature *mechanism*,
-   so a snapshot that moves and a digest that does not is itself a gate failure. **Same mechanism, not
-   the same file**: Gate B snapshots at `--all-features` because its job is to catch any drift the
-   workspace can reach, while the sealed digest must describe the features resolved in *the build that
-   actually decoded this file*. A `full` binary that sealed the workspace's kitchen-sink feature set
-   would be misnaming its own decoder — precisely the error this field exists to prevent.
-4. **Anti-vacuity (ADR-0057 §5).** The declared expected-fixture-count-per-configuration guard applies
-   here without exception, and the fixture set must carry **at least one fixture per live hazard
-   H1–H9**. A gate that silently runs zero ingest fixtures reports the same green as one that runs
-   twelve, and this repo has shipped that failure before.
+   crates. A snapshot that moves while no golden moves is a deliberate, documented event.
+4. **Anti-vacuity (ADR-0057 §5)** — the declared expected-fixture-count-per-configuration guard, plus
+   **at least one fixture per live hazard H1–H9** (and per the three leaks above, once they are added).
+   A gate that silently runs zero ingest fixtures reports the same green as one that runs twelve, and
+   this repo has shipped that failure before.
 
-Honest statement of the residual: this gate proves value-preservation **over the corpus**, not over
-all inputs. Under option 1 that is sufficient, because the seal's truth does not depend on it — the
-gate is a review aid whose failure costs a discussion. Under a sealed profile id the same gate would
-have been the sole thing standing between a routine bump and a permanently false seal, and a check
-that cannot be strengthened to proof is the wrong load-bearing member.
+Under option 4 a value-preserving bump is a no-op: nothing sealed moves, no corpus regeneration is
+triggered, and Gate A stays green without a maintainer decision. The bump PR is exactly as loud as the
+event deserves — silent when nothing changed, and loud, with a required written justification, when
+values moved.
 
-And a scope note, so this is not re-litigated: `ingest_decoder` is truthful about **the decoder**, not
-about determinism in general. Hazards H1 (host tzdb), H7 (SIMD dispatch) and H8 (locale) can move
-decoded values with the decoder identity unchanged — under *every* candidate, since none of them is
-versioned by the decoder. Those are closed by §5's rules (strip tz and take raw ticks, canonicalise at
-the boundary, `LC_ALL=C`) and by Gate A's cross-arch leg, not by this field. What §6a claims is
-narrower and exact: when the decoder changes, the seal says so.
+Honest statement of the residual: the gate proves value-preservation **over the corpus**, not over all
+inputs, and no option escapes that. Under option 4 nothing in the seal asserts anything about the
+decoder, so an uncovered value-changing bump produces two products whose sealed `content_hash`es
+differ — self-describing, and correctly attributable from the sealed source edge. What is lost, and
+should be stated plainly rather than argued away, is fast single-artifact triage when the `aux/`
+record has been stripped **and** the source-of-record is gone.
 
 ## §7 — Schema, sensitivity, and the laundering rule
 
@@ -457,9 +525,6 @@ ProductSchema {
             "Study / cohort / experiment this table belongs to (FAIR grouping)", "string"),
         FieldSpec::recommended("source_format",
             "Source format normalised at ingest (\"parquet\" | \"arrow\" | \"csv\" | …)", "string"),
-        FieldSpec::recommended("ingest_decoder",
-            "Decoder that produced this block (name + pinned version + resolved-feature digest)",
-            "string"),
     ],
     blocks: vec![one("data", Some(Table),
         "Normalised flat columnar table (Vortex-encoded at seal)")],
@@ -508,8 +573,9 @@ warn: column 'patient_id' matches an identifying-name pattern (MRN / patient id 
 byte-indistinguishable from a real vendor listmode ingest, carrying PS3.15 `Identifying` tiers that
 **no classification pass ever validated** — and every downstream consumer of
 `manifest.schema.fields[].sensitivity` would trust them. That is the self-describing-artifact thesis
-turned into a weapon. So: **a manifest whose `ingest_decoder` is a generic backend must declare a
-product in `{table, array, blob}`**, unless the operator supplies an explicit
+turned into a weapon. So: **an ingest through a generic backend must produce a product in
+`{table, array, blob}`** — enforced at the door by the engine, which knows which backend it dispatched
+to, rather than read back off a manifest field — unless the operator supplies an explicit
 `--classification-ack` (an ADR-0037 signature over the schema + column-tier tuple). No ack, no vendor
 schema. Retrofitting this after the first such artifact ships would leave those seals permanently
 ambiguous, which is why it belongs in this ADR rather than a later one.
@@ -636,9 +702,10 @@ They are gated anyway, for three reasons that do hold:
    with the static-HDF5 build in it. Every ungated reader is unconditionally in that build.
 2. **Supply-chain surface** — an embedder who never ingests Parquet should not have to audit
    `thrift`/`snap`/`brotli` under `cargo deny`.
-3. **The determinism story (the load-bearing one)** — §6 seals `ingest_decoder`. A feature-gated
-   decoder makes *which decoders could have produced this artifact* a **build-time fact** rather than
-   a runtime accident, which is exactly the property the sealed decoder id is trying to buy.
+3. **The determinism story (the load-bearing one)** — a feature-gated decoder makes *which decoders
+   could have produced this artifact* a **build-time fact** rather than a runtime accident. That
+   property is what makes the §6a `aux/` decoder record derivable at build time instead of guessed at,
+   and what lets ADR-0057 Gate B reason about the decode path structurally.
 
 ```toml
 [features]
@@ -678,21 +745,29 @@ dependencies is out of scope here but is the larger prize, and is named for a fu
   delivers the same ergonomics with none of the failure modes.
 - **Keeping vendor verbs as first-class CLI citizens.** Locks in a second naming axis forever;
   pre-1.0 is the only cheap moment to collapse it.
-- **Recording the decoder identity outside the seal** (in `aux/provenance.json`). `content_hash` is a
-  function of what the decoder *did*; leaving the decoder unrecorded makes the seal depend on an input
-  it does not name, and `aux/` is strippable by design (ADR-0042).
-- **A decoder profile id replacing the version** (`arrow-primitive-v1`, option 2 of #403). Substitutes a
-  maintainer claim for a verifiable fact inside an immutable record. The claim is dischargeable only over
-  a finite corpus, so the first value-changing bump on an uncovered input shape seals a falsehood that no
-  errata channel can retract — §2's rejected lossy tier, re-entering through the provenance door (§6a).
-- **Sealing both the profile id and the version** (option 3 of #403). The sealed version still moves
-  `manifest_hash` on every bump, so it pays option 1's churn in full and buys only a label — while adding
-  a second identifier that readers must reconcile, and that they reliably resolve in favour of the
-  familiar-looking one.
-- **Profile id sealed with the version demoted to `aux/`** (option 3′ of #403). The only candidate that
-  genuinely reduces churn, and it buys that by moving the verifiable fact outside the seal, where it can
-  be stripped without trace. It also asks Tessera to shadow-version a project it does not control; the
-  ADR-0052 precedent it leans on supports sealing a contract id only where we own the contract (§6a).
+- **Sealing the decoder version** (option 1 of #403, and this ADR's own earlier draft). Seals a
+  transitive dependency version — the category §6 assigns to `aux/` — and so requires silently widening
+  §6's admission rule from *"changes what the values mean"* to *"…or is required to reproduce them"*.
+  It also churns `manifest_hash` on every benign bump for a diff whose shape is known before it is
+  opened, and holds arrow-rs to an attribution standard `tessera-ingest`'s own canonicalisation code is
+  exempt from (§6a).
+- **A decoder profile id** (`arrow-primitive-v1`, option 2 of #403). Substitutes a maintainer claim for
+  a verifiable fact inside an immutable record. The claim is dischargeable only over a finite corpus, so
+  the first value-changing bump on an uncovered input shape seals a falsehood that no errata channel can
+  retract — §2's rejected lossy tier, re-entering through the provenance door.
+- **Sealing both the profile id and the version** (option 3 of #403). Pays option 1's cost in full and
+  buys only a label — while adding a second identifier that readers must reconcile, and that they
+  reliably resolve in favour of the familiar-looking one.
+- **Profile id sealed with the version demoted to `aux/`** (option 3′ of #403). Keeps the unbounded
+  claim inside the seal and moves the verifiable fact outside it — the worst division of the two.
+- **Sealing a `provenance_hash` over the `aux/` subtree** (raised on the second pass as a way to make
+  `aux/` tamper-evident without sealing the decoder). It does not work: `stamp_ingest_provenance` writes
+  `aux/provenance.json` into an **already-sealed** `.tsra` (`tessera-io/src/provenance.rs:86-106`), and
+  the record carries `ingested_at` + `host`, so binding it into the seal would make `manifest_hash` a
+  function of wall-clock and hostname and destroy re-ingest byte-identity — the property ADR-0042 exists
+  to protect. Restricting the hash to a deterministic subset is just sealing the decoder record with an
+  opaque digest instead of a legible string: same churn, worse ergonomics. There is no third thing
+  between sealing attribution and not sealing it.
 - **Defaulting generic-ingest columns to `Sensitivity::Public`.** Seals a false safety claim, and
   seals are forever.
 - **TIFF in P1.** Two independent reviewers flagged it; the pyramid is the point for whole-slide
@@ -702,13 +777,20 @@ dependencies is out of scope here but is the larger prize, and is named for a fu
 
 - The normalising path opens to non-vendor data; the AX write-your-own-data gap (#390) gets a real
   answer rather than "wrap it in a blob".
-- Four additive, corpus-neutral format fields land in `tessera-core` (§6). They are additive by
+- Three additive, corpus-neutral format fields land in `tessera-core` (§6). They are additive by
   construction, but they are still format surface — the reason each earns its place is stated inline.
-- `content_hash` is explicitly a function of what the decoder *does*, and `manifest_hash` a function of
-  the decoder identity the seal *names*. This is a clarification of reality, not a new dependency, but it
-  means decoder bumps become deliberate corpus events, governed by the §6a policy and gate. `id` and
-  `content_hash` are untouched by a value-preserving bump, so a bump is a new version of the same logical
-  product, not a new product.
+- `content_hash` is a function of the **extracted logical values** and Tessera's own encoder, never of
+  the decoder's byte representation (§6a Finding 1). A value-preserving dependency bump therefore moves
+  **no hash at all** — not `id`, not `content_hash`, and, since nothing decoder-shaped is sealed, not
+  `manifest_hash` either. A decoder bump is a corpus event *only* when it moves a value, which is
+  exactly when it should be.
+- Decoder drift stays detectable from sealed data alone, via the `ingested_from` source digest and
+  `content_hash` (§6a Finding 2) — which makes that edge load-bearing, and it is promoted from
+  convention to a requirement for generic ingest.
+- The decoder identity, its resolved-feature digest and the `ingest_profile` label are recorded in
+  `aux/provenance.json`. Attribution there is falsifiable rather than merely asserted — a claimed
+  decoder can be checked by re-decoding the source against the sealed `content_hash` — but it is not
+  tamper-evident, and that residual is stated in §6a rather than argued away.
 - The CLI shrinks to three ingest verbs and grows a `--from` dimension; vendor verbs go through a
   deprecation cycle and vendor ergonomics move to cookbook recipes (#389).
 - `blob` gets *more* traffic, not less, and that is intended: every rejection routes there with a
@@ -720,13 +802,14 @@ dependencies is out of scope here but is the larger prize, and is named for a fu
 - **P1 — self-describing formats, primitive verbs.** `ingest table --from parquet|arrow`;
   `ingest array --from npy|npz|nifti|dicom|dicom-series|raw`; the §2 type map with recorded
   transforms; §3 struct-flatten; `--as`, `--exclude`, `--column name:dtype`, `--schema`,
-  `--column-meta`; the four §6 format fields, with `ingest_decoder` derived at build time from the
-  `=`-pinned version plus a resolved-decode-feature digest (§6a) and the diagnostic `ingest_profile`
-  label written to `aux/provenance.json`; the §5 canonicalisation rules and corpus fixtures — at least
-  one per live hazard H1–H9, with `ingest_decoder` added to the golden record in the same change that
-  adds the first fixture (§6a); vendor verbs hidden-aliased. Tests: value round-trip, three-producer hash
-  equality, nested→reject, null-slot normalisation, cross-arch determinism, and the §6a
-  value-preservation check.
+  `--column-meta`; the three §6 format fields; `ingest_decoder` (build-derived: `=`-pinned version +
+  resolved-decode-feature digest) and `ingest_profile` written to `aux/provenance.json`, **not** the
+  manifest (§6a); the `ingested_from` source-digest edge promoted from convention to required, enforced
+  in `schema.validate()` (§6a condition 1); the §2 boundary normalising nullable-wrapping, column order
+  and dtype width (§6a condition 2), added to the §5 hazard table; the §5 canonicalisation rules and
+  corpus fixtures — at least one per live hazard; vendor verbs hidden-aliased. Tests: value round-trip,
+  three-producer hash equality, nested→reject, null-slot normalisation, cross-arch determinism, the §6a
+  value-preservation check, and a test that ingest without a source digest fails.
 - **P2 — judgment and CSV.** `ingest analyze`; inference-free CSV with `--schema`/`--column`;
   `verify --require-classified`; the §7 laundering rule enforced in `schema.validate()`.
 - **P3 — the NIfTI correctness gaps** (§11): `.nii.gz`, qform precedence, `space` from the sform/qform
@@ -742,8 +825,16 @@ dependencies is out of scope here but is the larger prize, and is named for a fu
 - Cross-*version* determinism (as opposed to cross-arch) remains unproven for ingest, as it does for
   the format generally.
 - Extension-type handling is best-effort; named handling for `arrow.uuid` / `arrow.json` is unspecified.
-- **The sealed decoder identity is a pointer, and §6a does not preserve what it points at.** A reader in
-  2050 holding `"arrow-rs 58.3.0+feat:…"` can reconstruct the decoder only if that source still exists;
-  a yanked crate or a crates.io outliving its usefulness turns the field into a dangling reference. The
-  archival lens's mitigation — binding each `=` pin to a content-addressed source digest lodged in a WORM
-  archive — is out of scope here and tracked separately.
+- **The recorded decoder identity is a pointer, and §6a does not preserve what it points at.** A reader
+  in 2050 holding `"arrow-rs 58.3.0+feat:…"` can reconstruct the decoder only if that source still
+  exists; a yanked crate, or a crates.io outliving its usefulness, turns the record into a dangling
+  reference. Binding each `=` pin to a content-addressed source digest lodged in a WORM archive is out
+  of scope here and tracked separately.
+- **`aux/` is outside the signature.** ADR-0037 binds `manifest_hash` only, so the decoder record §6a
+  places in `aux/provenance.json` is not tamper-evident. This is the archival dissent's live objection,
+  and the principled fix is a signed-`aux/` appendix that covers *all* forensic provenance rather than
+  privileging one field — tracked separately, not deferred silently.
+- **`tessera-ingest`'s own canonicalisation code is attributed by no sealed field**, and only partially
+  by `ingest_transform`. §6a resolves the arrow-rs asymmetry by sealing neither; the opposite resolution
+  — seal both, via a mechanically derived `tessera_canonicalisation_digest` — remains open and is what
+  a regulated-clinical adopter would ask for.
