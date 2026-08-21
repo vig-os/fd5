@@ -371,7 +371,10 @@ Two supporting arguments were weighed and found not to carry:
   That need is served **outside** the seal: an unsealed `aux/provenance.json` field
   `ingest_profile: "arrow-primitive-v1"`, explicitly diagnostic and never load-bearing. A wrong label
   in `aux/` is a correctable annotation; a wrong claim in the seal is forever. Claims belong where
-  they can be revised; facts belong where they must be preserved.
+  they can be revised; facts belong where they must be preserved. The strippability objection raised
+  against 3′ applies to this label too, and is accepted here for the reason it was refused there: a
+  stripped *diagnostic* costs a convenience, a stripped *forensic record of last resort* costs the
+  ability to detect that the seal is wrong.
 - **`ingest_decoder` stays inside the seal** under this decision, as §6 requires. The churn was never
   an argument for demoting it, and it is not used as one here.
 
@@ -406,11 +409,23 @@ that tells a routine bump from a semantic one. It composes with ADR-0057's two g
    whose `ingest_decoder` changed. Failure condition: any `content_hash` or `id` moved, or a
    `manifest_hash` moved without a corresponding decoder-identity change. This is the check that
    makes the diff legible; it is a hard gate, not a report.
+
+   **This requires the golden record to carry the decoder.** `Golden` today is
+   `{name, product, id, content_hash, manifest_hash}` (`tessera-io/src/conformance.rs:34-40`), which
+   does not carry enough to evaluate the rule above against the committed corpus alone. Ingest
+   fixtures must therefore add `ingest_decoder` to their golden record, and that field must land
+   **with the first ingest fixture, not after it** — the same "decide before P1" discipline that
+   motivated #403, for the same reason: goldens written before the field exists are ambiguous
+   forever.
 2. **ADR-0057 Gate A (behavioural)** — goldens byte-identical across every configured feature
    configuration and with the committed corpus. Unchanged, and now load-bearing for ingest too.
 3. **ADR-0057 Gate B (structural)** — committed `cargo tree -e features` snapshots of seal-path
-   crates. Extended: the sealed feature digest is derived from the same resolved-feature data, so a
-   snapshot that moves and a digest that does not is itself a gate failure.
+   crates. Extended: the sealed feature digest is derived from the same resolved-feature *mechanism*,
+   so a snapshot that moves and a digest that does not is itself a gate failure. **Same mechanism, not
+   the same file**: Gate B snapshots at `--all-features` because its job is to catch any drift the
+   workspace can reach, while the sealed digest must describe the features resolved in *the build that
+   actually decoded this file*. A `full` binary that sealed the workspace's kitchen-sink feature set
+   would be misnaming its own decoder — precisely the error this field exists to prevent.
 4. **Anti-vacuity (ADR-0057 §5).** The declared expected-fixture-count-per-configuration guard applies
    here without exception, and the fixture set must carry **at least one fixture per live hazard
    H1–H9**. A gate that silently runs zero ingest fixtures reports the same green as one that runs
@@ -421,6 +436,13 @@ all inputs. Under option 1 that is sufficient, because the seal's truth does not
 gate is a review aid whose failure costs a discussion. Under a sealed profile id the same gate would
 have been the sole thing standing between a routine bump and a permanently false seal, and a check
 that cannot be strengthened to proof is the wrong load-bearing member.
+
+And a scope note, so this is not re-litigated: `ingest_decoder` is truthful about **the decoder**, not
+about determinism in general. Hazards H1 (host tzdb), H7 (SIMD dispatch) and H8 (locale) can move
+decoded values with the decoder identity unchanged — under *every* candidate, since none of them is
+versioned by the decoder. Those are closed by §5's rules (strip tz and take raw ticks, canonicalise at
+the boundary, `LC_ALL=C`) and by Gate A's cross-arch leg, not by this field. What §6a claims is
+narrower and exact: when the decoder changes, the seal says so.
 
 ## §7 — Schema, sensitivity, and the laundering rule
 
@@ -701,7 +723,8 @@ dependencies is out of scope here but is the larger prize, and is named for a fu
   `--column-meta`; the four §6 format fields, with `ingest_decoder` derived at build time from the
   `=`-pinned version plus a resolved-decode-feature digest (§6a) and the diagnostic `ingest_profile`
   label written to `aux/provenance.json`; the §5 canonicalisation rules and corpus fixtures — at least
-  one per live hazard H1–H9; vendor verbs hidden-aliased. Tests: value round-trip, three-producer hash
+  one per live hazard H1–H9, with `ingest_decoder` added to the golden record in the same change that
+  adds the first fixture (§6a); vendor verbs hidden-aliased. Tests: value round-trip, three-producer hash
   equality, nested→reject, null-slot normalisation, cross-arch determinism, and the §6a
   value-preservation check.
 - **P2 — judgment and CSV.** `ingest analyze`; inference-free CSV with `--schema`/`--column`;

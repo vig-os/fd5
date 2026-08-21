@@ -229,6 +229,13 @@ mod tests {
         let v1 = sealed_with("arrow-rs 58.3.0+feat:9f2c1ab4");
         let v2 = sealed_with("arrow-rs 58.4.0+feat:9f2c1ab4");
 
+        // Read the field back first: without this the assertions below would still pass if sealing
+        // dropped `metadata` entirely, since blocks and id_inputs would be untouched either way.
+        assert_eq!(
+            v1.metadata.get("ingest_decoder"),
+            Some(&serde_json::json!("arrow-rs 58.3.0+feat:9f2c1ab4")),
+            "the decoder identity is carried in the sealed manifest, not just handed to the builder"
+        );
         assert_eq!(v1.id, v2.id, "the decoder is not an identity input");
         assert_eq!(
             v1.content_hash, v2.content_hash,
