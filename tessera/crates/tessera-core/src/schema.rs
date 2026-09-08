@@ -87,7 +87,7 @@ pub struct FieldSpec {
     /// `#[serde(default)]` keeps existing on-disk schemas back-compat (absent ⇒ `Public`).
     #[serde(default)]
     pub sensitivity: Sensitivity,
-    /// Whether this field is **inheritable identity** (ADR-0052 §5): copied from a `derived_from`
+    /// Whether this field is **inheritable identity** (ADR-0058 §5): copied from a `derived_from`
     /// parent into a child product's metadata at seal (unless the child overrides). This is the
     /// *inheritance* axis — orthogonal to [`sensitivity`](Self::sensitivity) (the PHI axis), and an
     /// inherited field carries its tier with it. `skip_serializing_if` keeps the default (`false`)
@@ -159,7 +159,7 @@ impl FieldSpec {
         self
     }
 
-    /// Builder: mark this field **inheritable identity** (ADR-0052 §5) — it flows from a
+    /// Builder: mark this field **inheritable identity** (ADR-0058 §5) — it flows from a
     /// `derived_from` parent into a child product at seal unless the child overrides it.
     pub fn inheritable(mut self) -> Self {
         self.inherit = true;
@@ -219,7 +219,7 @@ pub struct ProductSchema {
     pub fields: Vec<FieldSpec>,
     #[serde(default)]
     pub blocks: Vec<BlockRequirement>,
-    /// Whether a product of this schema **must** carry a generation record (ADR-0052 §3): the
+    /// Whether a product of this schema **must** carry a generation record (ADR-0058 §3): the
     /// schema-declared "this product needs a recipe" rule. `true` on schemas for computed products
     /// (a DAQ/SIM/recon output); absence at validate is a hard block. Default `false` (permissive,
     /// back-compat) with `skip_serializing_if` so existing embedded schemas' bytes are unchanged —
@@ -258,18 +258,18 @@ impl ProductSchema {
                 )));
             }
         }
-        // ADR-0052 §3: a schema-declared "needs a recipe" rule — reuse the same block-on-missing
+        // ADR-0058 §3: a schema-declared "needs a recipe" rule — reuse the same block-on-missing
         // mechanism as required fields, applied to the generation slot. Policy is schema data.
         if self.requires_generation && m.generation.as_ref().is_none_or(|g| g.is_empty()) {
             return Err(crate::Error::Invalid(format!(
-                "schema '{}' requires a generation record (producer config/config_ref) — ADR-0052 §3",
+                "schema '{}' requires a generation record (producer config/config_ref) — ADR-0058 §3",
                 self.product
             )));
         }
         Ok(())
     }
 
-    /// The fields this schema marks **inheritable identity** (ADR-0052 §5) — the allowlist
+    /// The fields this schema marks **inheritable identity** (ADR-0058 §5) — the allowlist
     /// [`crate::provenance::inherit_identity`] copies from a `derived_from` parent. Pure schema data;
     /// the engine holds no field list. Order matches schema declaration.
     pub fn inheritable_fields(&self) -> Vec<&FieldSpec> {
@@ -407,7 +407,7 @@ fn schema(product: &str, version: &str, description: &str) -> ProductSchema {
 /// `diffusion_mri` / `multicontrast_mri` rather than repeated per schema (DRY). `with` appends the
 /// schema's own extra fields.
 fn imaging_base(with: Vec<FieldSpec>) -> Vec<FieldSpec> {
-    // `modality` is intrinsic acquisition identity — it flows raw→derived (ADR-0052 §5).
+    // `modality` is intrinsic acquisition identity — it flows raw→derived (ADR-0058 §5).
     let mut fields = vec![FieldSpec::required("modality", "Imaging modality", "coded")
         .vocabulary("DICOM")
         .with_sensitivity(Sensitivity::Coded)
@@ -537,7 +537,7 @@ fn builtin_schemas() -> Vec<ProductSchema> {
         ProductSchema {
             // `coincidence_mode` is per-level (singles vs prompt vs extended) — NOT inherited.
             // The acquisition-identity fields ARE intrinsic to the acquisition and flow raw→derived
-            // (ADR-0052 §5): the raw `.dat` carries them, the derived singles/coin/events inherit
+            // (ADR-0058 §5): the raw `.dat` carries them, the derived singles/coin/events inherit
             // them so each product is self-describing. Vendor acquisition *config* (cal files, the
             // acq `.cfg`, load-point) is the raw's `generation.config` recipe, not inheritable identity.
             fields: vec![
@@ -1183,7 +1183,7 @@ mod tests {
             .is_empty());
     }
 
-    /// ADR-0052 §3: the "needs a recipe" rule is schema data — a schema with `requires_generation`
+    /// ADR-0058 §3: the "needs a recipe" rule is schema data — a schema with `requires_generation`
     /// blocks a product carrying no (or an empty) generation record, and accepts one with a config.
     /// A schema that does not opt in never blocks (the permissive back-compat default).
     #[test]

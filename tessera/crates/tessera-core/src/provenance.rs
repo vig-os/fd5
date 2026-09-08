@@ -39,7 +39,7 @@ impl Source {
     }
 }
 
-/// Structured producer identity (ADR-0052 §1) — *who/what generated a product*. The universal,
+/// Structured producer identity (ADR-0058 §1) — *who/what generated a product*. The universal,
 /// domain-agnostic keys the format fixes; a generator (tessera itself, or an external DAQ/SIM/recon)
 /// fills its own. Sealed inside the manifest, so it is tamper-evident and part of the product's id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -85,8 +85,8 @@ impl Producer {
     }
 }
 
-/// The manifest `producer` slot: a structured [`Producer`] (ADR-0052) **or** a legacy bare string
-/// (`"tessera/0.0.0"`, pre-ADR-0052). Untagged so a legacy string round-trips **byte-identically**
+/// The manifest `producer` slot: a structured [`Producer`] (ADR-0058) **or** a legacy bare string
+/// (`"tessera/0.0.0"`, pre-ADR-0058). Untagged so a legacy string round-trips **byte-identically**
 /// — existing seals hold, no corpus break — while newly-sealed products carry the struct.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -129,7 +129,7 @@ impl ProducerRef {
     }
 }
 
-/// Generation record (ADR-0052 §2) — *how a product was made*: a generic, **non-opinionated bag**.
+/// Generation record (ADR-0058 §2) — *how a product was made*: a generic, **non-opinionated bag**.
 /// The format enforces only that it is present + non-empty for products whose schema requires a
 /// recipe; the `config` keys are the generator's business and are never inspected by the engine.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -163,7 +163,7 @@ impl Generation {
     }
 }
 
-/// Copy **inheritable identity** fields from `parent` into `child`'s metadata (ADR-0052 §5),
+/// Copy **inheritable identity** fields from `parent` into `child`'s metadata (ADR-0058 §5),
 /// schema-driven: a field flows iff the `schema` marks it [`inherit`](crate::schema::FieldSpec::inherit)
 /// **and** the child does not already set it (an explicit child value always wins). The engine holds
 /// no field list — *which* fields are identity is the schema's declaration. The first-class `study`
@@ -285,7 +285,7 @@ mod tests {
         ));
     }
 
-    /// Back-compat (ADR-0052): a pre-ADR-0052 manifest carries `producer` as a bare string. Reading
+    /// Back-compat (ADR-0058): a pre-ADR-0058 manifest carries `producer` as a bare string. Reading
     /// then re-serializing MUST reproduce the exact string (not a struct), so the seal over the old
     /// bytes still holds and the conformance corpus / DP01 archive are not broken.
     #[test]
@@ -337,7 +337,7 @@ mod tests {
         assert_eq!(v["producer"]["tool"], "tessera");
     }
 
-    /// ADR-0052 §5: identity inheritance is **schema-driven** — only fields the schema flags
+    /// ADR-0058 §5: identity inheritance is **schema-driven** — only fields the schema flags
     /// `inherit` flow from parent to child; a non-flagged field (a transform setting) does not; an
     /// explicit child value always wins; the first-class `study` grouping key flows when unset.
     #[test]

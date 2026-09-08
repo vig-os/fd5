@@ -711,7 +711,7 @@ fn stream_to_listmode_product_2p_to_file_inner(
     }
     // Three-tier metadata precedence, mirroring the batch path (inherit_identity → default → spec):
     // apply in ascending priority so `with_field`'s last-write-wins yields spec > product-own > inherited.
-    // (1) INHERITED schema-flagged identity from `derived_from` parents (ADR-0052 §5) — lowest, so any
+    // (1) INHERITED schema-flagged identity from `derived_from` parents (ADR-0058 §5) — lowest, so any
     //     product-own default or explicit spec value below overrides it. `study` is a first-class field.
     if let Some(s) = inherited_study {
         ws.with_study(s)?;

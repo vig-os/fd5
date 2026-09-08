@@ -1,4 +1,4 @@
-# ADR-0052 — Generation provenance (generic bag) + seal-time identity inheritance
+# ADR-0058 — Generation provenance (generic bag) + seal-time identity inheritance
 
 Status: **Accepted** (implemented — tessera-core spine + tessera-ingest wiring, #324/#342/#343) ·
 Relates: ADR-0025 (ingest, provenance-rooted) · ADR-0033 (raw→derived) ·

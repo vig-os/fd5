@@ -115,14 +115,14 @@ impl ProductBuilder {
         self
     }
 
-    /// Declare the producing tool/build (ADR-0052 §1) — an external DAQ/SIM/recon records its own
+    /// Declare the producing tool/build (ADR-0058 §1) — an external DAQ/SIM/recon records its own
     /// identity here, overriding the default `tessera` stamp. Sealed provenance.
     pub fn with_producer(&mut self, producer: crate::provenance::Producer) -> &mut Self {
         self.manifest.producer = Some(crate::provenance::ProducerRef::Structured(producer));
         self
     }
 
-    /// Attach the generation record (ADR-0052 §2) — *how* this product was made, as a generic bag
+    /// Attach the generation record (ADR-0058 §2) — *how* this product was made, as a generic bag
     /// (inline `config` and/or a `config_ref` to a carried block). Required at validate for schemas
     /// that set `requires_generation`.
     pub fn with_generation(&mut self, generation: crate::provenance::Generation) -> &mut Self {
@@ -130,7 +130,7 @@ impl ProductBuilder {
         self
     }
 
-    /// Inherit **schema-flagged identity** fields from a resolved `derived_from` parent (ADR-0052
+    /// Inherit **schema-flagged identity** fields from a resolved `derived_from` parent (ADR-0058
     /// §5) — the DAG-walk caller (the ingest engine) supplies the parent manifest + this product's
     /// schema; only fields the schema marks `inherit` flow, and an explicit child value always wins.
     /// Call before `seal` so the inherited identity is covered by the seal.
@@ -170,7 +170,7 @@ impl ProductBuilder {
             }
         }
         // Sealed provenance: stamp the producing tool/build so a reader knows what wrote the file
-        // (ADR-0052 §1 — structured [`ProducerRef::tessera()`], tool + `TESSERA_VERSION` +
+        // (ADR-0058 §1 — structured [`ProducerRef::tessera()`], tool + `TESSERA_VERSION` +
         // optional build commit). Re-stamped per version (not inherited) — a new version is sealed
         // by *this* tool.
         //

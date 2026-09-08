@@ -162,7 +162,7 @@ fn run_into(
     // (name → (id, manifest_hash)) — the resolver `derived_from` edges look parents up in.
     let mut built: BTreeMap<String, (String, String)> = BTreeMap::new();
     // (name → sealed Manifest) — retained so a derived product can inherit schema-flagged identity
-    // from its parents at seal (ADR-0052 §5). Topo order (parents-first) guarantees a parent is
+    // from its parents at seal (ADR-0058 §5). Topo order (parents-first) guarantees a parent is
     // present before any child that derives from it.
     let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
 
@@ -175,7 +175,7 @@ fn run_into(
         let p = &spec.products[idx];
         let extra = build_extra_sources(p, &built, &spec_ref, &h)?;
         // Resolve this product's `derived_from` parents to their sealed manifests (topo order ⇒
-        // present) so the seal can inherit their schema-flagged identity (ADR-0052 §5).
+        // present) so the seal can inherit their schema-flagged identity (ADR-0058 §5).
         let parents: Vec<&Manifest> = p
             .derived_from
             .iter()
@@ -474,7 +474,7 @@ fn dispatch(
                 // directly; we then re-open the sealed manifest to record its id.
                 let stage = out_dir.join(format!("__stage_{}", sanitize_reference(name)));
                 let tmp_out = out_dir.join(format!("__pending_{}.tsra", sanitize_reference(name)));
-                // ADR-0052 §5: inherit schema-flagged identity from parents up-front (the streaming
+                // ADR-0058 §5: inherit schema-flagged identity from parents up-front (the streaming
                 // writer applies metadata pre-seal on the WriteSession, so there is no post-build
                 // re-seal hook — and re-writing a multi-GB streamed .tsra just for metadata would
                 // defeat the bounded-memory path). The backend layers the three tiers in ascending
@@ -654,7 +654,7 @@ fn seal_streaming_to_tsra(
     Ok(m)
 }
 
-/// Re-seal a product with (1) **inherited identity** from its `derived_from` parents (ADR-0052 §5)
+/// Re-seal a product with (1) **inherited identity** from its `derived_from` parents (ADR-0058 §5)
 /// and (2) the spec's `[product.metadata]` overrides, then the recorded `[generation]`/`[producer]`.
 /// Priority is spec metadata > the product's own value > inherited-from-parent, so an explicit value
 /// always wins. Blocks are reused by digest (`from_manifest`), so `content_hash`/`id` are stable —
@@ -665,7 +665,7 @@ fn seal_streaming_to_tsra(
 /// inheritance is driven by the **child's** embedded/builtin schema (`inheritable_fields`) — the
 /// engine holds no field list. The streaming path (`WriteSession`) applies spec overrides directly;
 /// this is the batch-path counterpart, and inheritance rides both.
-/// The identity fields a `product`-schema'd child inherits from its `parents` (ADR-0052 §5), as a
+/// The identity fields a `product`-schema'd child inherits from its `parents` (ADR-0058 §5), as a
 /// plain metadata map. The **streaming** ingest path applies metadata on the `WriteSession` before
 /// seal (not via [`apply_spec_metadata`]), so it needs the inherited fields up-front rather than a
 /// post-build `inherit_identity_from`. Schema-driven — the engine holds no field list; the first
@@ -711,7 +711,7 @@ fn apply_spec_metadata(
     for (k, v) in meta {
         b.with_field(k, v.clone());
     }
-    // (3) The sealed generation recipe + producer identity (ADR-0052 §1/§2).
+    // (3) The sealed generation recipe + producer identity (ADR-0058 §1/§2).
     if let Some(g) = &p.generation {
         b.with_generation(g.clone());
     }
@@ -1082,7 +1082,7 @@ metadata = {{ coincidence_mode = "singles", site = "anvil" }}
         }
     }
 
-    /// ADR-0052 through-line (#342/#324): a derived product **inherits** schema-flagged identity
+    /// ADR-0058 through-line (#342/#324): a derived product **inherits** schema-flagged identity
     /// from its parent on BOTH the batch and streaming paths, an explicit child value wins, and the
     /// raw records a **generation** recipe + external **producer** identity that ride the seal.
     #[test]
@@ -1162,7 +1162,7 @@ patient_id = "OVERRIDE"
         let der_batch = mani(1);
         let der_stream = mani(2);
 
-        // The raw records the generation recipe + external producer (ADR-0052 §1/§2), sealed.
+        // The raw records the generation recipe + external producer (ADR-0058 §1/§2), sealed.
         let g = raw
             .generation
             .as_ref()

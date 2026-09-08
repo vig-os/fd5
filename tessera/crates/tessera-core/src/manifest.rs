@@ -39,12 +39,12 @@ pub struct Manifest {
     /// RFC 3339 timestamp, normalized to UTC.
     pub timestamp: String,
     /// The tool/build that produced this product — sealed provenance so a reader knows *what wrote
-    /// the file* (ADR-0052 §1). A structured [`ProducerRef::Structured`] on newly-sealed products;
-    /// a legacy bare string (`"tessera/0.0.0"`) round-trips unchanged on pre-ADR-0052 files. `None`
+    /// the file* (ADR-0058 §1). A structured [`ProducerRef::Structured`] on newly-sealed products;
+    /// a legacy bare string (`"tessera/0.0.0"`) round-trips unchanged on pre-ADR-0058 files. `None`
     /// only for pre-stamp legacy files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer: Option<ProducerRef>,
-    /// Generation record (ADR-0052 §2) — *how* this product was made: producer's config/settings as
+    /// Generation record (ADR-0058 §2) — *how* this product was made: producer's config/settings as
     /// a generic bag (inline or a `config_ref` to a carried block). Sealed. Required at validate for
     /// products whose schema sets `requires_generation`; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
