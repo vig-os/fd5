@@ -581,6 +581,9 @@
             cp ${tessera-py-lib}/lib/_native.so tessera/_native.so
             export PYTHONPATH=$PWD
             python3 ${./tessera/crates/tessera-py/tests/smoke.py} ${./tessera/corpus/files}
+            # Docstring-vs-behaviour drift gate (#412): probes every dtype code against the live
+            # module and asserts the accepted sets exactly match what the docstrings advertise.
+            python3 ${./tessera/crates/tessera-py/tests/api_drift.py}
             touch $out
           '';
 
@@ -600,6 +603,8 @@
             export PYTHONPATH=$TMPDIR/site
             export LD_LIBRARY_PATH=${pkgs.stdenv.cc.cc.lib}/lib
             python3 ${./tessera/crates/tessera-py/tests/smoke.py} ${./tessera/corpus/files}
+            # Same drift gate as tessera-py-import, proven through the installed wheel.
+            python3 ${./tessera/crates/tessera-py/tests/api_drift.py}
             touch $out
           '';
 
