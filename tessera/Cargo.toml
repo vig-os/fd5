@@ -40,6 +40,7 @@ zip = { version = "2", default-features = false }   # STORED zip64 `.tsra` conta
 # via the `zstd` crate (no system zstd dep, hermetic build stays clean).
 zarrs = { version = "0.23", default-features = false, features = ["pcodec", "zstd"] }
 bytes = "1"                                          # zarrs store value type
+half = "2"                                           # float16 array dtype (already in-tree via zarrs)
 # Table block backend: Vortex (the settled columnar backend) — deterministic single-file writer +
 # reader. vortex-file pulls the default encoding crates (pco/alp/fsst/…); the sub-crates give the
 # exact import paths the probe verified. CurrentThreadRuntime drives the async write/read (no tokio).

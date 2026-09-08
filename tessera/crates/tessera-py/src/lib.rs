@@ -243,8 +243,10 @@ impl Builder {
 
     /// Add an N-D **array** block from a little-endian C-order buffer (e.g.
     /// `arr.astype(arr.dtype.newbyteorder("<")).tobytes()`), its `shape`, and the numpy `code`
-    /// (`i2/i4/i8`, `u2/u4/u8`, `f4/f8` — the pcodec backend needs ≥16-bit; for 8-bit, bool, or
-    /// string data use a **table** block, whose [`add_table`] code set is wider).
+    /// (`i1/i2/i4/i8`, `u1/u2/u4/u8`, `f2/f4/f8`, `b1`) — the full numpy fixed-width numeric
+    /// ladder plus bool. Sub-16-bit codes (`i1/u1/b1/f2`) are stored **widened** to a
+    /// pcodec-native width (free in output size) and read back at their original dtype —
+    /// transparent to callers. For string data use a **table** block ([`add_table`]).
     fn add_array(&mut self, name: &str, code: &str, shape: Vec<u64>, data: &[u8]) -> PyResult<()> {
         let arr = ArrayData::from_le_bytes(code, data).map_err(err)?;
         let n: u64 = shape.iter().product();
@@ -266,9 +268,10 @@ impl Builder {
     /// Add a **table** block from ordered `columns` of `(name, code, le_bytes)`. All columns must
     /// have equal length. `row_index` (optional) names the O(1)-take index column.
     ///
-    /// Accepted `code`s are a **superset** of [`add_array`]'s: `i1/i2/i4/i8`, `u1/u2/u4/u8`,
-    /// `f4/f8`, `b1` (one byte per bool), and `str` (UTF-8 length-prefixed: `[u32 LE len | bytes]*`).
-    /// The 8-bit and string codes are table-only — the array path's pcodec backend needs ≥16-bit.
+    /// Accepted `code`s: `i1/i2/i4/i8`, `u1/u2/u4/u8`, `f4/f8`, `b1` (one byte per bool), and
+    /// `str` (UTF-8 length-prefixed: `[u32 LE len | bytes]*`). `str` is table-only; conversely
+    /// float16 is array-only ([`add_array`]) — the columnar toolchain (polars/arrow/duckdb) has
+    /// no native half-float, so float16 *columns* would silently upcast downstream.
     #[pyo3(signature = (name, columns, row_index=None))]
     fn add_table(
         &mut self,

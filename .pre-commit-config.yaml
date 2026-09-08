@@ -110,7 +110,9 @@ repos:
     hooks:
       - id: typos
         name: typos (spell check)
-        entry: typos
+        # --force-exclude: honour _typos.toml [files] extend-exclude even for the explicit
+        # staged-file paths prek passes (binary corpus .tsra vectors are excluded there).
+        entry: typos --force-exclude
         language: system
 
   # GitHub Actions SHA pinning enforcement
