@@ -145,18 +145,7 @@ fn slab_to_columns(bytes: &[u8], c: &CompoundType, n_rows: usize) -> Result<Tabl
         .map(|(_, code)| empty_for(code))
         .collect::<Result<_>>()?;
     for col in &mut cols {
-        match col {
-            ColumnData::I8(v) => v.reserve_exact(n_rows),
-            ColumnData::I16(v) => v.reserve_exact(n_rows),
-            ColumnData::I32(v) => v.reserve_exact(n_rows),
-            ColumnData::I64(v) => v.reserve_exact(n_rows),
-            ColumnData::U8(v) => v.reserve_exact(n_rows),
-            ColumnData::U16(v) => v.reserve_exact(n_rows),
-            ColumnData::U32(v) => v.reserve_exact(n_rows),
-            ColumnData::U64(v) => v.reserve_exact(n_rows),
-            ColumnData::F32(v) => v.reserve_exact(n_rows),
-            ColumnData::F64(v) => v.reserve_exact(n_rows),
-        }
+        col.reserve_exact(n_rows);
     }
 
     // For each record, walk the field plan and push each (sub-)scalar.
@@ -413,8 +402,134 @@ pub fn compound_columns(path: &std::path::Path, dataset: &str) -> Result<Vec<Col
             name,
             dtype: code.into(),
             codec: None,
+            ..Default::default()
         })
         .collect())
+}
+
+// ── Opt-in GEDDF dictionary transform (#307 column annotation + #310 quantization) ──────────
+// The vendor HDF5 carries no per-column units/descriptions, and stores reconstructed quantities as
+// float32 with ~3 orders of magnitude more precision than the measurement holds (#310 benchmark).
+// This transform is OPT-IN (default off → byte-identical output, so the corpus/manifest_hash
+// invariant is untouched): it annotates columns from the embedded domain-owner dictionary and, when
+// `quantize`, requantizes float columns to int16 at the physical resolution (physical = raw × scale).
+
+/// One column's entry in the embedded GEDDF dictionary (`docs/dictionaries/…toml`). Unknown keys
+/// (`dtype`, `vocabulary`, `_tentative`, `_conflict`, `quantize_dtype`) are ignored by serde.
+#[derive(serde::Deserialize)]
+struct DictCol {
+    #[serde(default)]
+    short_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    unit: Option<String>,
+    /// Fixed-point scale for the int16 quantization: physical = raw × `quantize_scale`.
+    #[serde(default)]
+    quantize_scale: Option<f64>,
+}
+
+type GeDict = std::collections::BTreeMap<String, std::collections::BTreeMap<String, DictCol>>;
+
+/// Parse the embedded GEDDF listmode column dictionary once. Panics only if the in-tree TOML is
+/// malformed — an invariant guarded by the `geddf_dictionary_parses` test.
+fn geddf_dict() -> &'static GeDict {
+    static DICT: std::sync::OnceLock<GeDict> = std::sync::OnceLock::new();
+    DICT.get_or_init(|| {
+        toml::from_str(include_str!(
+            "../../../docs/dictionaries/ge-discovery-mi-listmode.toml"
+        ))
+        .expect("embedded GEDDF dictionary is valid TOML")
+    })
+}
+
+/// Map an HDF5 dataset name (or block prefix) to its dictionary group: `events_2p`/`events_3p` →
+/// `events`, `coin_2p`/`coin_3p` → `coin`, else the leaf name itself (`singles`, `time_markers`,
+/// `coin_counters`, …). A path-qualified dataset (`/proc_data/events_3p`) is stripped to its leaf
+/// first (#331) — otherwise annotation/quantization silently no-op'd on nested HDF5 layouts.
+fn dataset_group(name: &str) -> &str {
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    if leaf.starts_with("events") {
+        "events"
+    } else if leaf.starts_with("coin_2p") || leaf.starts_with("coin_3p") || leaf == "coin" {
+        "coin"
+    } else {
+        leaf
+    }
+}
+
+/// Annotate an already-built column list from the GEDDF dictionary for `group`
+/// (`short_name`/`description`/`unit`) — the annotation half of [`apply_geddf_dictionary`], reused by
+/// the streaming and batch-non-quantize paths (which build columns without requantizing). Leaves
+/// `dtype`/`scale`/`codec` untouched, and never overwrites an already-set annotation. Unknown groups
+/// or columns pass through unchanged (open-world).
+pub fn annotate_columns(group: &str, columns: &mut [Column]) {
+    let group = dataset_group(group);
+    let Some(dict) = geddf_dict().get(group) else {
+        return;
+    };
+    for c in columns.iter_mut() {
+        if let Some(m) = dict.get(base_field(&c.name)) {
+            if c.short_name.is_none() {
+                c.short_name = m.short_name.clone();
+            }
+            if c.description.is_none() {
+                c.description = m.description.clone();
+            }
+            if c.unit.is_none() {
+                c.unit = m.unit.clone();
+            }
+        }
+    }
+}
+
+/// The dictionary base field for an exploded column: `en_0` → `en`, `vtx_2` → `vtx`; scalar and
+/// non-numeric-suffixed names (`ms`, `lt_corr`, `n_singles`) pass through unchanged.
+fn base_field(col: &str) -> &str {
+    if let Some(i) = col.rfind('_') {
+        if i > 0 && col[i + 1..].chars().all(|ch| ch.is_ascii_digit()) {
+            return &col[..i];
+        }
+    }
+    col
+}
+
+/// Opt-in transform: annotate `data`'s columns from the GEDDF dictionary for `group`, and — when
+/// `quantize` — requantize float columns to int16 at the dictionary's `quantize_scale` (physical =
+/// raw × scale). Float columns with any non-finite value (e.g. the mostly-NaN `lt_corr`) are left as
+/// float and only annotated — int16 has no NaN. Returns the annotated [`Column`] schema for the
+/// (possibly requantized) `data`; call BEFORE sealing so payload and manifest reflect the transform.
+pub fn apply_geddf_dictionary(group: &str, data: &mut TableData, quantize: bool) -> Vec<Column> {
+    let group = dataset_group(group);
+    let dict = geddf_dict().get(group);
+    let mut columns = Vec::with_capacity(data.len());
+    for (name, col) in data.iter_mut() {
+        let meta = dict.and_then(|g| g.get(base_field(name)));
+        let mut scale: Option<f64> = None;
+        if quantize {
+            if let (ColumnData::F32(v), Some(qs)) = (&*col, meta.and_then(|m| m.quantize_scale)) {
+                if v.iter().all(|x| x.is_finite()) {
+                    let q: Vec<i16> = v
+                        .iter()
+                        .map(|x| {
+                            (*x as f64 / qs)
+                                .round()
+                                .clamp(i16::MIN as f64, i16::MAX as f64)
+                                as i16
+                        })
+                        .collect();
+                    *col = ColumnData::I16(q);
+                    scale = Some(qs);
+                }
+            }
+        }
+        let mut c = Column::new(name.clone(), col.numpy_code());
+        c.scale = scale;
+        columns.push(c);
+    }
+    // Unit/description/short_name from the dictionary — the same annotation the non-quantize paths use.
+    annotate_columns(group, &mut columns);
+    columns
 }
 
 /// Read a GE listmode 3-photon dataset (default name `events_3p`) and transpose to flat Tessera
@@ -478,6 +593,8 @@ pub fn stream_to_listmode_product_2p_to_file(
     row_index: &str,
     source_label: Option<&str>,
     extra_sources: &[tessera_core::provenance::Source],
+    inherited: &std::collections::BTreeMap<String, serde_json::Value>,
+    inherited_study: Option<&str>,
     extra_metadata: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Manifest> {
     stream_to_listmode_product_2p_to_file_inner(
@@ -494,6 +611,8 @@ pub fn stream_to_listmode_product_2p_to_file(
         row_index,
         source_label,
         extra_sources,
+        inherited,
+        inherited_study,
         extra_metadata,
     )
 }
@@ -531,6 +650,8 @@ pub fn stream_to_listmode_product_2p_to_file_with_block_rows(
         None,
         &[],
         &std::collections::BTreeMap::new(),
+        None,
+        &std::collections::BTreeMap::new(),
     )
 }
 
@@ -554,9 +675,14 @@ fn stream_to_listmode_product_2p_to_file_inner(
     row_index: &str,
     source_label: Option<&str>,
     extra_sources: &[tessera_core::provenance::Source],
+    inherited: &std::collections::BTreeMap<String, serde_json::Value>,
+    inherited_study: Option<&str>,
     extra_metadata: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Manifest> {
-    let columns = compound_columns(path, dataset)?;
+    let mut columns = compound_columns(path, dataset)?;
+    // #343: annotate the streamed columns (unit/description/short_name) from the GEDDF dictionary so
+    // singles/coin (bounded-memory, non-quantized) are self-describing like the batch events tables.
+    annotate_columns(dataset, &mut columns);
     // Per-row width × BLOCK_ROWS = the encode-side per-block estimate; feed it to the StreamWriter's
     // ring-depth sizing so the in-flight RAM ceiling tracks `cfg.ram_budget` on wide schemas.
     let row_bytes: u64 = columns
@@ -583,14 +709,23 @@ fn stream_to_listmode_product_2p_to_file_inner(
     for s in extra_sources {
         ws.add_source(s.clone())?;
     }
-    // Same default coincidence_mode as the batch builder — declared before any block commits so it
-    // flows into the sealed manifest_hash (the streaming path has no post-seal re-build).
+    // Three-tier metadata precedence, mirroring the batch path (inherit_identity → default → spec):
+    // apply in ascending priority so `with_field`'s last-write-wins yields spec > product-own > inherited.
+    // (1) INHERITED schema-flagged identity from `derived_from` parents (ADR-0058 §5) — lowest, so any
+    //     product-own default or explicit spec value below overrides it. `study` is a first-class field.
+    if let Some(s) = inherited_study {
+        ws.with_study(s)?;
+    }
+    for (k, v) in inherited {
+        ws.with_field(k, v.clone())?;
+    }
+    // (2) PRODUCT-OWN default coincidence_mode (same as the batch builder) — beats inherited, loses to spec.
     ws.with_field(
         "coincidence_mode",
         serde_json::Value::String(DEFAULT_COINCIDENCE_MODE.to_string()),
     )?;
-    // Spec `[product.metadata]` overrides — applied last (so a user value wins over the default)
-    // and before any block commits, so they flow into the sealed manifest_hash with no re-build.
+    // (3) SPEC `[product.metadata]` — highest; an explicit operator value wins over everything. All
+    //     three are declared before any block commits, so they flow into the sealed manifest_hash.
     for (k, v) in extra_metadata {
         ws.with_field(k, v.clone())?;
     }
@@ -648,6 +783,8 @@ pub fn stream_to_listmode_product_2p(
         None,
         &[],
         &std::collections::BTreeMap::new(),
+        None,
+        &std::collections::BTreeMap::new(),
     )?;
     // Re-read block bytes from the temp .tsra so callers get the in-memory pair their API expects.
     // Multi-block products may not fit in RAM — callers needing constant-memory should use
@@ -692,6 +829,34 @@ pub fn to_listmode_product(
         block_prefix,
         row_index,
         extra_sources,
+        None,
+    )
+}
+
+/// Like [`to_listmode_product`], but the caller supplies the sealed column schema — the
+/// annotated / requantized `Vec<Column>` from the opt-in GEDDF transform ([`apply_geddf_dictionary`],
+/// #310). `columns` MUST match `cols` in count, order, and dtype (the transform guarantees this).
+#[allow(clippy::too_many_arguments)]
+pub fn to_listmode_product_with_schema(
+    cols: &TableData,
+    name: &str,
+    timestamp: &str,
+    source: &str,
+    block_prefix: &str,
+    row_index: &str,
+    extra_sources: &[tessera_core::provenance::Source],
+    columns: Vec<Column>,
+) -> Result<(Manifest, Vec<BlockPayload>)> {
+    to_listmode_product_partitioned(
+        cols,
+        name,
+        timestamp,
+        source,
+        tessera_io::BLOCK_ROWS as u64,
+        block_prefix,
+        row_index,
+        extra_sources,
+        Some(columns),
     )
 }
 
@@ -714,19 +879,25 @@ pub(crate) fn to_listmode_product_partitioned(
     block_prefix: &str,
     row_index: &str,
     extra_sources: &[tessera_core::provenance::Source],
+    // `Some` = caller-supplied sealed column schema (annotated / requantized by the opt-in GEDDF
+    // transform, #310); `None` = build it from `cols` (name + dtype only — the byte-identical
+    // default). The overriding schema MUST match `cols` in count, order, and dtype.
+    column_overrides: Option<Vec<Column>>,
 ) -> Result<(Manifest, Vec<BlockPayload>)> {
     if block_rows == 0 {
         return Err(he("to_listmode_product: block_rows must be positive"));
     }
     let total_rows = u64::try_from(cols.first().map(|(_, c)| c.len()).unwrap_or(0)).map_err(he)?;
-    let columns: Vec<Column> = cols
-        .iter()
-        .map(|(n, c)| Column {
-            name: n.clone(),
-            dtype: c.numpy_code().into(),
-            codec: None,
-        })
-        .collect();
+    let columns: Vec<Column> = column_overrides.unwrap_or_else(|| {
+        cols.iter()
+            .map(|(n, c)| Column {
+                name: n.clone(),
+                dtype: c.numpy_code().into(),
+                codec: None,
+                ..Default::default()
+            })
+            .collect()
+    });
     // Partition through the format SSoT — every block carries `block_rows` rows except the trailing
     // one (which may be partial). The same helpers the streamed path uses, so the per-block split
     // matches → identical content_hash for the same `block_rows`.
@@ -781,6 +952,152 @@ pub(crate) fn to_listmode_product_partitioned(
 mod tests {
     use super::*;
     use hdf5::H5Type;
+
+    #[test]
+    fn geddf_dictionary_parses_and_carries_units_and_scales() {
+        let d = geddf_dict();
+        assert!(d.contains_key("events") && d.contains_key("singles") && d.contains_key("coin"));
+        assert_eq!(d["events"]["en"].unit.as_deref(), Some("keV"));
+        assert_eq!(d["events"]["vtx"].unit.as_deref(), Some("mm"));
+        assert_eq!(d["events"]["lt"].unit.as_deref(), Some("ns"));
+        assert_eq!(d["events"]["en"].quantize_scale, Some(0.1));
+        assert_eq!(d["events"]["vtx"].quantize_scale, Some(0.0125));
+    }
+
+    #[test]
+    fn base_field_strips_only_numeric_array_suffix() {
+        assert_eq!(base_field("en_0"), "en");
+        assert_eq!(base_field("vtx_2"), "vtx");
+        assert_eq!(base_field("ms"), "ms");
+        assert_eq!(base_field("lt_corr"), "lt_corr");
+        assert_eq!(base_field("n_singles"), "n_singles");
+    }
+
+    #[test]
+    fn dataset_group_maps_variants() {
+        assert_eq!(dataset_group("events_3p"), "events");
+        assert_eq!(dataset_group("coin_2p"), "coin");
+        assert_eq!(dataset_group("singles"), "singles");
+        assert_eq!(dataset_group("time_markers"), "time_markers");
+        assert_eq!(dataset_group("coin_counters"), "coin_counters");
+        // #331: a path-qualified dataset resolves via its leaf, not the whole path.
+        assert_eq!(dataset_group("/proc_data/events_3p"), "events");
+        assert_eq!(dataset_group("/proc_data/singles"), "singles");
+        assert_eq!(dataset_group("grp/coin_2p"), "coin");
+    }
+
+    #[test]
+    fn annotate_columns_labels_all_listmode_tables() {
+        // #343: the non-quantize paths (streaming singles/coin, batch time-markers/coin-counters)
+        // annotate columns from the dictionary — not just the quantized events table.
+        let mut singles = vec![
+            Column::new("ms", "u4"),
+            Column::new("en", "u2"),
+            Column::new("td", "u2"),
+        ];
+        annotate_columns("singles", &mut singles);
+        assert_eq!(singles[0].unit.as_deref(), Some("ms"));
+        assert_eq!(singles[1].unit.as_deref(), Some("keV"));
+        assert_eq!(singles[2].unit.as_deref(), Some("ps"));
+        assert!(singles[0]
+            .description
+            .as_deref()
+            .is_some_and(|d| d.contains("timestamp")));
+
+        // coin_counters via a nested path (#331 leaf resolution) still annotates.
+        let mut cc = vec![Column::new("cc", "u4")];
+        annotate_columns("/proc_data/coin_counters", &mut cc);
+        assert!(cc[0].description.is_some(), "coin_counters.cc annotated");
+
+        // Already-set annotation is never clobbered (open-world, non-destructive).
+        let mut pre = vec![Column {
+            name: "ms".into(),
+            dtype: "u4".into(),
+            unit: Some("custom".into()),
+            ..Default::default()
+        }];
+        annotate_columns("singles", &mut pre);
+        assert_eq!(pre[0].unit.as_deref(), Some("custom"), "existing unit kept");
+    }
+
+    #[test]
+    fn apply_dictionary_annotates_and_quantizes_events() {
+        let mut data: TableData = vec![
+            ("ms".into(), ColumnData::U32(vec![1, 2, 3])),
+            ("en_0".into(), ColumnData::F32(vec![511.0, 425.5, 650.2])),
+            ("vtx_0".into(), ColumnData::F32(vec![100.0, -200.0, 369.5])),
+        ];
+        let cols = apply_geddf_dictionary("events_3p", &mut data, true);
+        // ms: annotated (unit ms), integer column untouched.
+        assert_eq!(cols[0].dtype, "u4");
+        assert_eq!(cols[0].unit.as_deref(), Some("ms"));
+        assert!(cols[0].scale.is_none());
+        // en_0: float → int16, scale 0.1, unit keV.
+        assert_eq!(cols[1].dtype, "i2");
+        assert_eq!(cols[1].unit.as_deref(), Some("keV"));
+        assert_eq!(cols[1].scale, Some(0.1));
+        match &data[1].1 {
+            ColumnData::I16(v) => assert_eq!(v[0], 5110), // round(511.0 / 0.1)
+            other => panic!("expected I16, got {other:?}"),
+        }
+        assert_eq!(cols[2].scale, Some(0.0125)); // vtx
+    }
+
+    #[test]
+    fn annotate_only_leaves_floats_and_hashes_stable() {
+        // Without `quantize`, float columns keep dtype f4 + unit but NO scale (values are physical).
+        let mut data: TableData = vec![("en_0".into(), ColumnData::F32(vec![511.0]))];
+        let cols = apply_geddf_dictionary("events", &mut data, false);
+        assert_eq!(cols[0].dtype, "f4");
+        assert_eq!(cols[0].unit.as_deref(), Some("keV"));
+        assert!(cols[0].scale.is_none());
+    }
+
+    #[test]
+    fn quantize_skips_nonfinite_float_columns() {
+        // int16 has no NaN — the mostly-NaN `lt_corr` stays float, still annotated.
+        let mut data: TableData = vec![("lt".into(), ColumnData::F32(vec![1.0, f32::NAN, 2.0]))];
+        let cols = apply_geddf_dictionary("events", &mut data, true);
+        assert_eq!(cols[0].dtype, "f4");
+        assert!(cols[0].scale.is_none());
+        assert_eq!(cols[0].unit.as_deref(), Some("ns"));
+    }
+
+    #[test]
+    fn quantized_product_seals_annotated_int16_columns() {
+        // End-to-end: the opt-in transform's annotated/requantized schema reaches the SEALED
+        // manifest's block spec (this is what the `--quantize` ingest path relies on).
+        let mut data: TableData = vec![
+            ("ms".into(), ColumnData::U32(vec![1, 2])),
+            ("en_0".into(), ColumnData::F32(vec![511.0, 425.0])),
+            ("lt".into(), ColumnData::F32(vec![1.5, -2.0])),
+        ];
+        let schema = apply_geddf_dictionary("events_3p", &mut data, true);
+        let (m, _payloads) = to_listmode_product_with_schema(
+            &data,
+            "DP",
+            "2024-01-01T00:00:00Z",
+            "src.h5",
+            "events",
+            "ms",
+            &[],
+            schema,
+        )
+        .unwrap();
+        let cols = m.blocks[0].spec["columns"].as_array().unwrap();
+        let col = |name: &str| cols.iter().find(|c| c["name"] == name).unwrap();
+        // en_0: float → int16, unit keV, scale 0.1.
+        assert_eq!(col("en_0")["dtype"], "i2");
+        assert_eq!(col("en_0")["unit"], "keV");
+        assert_eq!(col("en_0")["scale"], 0.1);
+        // lt: → int16 at 1 ps.
+        assert_eq!(col("lt")["dtype"], "i2");
+        assert_eq!(col("lt")["scale"], 0.001);
+        // ms: integer column untouched, annotated `ms`.
+        assert_eq!(col("ms")["dtype"], "u4");
+        assert_eq!(col("ms")["unit"], "ms");
+        assert!(col("ms").get("scale").is_none());
+    }
 
     // Fixture-write only: writing a synthetic .h5 with a compound dataset legitimately needs a
     // compile-time `H5Type` (the `new_dataset::<T>()` builder is generic). The READER under test
@@ -1033,6 +1350,7 @@ mod tests {
                         name: n.clone(),
                         dtype: c.numpy_code().into(),
                         codec: None,
+                        ..Default::default()
                     })
                     .collect(),
                 rows: 100,
@@ -1088,6 +1406,7 @@ mod tests {
                     name: n.clone(),
                     dtype: c.numpy_code().into(),
                     codec: None,
+                    ..Default::default()
                 })
                 .collect(),
             rows: 64,
@@ -1139,6 +1458,7 @@ mod tests {
             "events",
             "ms",
             &[],
+            None,
         )
         .unwrap();
 
@@ -1351,6 +1671,7 @@ mod tests {
             "coin_3p",
             "time_ps",
             &[],
+            None,
         )
         .unwrap();
         assert!(

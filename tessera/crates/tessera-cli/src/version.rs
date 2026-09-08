@@ -396,6 +396,7 @@ mod tests {
                 name: "x".into(),
                 dtype: "u4".into(),
                 codec: None,
+                ..Default::default()
             }],
             rows: 3,
             row_index: None,
@@ -416,6 +417,7 @@ mod tests {
                 name: "v".into(),
                 dtype: "u4".into(),
                 codec: None,
+                ..Default::default()
             }],
             rows: u64::try_from(vals.len()).unwrap(),
             row_index: None,

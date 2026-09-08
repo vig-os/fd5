@@ -1,0 +1,10 @@
+# Project allowlist for `typos` (crate-ci/typos, wired in .pre-commit-config.yaml).
+# Medical-imaging domain vocabulary that typos mis-flags as misspellings — these are NOT typos.
+[default.extend-words]
+OT = "OT"      # DICOM modality code: "Other" (0008,0060)
+PN = "PN"      # DICOM value representation: Person Name
+OME = "OME"    # Open Microscopy Environment (OME-Zarr / OME-NGFF)
+
+[default.extend-identifiers]
+aspec = "aspec"     # "array spec" local (tessera-io sparse-encoding spike example)
+flate2 = "flate2"   # crates.io crate name (gzip/deflate) — typos reads the "flate" stem as "flat"
