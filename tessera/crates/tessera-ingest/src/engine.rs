@@ -654,17 +654,6 @@ fn seal_streaming_to_tsra(
     Ok(m)
 }
 
-/// Re-seal a product with (1) **inherited identity** from its `derived_from` parents (ADR-0058 §5)
-/// and (2) the spec's `[product.metadata]` overrides, then the recorded `[generation]`/`[producer]`.
-/// Priority is spec metadata > the product's own value > inherited-from-parent, so an explicit value
-/// always wins. Blocks are reused by digest (`from_manifest`), so `content_hash`/`id` are stable —
-/// only the metadata/provenance + `manifest_hash` change. Returns `m` unchanged when there is nothing
-/// to apply (no parents, no spec metadata, no generation/producer) so the common path is untouched.
-///
-/// `parents` are the resolved parent manifests (the engine walks `derived_from` in declared order);
-/// inheritance is driven by the **child's** embedded/builtin schema (`inheritable_fields`) — the
-/// engine holds no field list. The streaming path (`WriteSession`) applies spec overrides directly;
-/// this is the batch-path counterpart, and inheritance rides both.
 /// The identity fields a `product`-schema'd child inherits from its `parents` (ADR-0058 §5), as a
 /// plain metadata map. The **streaming** ingest path applies metadata on the `WriteSession` before
 /// seal (not via [`apply_spec_metadata`]), so it needs the inherited fields up-front rather than a
@@ -687,6 +676,17 @@ fn inherited_metadata(parents: &[&Manifest], product: &str) -> BTreeMap<String, 
     out
 }
 
+/// Re-seal a product with (1) **inherited identity** from its `derived_from` parents (ADR-0058 §5)
+/// and (2) the spec's `[product.metadata]` overrides, then the recorded `[generation]`/`[producer]`.
+/// Priority is spec metadata > the product's own value > inherited-from-parent, so an explicit value
+/// always wins. Blocks are reused by digest (`from_manifest`), so `content_hash`/`id` are stable —
+/// only the metadata/provenance + `manifest_hash` change. Returns `m` unchanged when there is nothing
+/// to apply (no parents, no spec metadata, no generation/producer) so the common path is untouched.
+///
+/// `parents` are the resolved parent manifests (the engine walks `derived_from` in declared order);
+/// inheritance is driven by the **child's** embedded/builtin schema (`inheritable_fields`) — the
+/// engine holds no field list. The streaming path (`WriteSession`) applies spec overrides directly;
+/// this is the batch-path counterpart, and inheritance rides both.
 fn apply_spec_metadata(
     m: Manifest,
     meta: &BTreeMap<String, serde_json::Value>,
