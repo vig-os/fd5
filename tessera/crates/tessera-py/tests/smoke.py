@@ -39,14 +39,21 @@ for f in files:
 
     for b in m["blocks"]:
         if b["kind"] == "array":
-            arr = r.array(b["name"])  # -> ndarray, already reshaped (native dtype, C-order)
+            arr = r.array(
+                b["name"]
+            )  # -> ndarray, already reshaped (native dtype, C-order)
             assert isinstance(arr, np.ndarray)
             assert list(arr.shape) == [int(d) for d in b["spec"]["shape"]]
-            # ROI sub-cube equals the full array's corresponding slice (only intersecting chunks read)
+            # ROI sub-cube equals the full array's corresponding slice (only intersecting chunks read).
+            # equal_nan for float dtypes: the segmentation_uint8 fixture's f16 block carries IEEE
+            # specials (NaN != NaN under plain array_equal); isnan doesn't exist for int dtypes.
             if all(d >= 2 for d in arr.shape):
                 half = [max(1, d // 2) for d in arr.shape]
                 sub = r.array_roi(b["name"], [0] * arr.ndim, half)
-                assert np.array_equal(sub, arr[tuple(slice(0, h) for h in half)]), f"{f.name}: ROI"
+                ref = arr[tuple(slice(0, h) for h in half)]
+                assert np.array_equal(sub, ref, equal_nan=arr.dtype.kind == "f"), (
+                    f"{f.name}: ROI"
+                )
         elif b["kind"] == "table":
             df = r.table(b["name"])  # -> polars DataFrame (via Arrow)
             assert isinstance(df, pl.DataFrame)
@@ -57,7 +64,9 @@ for f in files:
             first = next(iter(cols))
             proj = r.column(b["name"], first)  # projected single column
             assert isinstance(proj, np.ndarray)
-            assert np.array_equal(proj, cols[first]), f"{f.name}: projection != full read"
+            assert np.array_equal(proj, cols[first]), (
+                f"{f.name}: projection != full read"
+            )
             assert df.height == proj.shape[0]
     verified += 1
 
@@ -77,7 +86,9 @@ with tempfile.TemporaryDirectory() as td:
     out = pathlib.Path(td) / "roundtrip.tsra"
     b = tessera.Builder("recon", "rt", "py write roundtrip", "2024-01-01T00:00:00Z")
     b.add_array("volume", "i2", list(vol.shape), vol.tobytes())
-    b.add_table("events", [("idx", "u4", idx.tobytes()), ("en", "f4", en.tobytes())], "idx")
+    b.add_table(
+        "events", [("idx", "u4", idx.tobytes()), ("en", "f4", en.tobytes())], "idx"
+    )
     b.set_field("modality", '{"_vocabulary": "DICOM", "_code": "PT"}')
     cid = b.pack(str(out))
     assert cid.startswith("blake3:")
