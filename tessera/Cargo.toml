@@ -5,7 +5,10 @@ members = ["crates/tessera-core", "crates/tessera-io", "crates/tessera-cli", "cr
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-version = "0.0.0"
+# Software SemVer (crates/CLI/bindings) — independent of the format-spec version `tessera_version`,
+# which stays `v0`/pre-1.0 (ADR-0052 §1). The sealed producer stamps TESSERA_VERSION, not this, so a
+# software bump costs no conformance-corpus regen (#336). Bootstrap baseline for release-plz (#337).
+version = "0.1.0-alpha.1"
 repository = "https://github.com/vig-os/tessera"
 authors = ["vig-os"]
 
@@ -37,7 +40,8 @@ bytes = "1"                                          # zarrs store value type
 # exact import paths the probe verified. CurrentThreadRuntime drives the async write/read (no tokio).
 vortex-file = "0.75"
 vortex-array = "0.75"
-vortex-btrblocks = "0.75"   # compressor builder — exclude ALP float scheme for cross-env determinism
+# compressor builder — exclude non-deterministic ALP, register deterministic Pco for float columns.
+vortex-btrblocks = { version = "0.75", features = ["pco"] }
 vortex-buffer = "0.75"
 vortex-io = "0.75"
 vortex-layout = "0.75"
@@ -68,3 +72,8 @@ toml = "0.8"
 tessera-core = { path = "crates/tessera-core" }
 tessera-io = { path = "crates/tessera-io" }
 tessera-ingest = { path = "crates/tessera-ingest" }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

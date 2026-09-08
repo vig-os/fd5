@@ -6,7 +6,9 @@
 
 mod bench;
 mod collection;
+mod info;
 mod nav;
+mod resource;
 #[cfg(feature = "sql")]
 mod sql;
 mod trust;
@@ -16,9 +18,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use tessera_core::collection::{member_filename, MemberKind};
 use tessera_core::SchemaRegistry;
 use tessera_ingest::{engine, spec as ingest_spec};
-use tessera_io::{pack_dir, parse_byte_size, unpack, Reader, WriteConfig};
+use tessera_io::{pack_dir, parse_byte_size, unpack, Reader};
 
 /// Cloud-URL prefixes the `cloud` feature recognises. Used to detect a URL-shaped argument and
 /// route it through `tessera_io::open_url` instead of the local file path.
@@ -56,8 +59,6 @@ fn open_local_or_url(arg: &std::path::Path) -> tessera_core::Result<Box<dyn Tsra
 /// behind a single boxed handle.
 trait TsraSource {
     fn manifest(&self) -> &tessera_core::Manifest;
-    fn read_block_by_name(&mut self, name: &str) -> tessera_core::Result<Vec<u8>>;
-    fn block_names(&self) -> Vec<String>;
     /// Bounded-memory copy of a block's bytes into `w`, digest-verified after the last byte.
     /// Delegates to [`Reader::stream_block`] — preserves the same integrity contract: on
     /// `Err(Integrity)` the writer already saw the unverified bytes, so callers must stage to
@@ -67,17 +68,14 @@ trait TsraSource {
         name: &str,
         w: &mut dyn std::io::Write,
     ) -> tessera_core::Result<u64>;
+    /// Verify every block payload at bounded RSS, returning a typed `BlockIntegrity` (naming
+    /// `label` + the block) on the first corrupt block. Delegates to [`Reader::verify_payloads`].
+    fn verify_payloads(&mut self, label: &str) -> tessera_core::Result<()>;
 }
 
 impl<R: std::io::Read + std::io::Seek> TsraSource for Reader<R> {
     fn manifest(&self) -> &tessera_core::Manifest {
         Reader::manifest(self)
-    }
-    fn read_block_by_name(&mut self, name: &str) -> tessera_core::Result<Vec<u8>> {
-        Reader::read_block(self, name)
-    }
-    fn block_names(&self) -> Vec<String> {
-        Reader::block_names(self)
     }
     fn stream_block_to(
         &mut self,
@@ -88,6 +86,9 @@ impl<R: std::io::Read + std::io::Seek> TsraSource for Reader<R> {
         // trait object as `&mut &mut dyn Write` — the mutable-reference impl of `Write` is itself
         // `Sized`, which keeps the generic happy without changing the underlying writer.
         Reader::stream_block(self, name, &mut w)
+    }
+    fn verify_payloads(&mut self, label: &str) -> tessera_core::Result<()> {
+        Reader::verify_payloads(self, label)
     }
 }
 
@@ -147,6 +148,7 @@ Signing & trust:
   verify-sig  Verify a sealed .tsra against its signature (embedded first, sidecar fallback)
 
 Diagnostics:
+  info        What this build is (version, backends, build modes) — --json for machines
   bench       Bench the write engine on this host (throughput + peak RSS)
 
 Run `tsra help <command>` for details, flags, and what to pass.
@@ -181,6 +183,11 @@ enum Cmd {
         /// path); default collapses a multi-file edge to `<first> (+N more)`.
         #[arg(long)]
         full: bool,
+        /// Deep-verify: also re-hash every block payload (bounded memory), not just the seal that
+        /// `open` already checked. Exits nonzero and names the block on corruption. Slower — it
+        /// reads all payloads; for a huge blob prefer the fast default (seal only) unless auditing.
+        #[arg(long)]
+        verify: bool,
     },
     /// Verify a `.tsra`'s integrity (magic, seal, every block digest).
     ///
@@ -202,6 +209,11 @@ enum Cmd {
         /// Print provenance references in full instead of collapsing a multi-file edge.
         #[arg(long)]
         full: bool,
+        /// Deep-verify: re-hash every block payload (bounded memory) before rendering; the root
+        /// badge becomes `verified✓`, or the command exits nonzero naming the corrupt block. The
+        /// fast default only shows `sealed` (the seal `open` verified), not payload integrity (#268).
+        #[arg(long)]
+        verify: bool,
     },
     /// List one node's children (top level, `meta`, a block, or `sources`).
     ///
@@ -607,6 +619,17 @@ enum Cmd {
         #[command(subcommand)]
         action: CollectionAction,
     },
+    /// What this build is: version, compiled-in backends, build modes (ADR-0057 §7).
+    ///
+    /// Feature selection decides which formats are **readable**; it never changes the **bytes**
+    /// produced for a readable one. This is how someone who did not build the binary can see which
+    /// side of that line a failure is on. `--json` emits the same facts in a shape suitable for
+    /// embedding in `aux/provenance.json`.
+    Info {
+        /// Emit JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Bench the write engine on this host (throughput + peak RSS).
     ///
     /// Drives the real `StreamWriter`/`TableStreamWriter` and reports throughput + peak RSS so an
@@ -619,6 +642,33 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum CollectionAction {
+    /// Assemble a collection.json from pre-sealed .tsra products (decouples membership from ingest).
+    New {
+        /// A pre-sealed `.tsra` product member (repeatable).
+        #[arg(long = "member", required = true)]
+        members: Vec<PathBuf>,
+        /// Output directory: writes `collection.json` + each member as `<id>.tsra`.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Collection name.
+        #[arg(long)]
+        name: String,
+        /// Collection description.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Level schema: `collection` (generic) · `dataset` (products) · `project` · a domain level.
+        #[arg(long, default_value = "collection")]
+        schema: String,
+        /// Optional study/grouping id.
+        #[arg(long)]
+        study: Option<String>,
+        /// RFC-3339 identity timestamp (default: the latest member's timestamp).
+        #[arg(long)]
+        timestamp: Option<String>,
+        /// Member role applied to all members: `raw` | `derived`.
+        #[arg(long, default_value = "derived")]
+        role: String,
+    },
     /// Catalog header: identity, seal badge, and each member's role + reference + pinned hash.
     Inspect {
         /// The `collection.json` descriptor.
@@ -830,6 +880,16 @@ enum IngestSrc {
 }
 
 fn main() -> ExitCode {
+    // Restore the default SIGPIPE disposition so piping tessera's output into `head`, `less`, etc.
+    // terminates it quietly — like every standard Unix tool — instead of erroring. Rust's runtime
+    // sets SIGPIPE to SIG_IGN, which turns a reader closing the pipe into a `Broken pipe` write error
+    // on the streaming subcommands (`read`/`slice`/`project`) rather than a clean exit.
+    #[cfg(unix)]
+    // SAFETY: run once at startup before any thread is spawned; resetting a signal disposition to the
+    // OS default is sound.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // Surface library WARNs (e.g. the ingest engine's recommended-field nudge) on stderr. Quiet
     // (warn+ only), compact + timestamp-free so it reads as CLI output rather than a log.
     let _ = tracing_subscriber::fmt()
@@ -849,15 +909,20 @@ fn main() -> ExitCode {
 
 fn run(cmd: Cmd) -> tessera_core::Result<()> {
     match cmd {
-        Cmd::Inspect { file, full } => {
-            let r = open_local_or_url(&file)?;
+        Cmd::Inspect { file, full, verify } => {
+            let mut r = open_local_or_url(&file)?;
+            // Deep-verify (opt-in): re-hash every payload before rendering, so a corrupt file
+            // errors out here instead of printing a clean-looking summary (#268). Bounded RSS.
+            if verify {
+                r.verify_payloads(&file.display().to_string())?;
+            }
             let m = r.manifest();
             println!("tessera {} · product={}", m.tessera_version, m.product);
             println!("id            {}", m.id);
             println!("name          {}", m.name);
             println!("timestamp     {}", m.timestamp);
             if let Some(p) = &m.producer {
-                println!("producer      {p}");
+                println!("producer      {}", p.display());
             }
             if let Some(s) = &m.study {
                 println!("study         {s}");
@@ -867,6 +932,12 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
                 "manifest_hash {}",
                 m.manifest_hash.as_deref().unwrap_or("-")
             );
+            if verify {
+                println!(
+                    "integrity     verified✓ ({} block payloads re-hashed)",
+                    m.blocks.len()
+                );
+            }
             println!("blocks        {}", m.blocks.len());
             for b in &m.blocks {
                 println!(
@@ -896,17 +967,33 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
             Ok(())
         }
         Cmd::Verify { file } => {
-            let mut r = open_local_or_url(&file)?; // magic + manifest seal
-            let n = r.manifest().blocks.len();
-            for name in r.block_names() {
-                r.read_block_by_name(&name)?; // payload bytes vs recorded digest
+            let label = file.display().to_string();
+            // Payload half of verification: re-derive every block's digest from its stored bytes at
+            // bounded RSS + typed, located errors (#268 parts 3+4). `open` already checked the seal.
+            // A local `.tsra` fans the probe across the worker pool — each block is independently
+            // addressable in the STORED zip (#367); a URL verifies serially (no cheap multi-handle
+            // reopen). Worker count is the machine default for now; #368 will feed it from the
+            // resource-cap resolver.
+            #[cfg(feature = "cloud")]
+            let is_url = cloud_url(&file).is_some();
+            #[cfg(not(feature = "cloud"))]
+            let is_url = false;
+            if is_url {
+                let mut r = open_local_or_url(&file)?; // magic + manifest seal
+                let n = r.manifest().blocks.len();
+                r.verify_payloads(&label)?;
+                println!("OK  {label} verified ({n} blocks)");
+            } else {
+                let workers = tessera_io::WriteConfig::for_system().worker_count();
+                // Returns the block count (verified with L1 seal + L2 payloads) — no extra reopen.
+                let n = tessera_io::verify_payloads_parallel(&file, &label, workers)?;
+                println!("OK  {label} verified ({n} blocks)");
             }
-            println!("OK  {} verified ({n} blocks)", file.display());
             Ok(())
         }
-        Cmd::Tree { file, full } => {
+        Cmd::Tree { file, full, verify } => {
             let mut out = std::io::stdout().lock();
-            nav::tree(&file, full, &mut out)
+            nav::tree(&file, full, verify, &mut out)
         }
         Cmd::Ls { file, path, full } => {
             let mut out = std::io::stdout().lock();
@@ -1340,11 +1427,44 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
         Cmd::Collection { action } => {
             let mut out = std::io::stdout().lock();
             match action {
+                CollectionAction::New {
+                    members,
+                    out: dir,
+                    name,
+                    description,
+                    schema,
+                    study,
+                    timestamp,
+                    role,
+                } => match role.as_str() {
+                    "raw" | "derived" => {
+                        let role = if role == "raw" {
+                            tessera_core::collection::Role::Raw
+                        } else {
+                            tessera_core::collection::Role::Derived
+                        };
+                        collection::new(
+                            &members,
+                            &dir,
+                            &name,
+                            &description,
+                            &schema,
+                            study.as_deref(),
+                            timestamp.as_deref(),
+                            role,
+                            &mut out,
+                        )
+                    }
+                    other => Err(tessera_core::Error::Invalid(format!(
+                        "--role must be 'raw' or 'derived', got '{other}'"
+                    ))),
+                },
                 CollectionAction::Inspect { file } => collection::inspect(&file, &mut out),
                 CollectionAction::Ls { file, full } => collection::ls(&file, full, &mut out),
                 CollectionAction::Verify { file } => collection::verify(&file, &mut out),
             }
         }
+        Cmd::Info { json } => info::info(json, &mut std::io::stdout().lock()),
         Cmd::Bench { action } => match action {
             BenchAction::Write {
                 schema,
@@ -1501,7 +1621,9 @@ fn run_ingest(src: IngestSrc) -> tessera_core::Result<()> {
     let staging = tempfile::tempdir().map_err(|e| {
         tessera_core::Error::Invalid(format!("tessera ingest: create staging dir: {e}"))
     })?;
-    let cfg = WriteConfig::for_system();
+    // Resource caps (#368): the per-format subcommands expose no --workers/--ram flags, so this is
+    // env > conf > for_system() — TESSERA_WORKERS / TESSERA_RAM_BUDGET and .tessera/config.toml still apply.
+    let cfg = resource::resolve_write_config(None, None)?;
     let coll = engine::run(
         &spec,
         std::path::Path::new("cli-inline-spec"),
@@ -1509,13 +1631,14 @@ fn run_ingest(src: IngestSrc) -> tessera_core::Result<()> {
         &cfg,
         engine::DEFAULT_STREAM_THRESHOLD_BYTES,
     )?;
-    // Move the single produced `.tsra` to the user's `out` path. The engine names files by
-    // sanitized id (`blake3_<hex>.tsra`); we read that name back out of the sealed collection.
+    // Move the single produced `.tsra` to the user's `out` path. The engine names files by the
+    // shared `member_filename` SSoT (`blake3_<hex>.tsra`); resolve that same name here (#323).
     let member = coll.members.first().ok_or_else(|| {
         tessera_core::Error::Invalid("tessera ingest: engine produced no member".into())
     })?;
-    let sanitized = member.reference.replace([':', '/', '\\'], "_");
-    let from = staging.path().join(format!("{sanitized}.tsra"));
+    let from = staging
+        .path()
+        .join(member_filename(&member.reference, MemberKind::Product));
     if let Some(parent) = user_out.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -1579,6 +1702,8 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
+                    generation: None,
+                    producer: None,
                     options: FormatOptions::Dicom { input, deidentify },
                 }],
             },
@@ -1610,6 +1735,8 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
+                    generation: None,
+                    producer: None,
                     options: FormatOptions::DicomSeries {
                         inputs,
                         deidentify,
@@ -1650,6 +1777,8 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
+                    generation: None,
+                    producer: None,
                     options: FormatOptions::HdfCompound {
                         input,
                         dataset,
@@ -1688,6 +1817,8 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
+                    generation: None,
+                    producer: None,
                     options: FormatOptions::Blob { input, media_type },
                 }],
             },
@@ -1712,13 +1843,9 @@ struct IngestSpecOpts {
 fn run_ingest_spec(opts: IngestSpecOpts) -> tessera_core::Result<()> {
     let parsed = ingest_spec::parse(&opts.spec_path)?;
     let out_dir = opts.out_dir.unwrap_or_else(|| PathBuf::from("ingest-out"));
-    let mut cfg = WriteConfig::for_system();
-    if let Some(n) = opts.workers {
-        cfg = cfg.workers(n);
-    }
-    if let Some(s) = opts.ram_budget {
-        cfg = cfg.ram_budget(parse_byte_size(&s)?);
-    }
+    // Resource caps (#368): flag > env > conf > default. The explicit --workers / --ram-budget are
+    // the top tier; TESSERA_WORKERS / TESSERA_RAM_BUDGET and .tessera/config.toml fill in below.
+    let cfg = resource::resolve_write_config(opts.workers, opts.ram_budget.as_deref())?;
     if opts.auto {
         // The honest knee model needs measured read/encode rates; without a fixture here we just
         // surface the request and stick to defaults (the bench subcommand is where the live
@@ -1742,8 +1869,11 @@ fn run_ingest_spec(opts: IngestSpecOpts) -> tessera_core::Result<()> {
         out_dir.display()
     );
     for m in &coll.members {
-        let sanitized = m.reference.replace([':', '/', '\\'], "_");
-        println!("  - {} -> {sanitized}.tsra", m.reference);
+        println!(
+            "  - {} -> {}",
+            m.reference,
+            member_filename(&m.reference, MemberKind::Product)
+        );
     }
     Ok(())
 }
@@ -1793,6 +1923,7 @@ mod tests {
         run(Cmd::Inspect {
             file: tsra.clone(),
             full: false,
+            verify: false,
         })
         .unwrap();
         run(Cmd::Schema {
@@ -1825,6 +1956,105 @@ mod tests {
         let bad = dir.path().join("bad.tsra");
         std::fs::write(&bad, b"not a zip at all").unwrap();
         assert!(run(Cmd::Verify { file: bad }).is_err());
+    }
+
+    /// #268 parts 3+4: a corrupt block payload makes `verify` fail with a typed `BlockIntegrity`
+    /// error that names the container file AND the block (not a bare `io: Invalid checksum`), and
+    /// the check runs over the bounded-memory `stream_block` path (never buffering the whole block).
+    #[test]
+    fn verify_names_the_corrupt_block_with_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_tsra(&tsra);
+        // Unpack → corrupt the block payload → repack. Repack recomputes the zip CRC over the
+        // tampered bytes (so the container reads clean), but the manifest still pins the ORIGINAL
+        // blake3 digest → the streamed digest check is what catches it (exercising the rich path).
+        let exploded = dir.path().join("exploded");
+        run(Cmd::Unpack {
+            file: tsra,
+            outdir: exploded.clone(),
+        })
+        .unwrap();
+        let block = exploded.join("blocks/volume");
+        let mut bytes = std::fs::read(&block).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&block, &bytes).unwrap();
+        let bad = dir.path().join("bad.tsra");
+        run(Cmd::Pack {
+            dir: exploded,
+            out: bad.clone(),
+        })
+        .unwrap();
+
+        match run(Cmd::Verify { file: bad }).unwrap_err() {
+            tessera_core::Error::BlockIntegrity {
+                file,
+                block,
+                detail,
+            } => {
+                assert_eq!(block, "volume", "names the corrupt block");
+                assert!(
+                    file.contains("bad.tsra"),
+                    "names the container file: {file}"
+                );
+                assert!(
+                    detail.contains("block_payload") || detail.contains("checksum"),
+                    "carries the underlying integrity cause: {detail}"
+                );
+            }
+            other => panic!("expected a typed BlockIntegrity error, got {other:?}"),
+        }
+    }
+
+    /// #268 part 1: the `--verify` deep opt-in on `tree`/`inspect` re-hashes payloads, so a
+    /// payload-corrupt file (whose seal is still valid → the fast default renders it) errors out
+    /// with a typed `BlockIntegrity` instead of showing a clean-looking `sealed` view.
+    #[test]
+    fn deep_verify_flag_rejects_a_corrupt_block_in_tree_and_inspect() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_tsra(&tsra);
+        let exploded = dir.path().join("exploded");
+        run(Cmd::Unpack {
+            file: tsra,
+            outdir: exploded.clone(),
+        })
+        .unwrap();
+        let block = exploded.join("blocks/volume");
+        let mut bytes = std::fs::read(&block).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&block, &bytes).unwrap();
+        let bad = dir.path().join("bad.tsra");
+        run(Cmd::Pack {
+            dir: exploded,
+            out: bad.clone(),
+        })
+        .unwrap();
+
+        // Fast default: the seal is valid, so it renders without error (no payload check).
+        run(Cmd::Tree {
+            file: bad.clone(),
+            full: false,
+            verify: false,
+        })
+        .unwrap();
+        // --verify: the payload corruption is caught, typed + located.
+        assert!(matches!(
+            run(Cmd::Tree {
+                file: bad.clone(),
+                full: false,
+                verify: true,
+            }),
+            Err(tessera_core::Error::BlockIntegrity { .. })
+        ));
+        assert!(matches!(
+            run(Cmd::Inspect {
+                file: bad,
+                full: false,
+                verify: true,
+            }),
+            Err(tessera_core::Error::BlockIntegrity { .. })
+        ));
     }
 
     // Mirrors the GE 3-photon compound record (HDF5 maps by member name on read).
@@ -1888,6 +2118,7 @@ mod tests {
         run(Cmd::Inspect {
             file: out.clone(),
             full: false,
+            verify: false,
         })
         .unwrap();
         let r = Reader::open(&out).unwrap();
@@ -1980,7 +2211,7 @@ streaming = "batch"
 
         // 2. every member's .tsra exists + verifies + carries the expected spec edge.
         for m in &coll.members {
-            let p = out_dir.join(format!("{}.tsra", m.reference.replace([':', '/'], "_")));
+            let p = out_dir.join(member_filename(&m.reference, MemberKind::Product));
             assert!(p.exists(), "missing {}", p.display());
             run(Cmd::Verify { file: p.clone() }).unwrap();
             let r = Reader::open(&p).unwrap();
@@ -1991,11 +2222,16 @@ streaming = "batch"
                 .any(|s| s.role == engine::SPEC_PROVENANCE_ROLE));
         }
 
+        // 2b. #323: the COLLECTION-level verb resolves every ingested member by the same sanitized
+        // name the engine wrote — the exact path that used to fail (`blake3:…` resolve vs `blake3_…`
+        // write). This is the ingest --spec → `collection verify` round-trip the bug report asked for.
+        collection::verify(&out_dir.join("collection.json"), &mut Vec::new()).unwrap();
+
         // 3. the derived member's `derived_from` edge pins the raw's manifest_hash → chain verifies.
         let raw_id = &coll.members[0].reference;
         let derived_id = &coll.members[1].reference;
-        let raw_path = out_dir.join(format!("{}.tsra", raw_id.replace([':', '/'], "_")));
-        let derived_path = out_dir.join(format!("{}.tsra", derived_id.replace([':', '/'], "_")));
+        let raw_path = out_dir.join(member_filename(raw_id, MemberKind::Product));
+        let derived_path = out_dir.join(member_filename(derived_id, MemberKind::Product));
         let raw_m = Reader::open(&raw_path).unwrap().manifest().clone();
         let derived_m = Reader::open(&derived_path).unwrap().manifest().clone();
         let mut resolver: std::collections::BTreeMap<String, tessera_core::Manifest> =

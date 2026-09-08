@@ -8,18 +8,29 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b  # v5.0.0
     hooks:
-      # Enforce topic branch naming:
-      # - chore/<short_summary> (no issue required)
-      # - <type>/<issue_number>-<short_summary> (for feature, bugfix, etc.)
-      # - worktree/<issue_number> (autonomous worktree branches)
+      # Enforce topic branch naming: `<type>/<summary>`.
+      #
+      # The issue number is OPTIONAL — put it in the summary (`feat/349-log-axis-transform`) when
+      # there is one. It is NOT required in the branch name because `.gitmessage` already makes
+      # every commit carry `Refs: #<issue>`; requiring it in both places bought nothing and
+      # blocked most real work.
+      #
+      # The type list is derived from branch names actually used on merged PRs (checked against
+      # `gh pr list --state merged`), not from an aspirational convention: the previous pattern
+      # rejected `feat/`, `fix/`, `perf/`, `polish/`, `land/` and `spike/` — i.e. 14 of the last
+      # 30 merged PR branches, including the branch that graduated the spike. A gate that no real
+      # branch can satisfy is not a gate; it just teaches everyone to pass `--no-verify`, which
+      # then bypasses the *other* gates in this file too.
+      #
+      # `release/<semver>` is kept strict on purpose (release-plz owns that namespace).
       # Allows main, dev, and branches matching the convention.
       - id: no-commit-to-branch
-        name: branch-name (enforce <type>/<issue>-<summary>)
+        name: branch-name (enforce <type>/<summary>)
         args:
           - --branch
           - __none__  # override default so main/dev are not protected
           - --pattern
-          - "^(?!main$)(?!dev$)(?!^(chore)/[a-z0-9]+(-[a-z0-9]+)*$)(?!^(feature|bugfix|hotfix|release|docs|test|refactor)/[0-9]+-[a-z0-9]+(-[a-z0-9]+)*$)(?!^worktree/[0-9]+$).+$"
+          - "^(?!main$)(?!dev$)(?!(chore|feat|feature|fix|bugfix|hotfix|perf|polish|spike|refactor|docs|test|build|ci|style|land)/[a-z0-9][a-z0-9._-]*$)(?!release/[0-9]+\\.[0-9]+(\\.[0-9]+)?$)(?!worktree/[0-9]+$).+$"
       - id: check-added-large-files
       - id: check-case-conflict
       - id: check-json
@@ -49,13 +60,22 @@ repos:
       - id: yamllint
         args: ["--format", "parsable", "--strict"]
 
-  # Shellcheck
-  - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: a23f6b85d0fdd5bb9d564e2579e678033debbdff  # v0.10.0.1
+  # Shellcheck — the Nix-provided binary, NOT the `shellcheck-py` PyPI wrapper.
+  #
+  # `shellcheck-py` builds a wheel inside prek's vendored uv cache, and that build asserts the
+  # interpreter tag matches the wheel tag. On this toolchain it does not
+  # (`AssertionError: would build wheel with unsupported tag ('cp313','cp312','linux_x86_64')`),
+  # so hook INSTALLATION failed — and because prek installs in file order, every hook declared
+  # below this point (all six guardrails agent-drift gates, rustfmt, clippy, cargo-deny,
+  # gitleaks) never ran either. One unbuildable Python wrapper silently disabled the entire
+  # local gate suite. The devShell already puts a pinned `shellcheck` on PATH; use it.
+  - repo: local
     hooks:
       - id: shellcheck
         name: shellcheck
-        args: ["-x"]
+        entry: shellcheck -x
+        language: system
+        types: [shell]
 
   # Containerfile
   - repo: https://github.com/hadolint/hadolint
@@ -83,39 +103,24 @@ repos:
         files: ^justfile(\..*)?$
         pass_filenames: false
 
-  - repo: https://github.com/crate-ci/typos
-    rev: 07d900b8fa1097806b8adb6391b0d3e0ac2fdea7  # v1.39.0
-    hooks:
-      - id: typos
-
-  # License Compliance Check (runs only when dependencies change)
+  # typos — the Nix-provided binary. prek's installer fetches a generic-linux dynamically
+  # linked executable, which NixOS cannot run at all ("Could not start dynamically linked
+  # executable", nix.dev/permalink/stub-ld). Same failure class as shellcheck-py above.
   - repo: local
     hooks:
-      - id: pip-licenses
-        name: pip-licenses (check dependency licenses)
-        entry: uv run pip-licenses --fail-on="GPL-3.0-only;GPL-3.0-or-later;AGPL-3.0-only;AGPL-3.0-or-later"
+      - id: typos
+        name: typos (spell check)
+        entry: typos
         language: system
-        files: ^(pyproject\.toml|uv\.lock|requirements.*\.txt)$
-        pass_filenames: false
 
   # GitHub Actions SHA pinning enforcement
   - repo: local
     hooks:
       - id: check-action-pins
         name: check-action-pins (verify SHA-pinned actions)
-        entry: uv run check-action-pins
-        language: system
+        entry: scripts/check-action-pins.sh
+        language: script
         files: ^\.github/(workflows/.*\.ya?ml|actions/.*/action\.ya?ml)$
-        pass_filenames: false
-
-  # Python Security (Bandit)
-  - repo: local
-    hooks:
-      - id: bandit
-        name: bandit (Python security linting)
-        entry: uv run bandit -r src/ -ll
-        language: system
-        types: [python]
         pass_filenames: false
 
   # Skill directory naming convention
@@ -180,19 +185,19 @@ repos:
       # ── Rust workspace lives in tessera/ — scope the cargo gates there ──
       - id: rustfmt
         name: rustfmt (tessera workspace)
-        entry: bash -c 'cd tessera && cargo fmt --all -- --check'
+        entry: bash -euo pipefail -c 'cd tessera && cargo fmt --all -- --check'
         language: system
         files: ^tessera/.*\.rs$
         pass_filenames: false
       - id: clippy
         name: clippy -D warnings (tessera workspace)
-        entry: bash -c 'cd tessera && cargo clippy --all-targets --all-features -- -D warnings'
+        entry: bash -euo pipefail -c 'cd tessera && cargo clippy --all-targets --all-features -- -D warnings'
         language: system
         files: ^tessera/.*\.rs$
         pass_filenames: false
       - id: cargo-deny
         name: cargo-deny (licenses + advisories)
-        entry: bash -c 'cd tessera && cargo deny check'
+        entry: bash -euo pipefail -c 'cd tessera && cargo deny check'
         language: system
         files: ^tessera/.*Cargo\.(toml|lock)$
         pass_filenames: false
@@ -202,8 +207,8 @@ repos:
     hooks:
       - id: validate-commit-msg
         name: validate commit message
-        entry: uv run validate-commit-msg
-        language: system
+        entry: scripts/validate-commit-msg.sh
+        language: script
         stages: [commit-msg]
         # Optional: customize commit types, scopes, or refs-optional types via CLI arguments.
         # By default, scopes are not enforced. Set --scopes to require specific scopes.

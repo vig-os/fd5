@@ -51,6 +51,7 @@ Signing & trust:
   verify-sig  Verify a sealed .tsra against its signature (embedded first, sidecar fallback)
 
 Diagnostics:
+  info        What this build is (version, backends, build modes) — --json for machines
   bench       Bench the write engine on this host (throughput + peak RSS)
 
 Run `tsra help <command>` for details, flags, and what to pass.

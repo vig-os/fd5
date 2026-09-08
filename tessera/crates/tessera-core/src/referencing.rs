@@ -28,6 +28,13 @@ pub enum Transform {
     /// PET → Bq/mL). Invertible iff `slope != 0`.
     #[serde(rename = "affine_1d")]
     Affine1d { slope: f64, intercept: f64 },
+    /// Log-spaced regular axis: `physical = exp(ln_lo + ln_step * stored)`. The log-space analogue of
+    /// [`Self::Affine1d`] — a *geometric* progression stored as a regular integer index, the way a
+    /// decade-spanning physical quantity (photon energy, frequency, a dose grid) is tabulated. This is
+    /// the calibration-LUT case: cross-section σ(E) curves and 2-D inverse-CDF samplers whose energy axis
+    /// is log-spaced so a few nodes cover keV→MeV at ~constant relative resolution. Regular (closed-form,
+    /// O(1) index) unlike the irregular [`Self::Lookup`]; invertible iff `ln_step != 0` and `physical > 0`.
+    Log { ln_lo: f64, ln_step: f64 },
     /// N-D affine: a homogeneous index→world matrix of `dims` rows × `dims+1` columns, **row-major**
     /// (`[R | t]`, implicit last row `[0…0 1]`). The [`WorldFrame`] voxel→world case.
     #[serde(rename = "affine_nd")]
@@ -66,6 +73,7 @@ impl Transform {
         match self {
             Transform::Identity => Some(stored),
             Transform::Affine1d { slope, intercept } => Some(stored * slope + intercept),
+            Transform::Log { ln_lo, ln_step } => Some((ln_lo + ln_step * stored).exp()),
             Transform::Lookup { values } => (stored.fract() == 0.0 && stored >= 0.0)
                 .then(|| values.get(stored as usize).copied())
                 .flatten(),
@@ -81,6 +89,9 @@ impl Transform {
             Transform::Identity => Some(physical),
             Transform::Affine1d { slope, intercept } => {
                 (*slope != 0.0).then(|| (physical - intercept) / slope)
+            }
+            Transform::Log { ln_lo, ln_step } => {
+                (*ln_step != 0.0 && physical > 0.0).then(|| (physical.ln() - ln_lo) / ln_step)
             }
             Transform::Lookup { values } => {
                 values.iter().position(|&v| v == physical).map(|i| i as f64)
@@ -234,6 +245,27 @@ impl Referenced {
         }
     }
 
+    /// ADR-0032 **calibration-LUT** instance: a **log-spaced** physical axis over `[lo, hi]` sampled at
+    /// `n` nodes — `physical = exp(ln(lo) + i * (ln(hi) − ln(lo))/(n−1))`. The cross-section / inverse-CDF
+    /// **energy axis** of a physics calibration table: log spacing lets a few nodes span keV→MeV at
+    /// ~constant *relative* resolution (the natural grid for σ(E) and sampler tables). A [`Transform::Log`];
+    /// unit is the quantity's UCUM code (e.g. `"keV"`), frame `"physical"`. Store-don't-compute — the two
+    /// log-grid parameters are data and the index is closed-form O(1) (unlike an irregular [`Transform::Lookup`]).
+    pub fn log_axis(lo: f64, hi: f64, n: usize, unit: Option<String>) -> Self {
+        let ln_lo = lo.ln();
+        let ln_step = if n > 1 {
+            (hi.ln() - ln_lo) / (n - 1) as f64
+        } else {
+            0.0
+        };
+        Referenced {
+            transform: Transform::Log { ln_lo, ln_step },
+            unit,
+            vocabulary: None,
+            frame: Some("physical".into()),
+        }
+    }
+
     /// Builder: attach the §3 vocabulary escape naming the controlled vocabulary `unit` is drawn from.
     pub fn with_vocabulary(mut self, vocabulary: &str) -> Self {
         self.vocabulary = Some(vocabulary.into());
@@ -287,9 +319,115 @@ impl Referenced {
     }
 }
 
+/// How a stored array's *values* are reconstructed **between** grid nodes — the
+/// evaluator law, distinct from the axis [`Transform`] (which maps index →
+/// coordinate). "Store, don't compute" applied to interpolation: a consumer
+/// gathers the bracketing node values and reconstructs from this descriptor
+/// alone, so CPU/GPU/FPGA lowerings all interpolate identically.
+///
+/// The axis space is already carried by the axis `Transform` (e.g.
+/// [`Transform::Log`] gives a log-spaced coordinate), so this enum names only
+/// the *value* space. Physics "log-log interpolation" = a [`Transform::Log`]
+/// axis + [`Interp::Log`] values; "lin-lin" = a linear axis + [`Interp::Linear`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "law", rename_all = "snake_case")]
+pub enum Interp {
+    /// Nearest node — no interpolation (`t < 0.5 → a`, else `b`).
+    Nearest,
+    /// Linear in value: `a + (b − a)·t`.
+    Linear,
+    /// Linear in `ln(value)`: `exp(ln a + (ln b − ln a)·t)` — exact for
+    /// power-law data. Falls back to [`Self::Linear`] if a node is ≤ 0.
+    Log,
+}
+
+impl Interp {
+    /// Reconstruct the value at fraction `t ∈ [0,1]` between node values `a`, `b`.
+    pub fn reconstruct(self, a: f64, b: f64, t: f64) -> f64 {
+        match self {
+            Interp::Nearest => {
+                if t < 0.5 {
+                    a
+                } else {
+                    b
+                }
+            }
+            Interp::Linear => a + (b - a) * t,
+            Interp::Log => {
+                if a > 0.0 && b > 0.0 {
+                    (a.ln() + (b.ln() - a.ln()) * t).exp()
+                } else {
+                    a + (b - a) * t
+                }
+            }
+        }
+    }
+}
+
+/// A 2-D **inverse-CDF sampler** descriptor: the value grid is `[row_axis × u]`
+/// (e.g. energy × uniform-quantile) and a draw gathers the four bracketing cells
+/// and combines them with the `row`/`col` [`Interp`] laws. Bilinear =
+/// `{ row: Linear, col: Linear }`. Self-describing so any backend samples the
+/// same distribution from the same table (the Compton-ICDF / calibration-LUT
+/// case that motivated [`Transform::Log`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcdfSampler {
+    /// Interpolation along the row axis (e.g. energy).
+    pub row: Interp,
+    /// Interpolation along the quantile (`u`) axis.
+    pub col: Interp,
+}
+
+impl IcdfSampler {
+    /// Bilinear (linear × linear) — the common case.
+    pub const BILINEAR: IcdfSampler = IcdfSampler {
+        row: Interp::Linear,
+        col: Interp::Linear,
+    };
+
+    /// Reconstruct the sampled value from the four bracketing cells
+    /// `v[row][col]`: `v00,v01` (row `r`), `v10,v11` (row `r+1`), with fractions
+    /// `tr` (row) and `tc` (col).
+    pub fn reconstruct(self, v00: f64, v01: f64, v10: f64, v11: f64, tr: f64, tc: f64) -> f64 {
+        let r0 = self.col.reconstruct(v00, v01, tc);
+        let r1 = self.col.reconstruct(v10, v11, tc);
+        self.row.reconstruct(r0, r1, tr)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interp_reconstructs_and_round_trips_json() {
+        // linear
+        assert_eq!(Interp::Linear.reconstruct(2.0, 4.0, 0.5), 3.0);
+        // log (geometric mean at t=0.5)
+        let g = Interp::Log.reconstruct(1.0, 100.0, 0.5);
+        assert!((g - 10.0).abs() < 1e-9, "log midpoint {g}");
+        // log falls back to linear at a non-positive node
+        assert_eq!(Interp::Log.reconstruct(0.0, 2.0, 0.5), 1.0);
+        // nearest
+        assert_eq!(Interp::Nearest.reconstruct(2.0, 4.0, 0.4), 2.0);
+        assert_eq!(Interp::Nearest.reconstruct(2.0, 4.0, 0.6), 4.0);
+        // self-describing on the wire (tagged by `law`)
+        let j = serde_json::to_string(&Interp::Log).unwrap();
+        assert_eq!(j, r#"{"law":"log"}"#);
+        assert_eq!(serde_json::from_str::<Interp>(&j).unwrap(), Interp::Log);
+    }
+
+    #[test]
+    fn icdf_sampler_bilinear_and_round_trips_json() {
+        // bilinear over a unit cell: v00=0,v01=1,v10=2,v11=3
+        let s = IcdfSampler::BILINEAR;
+        assert_eq!(s.reconstruct(0.0, 1.0, 2.0, 3.0, 0.0, 0.0), 0.0);
+        assert_eq!(s.reconstruct(0.0, 1.0, 2.0, 3.0, 1.0, 1.0), 3.0);
+        assert_eq!(s.reconstruct(0.0, 1.0, 2.0, 3.0, 0.5, 0.5), 1.5);
+        let j = serde_json::to_string(&s).unwrap();
+        let back: IcdfSampler = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, s);
+    }
 
     #[test]
     fn identity_is_passthrough_both_directions() {
@@ -338,6 +476,43 @@ mod tests {
         assert_eq!(t.apply_scalar(1.5), None); // non-integral index
         assert_eq!(t.invert_scalar(165.0), Some(3.0));
         assert_eq!(t.invert_scalar(1.0), None); // no such frame time
+    }
+
+    #[test]
+    fn log_axis_maps_index_to_geometric_energy_grid() {
+        // a σ(E) / inverse-CDF energy axis: 1 keV .. 511 keV over 128 log-spaced nodes.
+        let r = Referenced::log_axis(1.0, 511.0, 128, Some("keV".into()));
+        assert_eq!(r.unit.as_deref(), Some("keV"));
+        assert_eq!(r.frame.as_deref(), Some("physical"));
+        // endpoints land on lo/hi; the grid is geometric (constant ratio per step).
+        assert!((r.transform.apply_scalar(0.0).unwrap() - 1.0).abs() < 1e-9);
+        assert!((r.transform.apply_scalar(127.0).unwrap() - 511.0).abs() < 1e-6);
+        // constant ratio: node k+1 / node k is the same everywhere (the defining log-grid property).
+        let step_ratio = 511.0f64.powf(1.0 / 127.0);
+        for k in [0.0, 50.0, 126.0] {
+            let lo = r.transform.apply_scalar(k).unwrap();
+            let hi = r.transform.apply_scalar(k + 1.0).unwrap();
+            assert!((hi / lo - step_ratio).abs() < 1e-9);
+        }
+        // invert recovers the (fractional) index — the O(1) closed-form gather.
+        let e = r.transform.apply_scalar(40.0).unwrap();
+        assert!((r.transform.invert_scalar(e).unwrap() - 40.0).abs() < 1e-9);
+        // guards: zero step and non-positive physical are non-invertible (no ln of ≤ 0).
+        assert_eq!(
+            Transform::Log {
+                ln_lo: 0.0,
+                ln_step: 0.0
+            }
+            .invert_scalar(1.0),
+            None
+        );
+        assert_eq!(r.transform.invert_scalar(0.0), None);
+        assert_eq!(r.transform.invert_scalar(-5.0), None);
+        // self-describing on the wire, additively (kind = "log"); roundtrips.
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["transform"]["kind"], "log");
+        let back: Referenced = serde_json::from_value(j).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]
@@ -411,6 +586,7 @@ mod tests {
             Referenced::time_regular(0.0, 30.0),                                   // epoch
             Referenced::time_irregular(vec![5.0, 15.0]),                           // epoch
             Referenced::time_ticks(1e-12, 0.0),                                    // epoch
+            Referenced::log_axis(1.0, 511.0, 128, Some("keV".into())),             // physical
             Referenced::identity(Some("HU".into())),                               // no frame
         ] {
             assert!(
@@ -474,6 +650,7 @@ mod tests {
             Referenced::from_rescale(Some(1.0), Some(-1024.0), Some("HU".into())),
             Referenced::time_regular(0.0, 30.0), // s
             Referenced::time_ticks(1e-12, 0.0),  // s
+            Referenced::log_axis(1.0, 511.0, 128, Some("keV".into())), // keV
             Referenced::identity(Some("Bq/mL".into())),
         ] {
             assert!(r.unit_is_canonical(), "{:?} must use a pinned unit", r.unit);

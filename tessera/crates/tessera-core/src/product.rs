@@ -46,6 +46,9 @@ impl ProductBuilder {
         manifest.schema = parent.schema.clone();
         manifest.metadata = parent.metadata.clone();
         manifest.extra = parent.extra.clone();
+        // `producer` and `generation` are intentionally NOT carried: a new version is sealed by
+        // *this* build (producer is re-stamped in `seal`), and its generation recipe is a property of
+        // how *this* revision was made — the caller re-attaches one via `with_generation` if needed.
         // Keep derivation/provenance edges; drop the parent's version edges (walked, not accumulated).
         manifest.sources = parent
             .sources
@@ -112,6 +115,34 @@ impl ProductBuilder {
         self
     }
 
+    /// Declare the producing tool/build (ADR-0058 §1) — an external DAQ/SIM/recon records its own
+    /// identity here, overriding the default `tessera` stamp. Sealed provenance.
+    pub fn with_producer(&mut self, producer: crate::provenance::Producer) -> &mut Self {
+        self.manifest.producer = Some(crate::provenance::ProducerRef::Structured(producer));
+        self
+    }
+
+    /// Attach the generation record (ADR-0058 §2) — *how* this product was made, as a generic bag
+    /// (inline `config` and/or a `config_ref` to a carried block). Required at validate for schemas
+    /// that set `requires_generation`.
+    pub fn with_generation(&mut self, generation: crate::provenance::Generation) -> &mut Self {
+        self.manifest.generation = Some(generation);
+        self
+    }
+
+    /// Inherit **schema-flagged identity** fields from a resolved `derived_from` parent (ADR-0058
+    /// §5) — the DAG-walk caller (the ingest engine) supplies the parent manifest + this product's
+    /// schema; only fields the schema marks `inherit` flow, and an explicit child value always wins.
+    /// Call before `seal` so the inherited identity is covered by the seal.
+    pub fn inherit_identity_from(
+        &mut self,
+        parent: &Manifest,
+        schema: &crate::schema::ProductSchema,
+    ) -> &mut Self {
+        crate::provenance::inherit_identity(&mut self.manifest, parent, schema);
+        self
+    }
+
     /// Seal: roll block digests into the content Merkle root, then hash the whole manifest into
     /// the `manifest_hash` seal, freeze, and return it.
     ///
@@ -138,11 +169,19 @@ impl ProductBuilder {
                 self.manifest.schema = Some(s.to_value()?);
             }
         }
-        // Sealed provenance: stamp the producing tool/build so a reader knows what wrote the file.
-        // Re-stamped per version (not inherited) — a new version is sealed by *this* tool.
+        // Sealed provenance: stamp the producing tool/build so a reader knows what wrote the file
+        // (ADR-0058 §1 — structured [`ProducerRef::tessera()`], tool + `TESSERA_VERSION` +
+        // optional build commit). Re-stamped per version (not inherited) — a new version is sealed
+        // by *this* tool.
+        //
+        // Note the seal keys off the **format version** (`TESSERA_VERSION`), not the software
+        // (`CARGO_PKG_VERSION`) — identity-relevant and stable across software/crate version
+        // bumps. The build-tool/software version is non-sealed provenance and lives in
+        // `aux/provenance.json` (ADR-0042), so a `cargo` version bump never changes the seal or
+        // forces a conformance-corpus regen. (`TESSERA_VERSION` only changes on a *deliberate*
+        // format revision — where a regen is expected.)
         if self.manifest.producer.is_none() {
-            self.manifest.producer =
-                Some(concat!("tessera/", env!("CARGO_PKG_VERSION")).to_string());
+            self.manifest.producer = Some(crate::provenance::ProducerRef::tessera());
         }
         // The seal is computed last, over the manifest with `manifest_hash` excluded, so it
         // transitively commits to id_inputs, sources, the producer, the embedded schema, and blocks.
@@ -207,6 +246,71 @@ mod tests {
             sup[0].reference, v1mh,
             "points at the immediate parent version"
         );
+    }
+
+    /// ADR-0056 §6a: decoder drift is detectable from **sealed data alone**, even before the
+    /// decoder identity is recorded.
+    ///
+    /// This is the property that makes the decoder identity a *recipe fact* — recorded in the
+    /// sealed provenance bag under the well-known key `ingest_decoder` (ADR-0056 §6a), not a
+    /// bespoke sealed field. The seal already pins both ends of the ingest transform — the input,
+    /// via the `ingested_from` edge's source digest, and the output, via `content_hash` — so
+    /// *same source digest + different content_hash* means the interpretation changed, and no
+    /// dedicated field is needed to *detect* it. Recording the decoder is for *attribution*, not
+    /// detection.
+    ///
+    /// If a refactor ever dropped the source digest from the edge, or folded product metadata into
+    /// `content_hash`, that inference would break silently and #403's decision would lose its
+    /// premise. Both halves are asserted here.
+    #[test]
+    fn the_sealed_source_and_content_hashes_bracket_the_ingest_transform() {
+        // Same source file, decoded twice. `decoded` is the block digest, standing in for whatever
+        // logical values the decoder extracted; `context` is a piece of recorded metadata — sealed,
+        // but not part of `content_hash`.
+        let sealed = |decoded: &str, context: &str| {
+            let mut b = ProductBuilder::new("table", "trades", "d", "2024-01-01T00:00:00Z");
+            b.add_block_ref(block("data", decoded));
+            b.add_source(
+                Source::new("ingested_from", "trades.parquet").with_content_hash("blake3:src"),
+            );
+            b.with_field("source_format", serde_json::json!(context));
+            b.seal().unwrap()
+        };
+
+        let same_values = sealed("blake3:aa", "parquet");
+        let drifted = sealed("blake3:bb", "parquet");
+
+        // The input is pinned inside the seal — this is what makes the comparison meaningful.
+        let src = |m: &Manifest| {
+            m.sources
+                .iter()
+                .find(|s| s.role == "ingested_from")
+                .and_then(|s| s.content_hash.clone())
+                .expect("ingest stamps a source digest")
+        };
+        assert_eq!(src(&same_values), src(&drifted), "same source file");
+
+        // Same source + moved content_hash ⇒ the interpretation changed. Detection, from the seal.
+        assert_ne!(
+            same_values.content_hash, drifted.content_hash,
+            "different extracted values must move content_hash"
+        );
+        assert_ne!(same_values.manifest_hash, drifted.manifest_hash);
+        assert_eq!(
+            same_values.id, drifted.id,
+            "drift is a new version of one logical product, not a new product"
+        );
+
+        // The other half: a value-preserving change to recorded context moves `manifest_hash`
+        // (metadata changed) but never `content_hash`/`id` — the data fingerprint tracks the
+        // extracted *values*, not the recipe. That is exactly why recording the decoder (§6a) is a
+        // sealed recipe fact that can never move `content_hash` on its own.
+        let relabelled = sealed("blake3:aa", "parquet-v2");
+        assert_eq!(
+            same_values.content_hash, relabelled.content_hash,
+            "content_hash is a Merkle over block digests; manifest metadata is not in it"
+        );
+        assert_eq!(same_values.id, relabelled.id);
     }
 
     #[test]

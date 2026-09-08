@@ -14,7 +14,9 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use tessera_core::collection::{Collection, MemberKind, Role};
+use tessera_core::collection::{
+    member_filename, Collection, CollectionBuilder, MemberKind, ProductHandle, Role,
+};
 use tessera_core::{Error, Result};
 use tessera_io::Reader;
 
@@ -43,15 +45,11 @@ fn load(file: &Path) -> Result<Collection> {
     Collection::from_json(&std::fs::read_to_string(file)?)
 }
 
-/// The on-disk path of a member next to the `collection.json` — resolved by `kind` (ADR-0049 §4): a
-/// product is `<reference>.tsra`, a sub-collection is `<reference>.collection.json`.
+/// The on-disk path of a member next to the `collection.json` — resolved by `kind` (ADR-0049 §4) via
+/// the shared [`member_filename`] SSoT (so the resolved name matches what every writer emits, #323).
 fn member_path(collection_file: &Path, reference: &str, kind: MemberKind) -> PathBuf {
     let dir = collection_file.parent().unwrap_or_else(|| Path::new("."));
-    if kind == MemberKind::Collection {
-        dir.join(format!("{reference}.collection.json"))
-    } else {
-        dir.join(format!("{reference}.tsra"))
-    }
+    dir.join(member_filename(reference, kind))
 }
 
 fn w(out: &mut dyn Write, args: std::fmt::Arguments<'_>) -> Result<()> {
@@ -242,6 +240,87 @@ fn verify_collection(
     Ok(count)
 }
 
+/// `tessera collection new` — assemble a `collection.json` from **pre-sealed** `.tsra` products
+/// (#304 Part 1), decoupling "which members belong together" from ingest time. Opens each member
+/// (which verifies its seal), pins it by `(id, manifest_hash)` via the typed [`ProductHandle`], seals
+/// the catalog under the declared `--schema` (validating its `member_rule`), and writes a
+/// self-contained collection directory: `<out>/collection.json` + each member hard-linked (or copied)
+/// as `<out>/<id>.tsra`, so `collection verify` resolves + checks it in place. The collection's
+/// timestamp defaults to the latest member's (deterministic) unless `--timestamp` is given.
+#[allow(clippy::too_many_arguments)]
+pub fn new(
+    members: &[PathBuf],
+    out: &Path,
+    name: &str,
+    description: &str,
+    schema: &str,
+    study: Option<&str>,
+    timestamp: Option<&str>,
+    role: Role,
+    w_out: &mut dyn Write,
+) -> Result<()> {
+    if members.is_empty() {
+        return Err(Error::Invalid(
+            "collection new needs at least one --member".into(),
+        ));
+    }
+    // Open each member (verifies its own seal), pin by (id, manifest_hash), track the latest ts.
+    let mut handles: Vec<(ProductHandle, PathBuf)> = Vec::with_capacity(members.len());
+    let mut latest_ts = String::new();
+    for m in members {
+        let r = Reader::open(m).map_err(|e| {
+            Error::Invalid(format!(
+                "member '{}' is not a readable .tsra: {e}",
+                m.display()
+            ))
+        })?;
+        let mf = r.manifest();
+        if mf.timestamp > latest_ts {
+            latest_ts = mf.timestamp.clone();
+        }
+        handles.push((ProductHandle::of(mf)?, m.clone()));
+    }
+    let ts = timestamp.map(String::from).unwrap_or(latest_ts);
+
+    let mut cb = CollectionBuilder::new(name, description, &ts);
+    cb.with_collection_schema(schema);
+    if let Some(s) = study {
+        cb.with_study(s);
+    }
+    for (h, _) in &handles {
+        cb.add_product(h, role, Vec::new());
+    }
+    // Seal validates the declared schema's `member_rule` (a `dataset` accepts these products; a
+    // `project` would reject them — fail-fast before writing anything).
+    let sealed = cb.seal()?;
+
+    // Write the self-contained collection dir: collection.json + each member under the shared
+    // `member_filename` (sanitized `<stem>.tsra`), the same name `verify`/`ls` resolve (#323).
+    std::fs::create_dir_all(out)?;
+    std::fs::write(out.join("collection.json"), sealed.to_json()?)?;
+    for (h, src) in &handles {
+        let dst = out.join(member_filename(h.reference(), MemberKind::Product));
+        if src.canonicalize().ok() == dst.canonicalize().ok() {
+            continue; // member already in place
+        }
+        let _ = std::fs::remove_file(&dst);
+        // Hard-link when same-filesystem (no data copy); fall back to a full copy across mounts.
+        if std::fs::hard_link(src, &dst).is_err() {
+            std::fs::copy(src, &dst)?;
+        }
+    }
+    w(
+        w_out,
+        format_args!(
+            "wrote collection '{}' (schema {}, {} members) → {}\n",
+            sealed.id,
+            sealed.collection_schema,
+            sealed.members.len(),
+            out.join("collection.json").display()
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,7 +344,7 @@ mod tests {
             pack(
                 &sealed,
                 &[payload],
-                &dir.join(format!("{}.tsra", sealed.id)),
+                &dir.join(member_filename(&sealed.id, MemberKind::Product)),
             )
             .unwrap();
             cb.add_member(
@@ -311,7 +390,11 @@ mod tests {
             .contains("verified (2 members, recursive)"));
 
         // Remove a member file → verify fails loudly (missing member).
-        std::fs::remove_file(dir.path().join(format!("{}.tsra", c.members[0].reference))).unwrap();
+        std::fs::remove_file(dir.path().join(member_filename(
+            &c.members[0].reference,
+            MemberKind::Product,
+        )))
+        .unwrap();
         assert!(verify(&cf, &mut Vec::new()).is_err());
     }
 
@@ -329,7 +412,7 @@ mod tests {
             pack(
                 &sealed,
                 &[payload],
-                &dir.join(format!("{}.tsra", sealed.id)),
+                &dir.join(member_filename(&sealed.id, MemberKind::Product)),
             )
             .unwrap();
             cb.add_member(
@@ -341,7 +424,7 @@ mod tests {
         }
         let c = cb.seal().unwrap();
         std::fs::write(
-            dir.join(format!("{}.collection.json", c.id)),
+            dir.join(member_filename(&c.id, MemberKind::Collection)),
             c.to_json().unwrap(),
         )
         .unwrap();
@@ -390,11 +473,87 @@ mod tests {
         assert!(s.contains("recursive") && s.contains("3 members"), "{s}");
 
         // Tamper a grandchild product `.tsra` → the recursive verify catches it transitively.
-        std::fs::remove_file(
-            dir.path()
-                .join(format!("{}.tsra", child.members[0].reference)),
-        )
+        std::fs::remove_file(dir.path().join(member_filename(
+            &child.members[0].reference,
+            MemberKind::Product,
+        )))
         .unwrap();
         assert!(verify(&pf, &mut Vec::new()).is_err());
+    }
+
+    /// `collection new` (#304 Part 1): assemble a `dataset` from two pre-sealed `.tsra` products →
+    /// a self-contained dir (`collection.json` + `<id>.tsra` members) that `verify` passes, and
+    /// `inspect` shows the declared schema.
+    #[test]
+    fn collection_new_assembles_from_presealed_tsra() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut member_paths = Vec::new();
+        for name in ["ct", "pt"] {
+            let spec = ArraySpec::new(vec![2, 2], "int16");
+            let (bref, payload) =
+                tessera_io::array::array_block("volume", &spec, &ArrayData::I16(vec![0, 1, 2, 3]))
+                    .unwrap();
+            let mut b = ProductBuilder::new("recon", name, "d", "2024-01-01T00:00:00Z");
+            b.add_block_ref(bref);
+            let sealed = b.seal().unwrap();
+            let p = dir.path().join(format!("input_{name}.tsra"));
+            pack(&sealed, &[payload], &p).unwrap();
+            member_paths.push(p);
+        }
+        let out = dir.path().join("assembled");
+        new(
+            &member_paths,
+            &out,
+            "study-A",
+            "",
+            "dataset",
+            Some("S1"),
+            None,
+            Role::Raw,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let cf = out.join("collection.json");
+        assert!(cf.exists(), "collection.json written");
+        // #323: each member lands under the sanitized stem (`blake3_….tsra`), NOT the raw
+        // colon-bearing reference — and that is exactly the name `verify` resolves.
+        let c = load(&cf).unwrap();
+        for m in &c.members {
+            assert!(m.reference.contains(':'), "a real blake3 id has a colon");
+            assert!(
+                out.join(member_filename(&m.reference, MemberKind::Product))
+                    .exists(),
+                "member resolves under the sanitized stem"
+            );
+            assert!(
+                !out.join(format!("{}.tsra", m.reference)).exists(),
+                "the raw colon-named file must NOT be the on-disk name (the #323 mismatch)"
+            );
+        }
+        // The assembled collection is self-contained + passes recursive verify.
+        verify(&cf, &mut Vec::new()).unwrap();
+        let mut buf = Vec::new();
+        inspect(&cf, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("schema        dataset") && s.contains("members       2"),
+            "{s}"
+        );
+
+        // A `project` schema rejects product members (member_rule) — fail-fast, nothing written.
+        let out2 = dir.path().join("bad");
+        assert!(new(
+            &member_paths,
+            &out2,
+            "p",
+            "",
+            "project",
+            None,
+            None,
+            Role::Derived,
+            &mut Vec::new()
+        )
+        .is_err());
     }
 }

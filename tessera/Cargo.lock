@@ -1273,9 +1273,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2470,7 +2470,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2842,9 +2842,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2942,13 +2942,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "hdf5-metno-sys"
-version = "0.12.0"
+name = "hdf5-metno-src"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5588d150d10fc4ef9407c5b9f01735e3de0d71367b730b940cbd5be08f3e1d82"
+checksum = "ffa848dfefcedb9778083a799c96e1ec620757e54f6649e525e08bd8600a4595"
 dependencies = [
+ "cmake",
+ "libz-sys",
+]
+
+[[package]]
+name = "hdf5-metno-sys"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4960600abde637480bd1c21430baece56bcbafe5303cede311f67c27f50a9f4a"
+dependencies = [
+ "hdf5-metno-src",
  "libc",
  "libloading",
+ "libz-sys",
  "parking_lot",
  "pkg-config",
  "regex",
@@ -3344,7 +3356,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4377,7 +4389,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4935,7 +4947,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5367,7 +5379,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5425,7 +5437,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6074,7 +6086,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6095,7 +6107,7 @@ checksum = "d4d1330fe7f7f872cd05165130b10602d667b205fd85be09be2814b115d4ced9"
 
 [[package]]
 name = "tessera-cli"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "arrow",
  "clap",
@@ -6103,7 +6115,9 @@ dependencies = [
  "dicom",
  "getrandom 0.2.17",
  "hdf5-metno",
+ "libc",
  "object_store 0.14.0",
+ "serde",
  "serde_json",
  "ssh-key",
  "tempfile",
@@ -6112,6 +6126,7 @@ dependencies = [
  "tessera-io",
  "time",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "trycmd",
@@ -6119,7 +6134,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-core"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -6133,7 +6148,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-ingest"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "dicom",
  "dicom-transfer-syntax-registry",
@@ -6150,7 +6165,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-io"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "blake3",
  "bytes",
@@ -6180,7 +6195,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-py"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "pyo3",
  "serde_json",
@@ -6190,7 +6205,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-wasm"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde_json",
  "tessera-core",
@@ -6833,6 +6848,7 @@ checksum = "110427e1a65221519c8127e92a8080ee922b5f76a311568d227fd227bfbdfa10"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
+ "pco",
  "rand 0.10.1",
  "vortex-alp",
  "vortex-array",
@@ -6843,6 +6859,7 @@ dependencies = [
  "vortex-error",
  "vortex-fastlanes",
  "vortex-fsst",
+ "vortex-pco",
  "vortex-runend",
  "vortex-sequence",
  "vortex-sparse",
@@ -7407,7 +7424,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
