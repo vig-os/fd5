@@ -440,6 +440,132 @@ impl<R: Read + Seek> Reader<R> {
         }
         Ok(total)
     }
+
+    /// Verify every block's stored payload by streaming it through [`Self::stream_block`] (the
+    /// bounded-memory 64 KiB-ring path) into a null sink — so a multi-GB product verifies at a few
+    /// MiB RSS, never buffering a whole block. `open` already checked the seal (manifest); this is
+    /// the payload half. The first corrupt block returns a typed [`Error::BlockIntegrity`] naming
+    /// `label` (the file path or URL) and the block, with the underlying cause in `detail` (the zip
+    /// CRC error, or an `Integrity` mismatch with expected/actual) — never a locus-free `io:` error
+    /// (#268). Shared by `tessera verify` and the `--verify` deep opt-in of the read-side commands.
+    pub fn verify_payloads(&mut self, label: &str) -> Result<()> {
+        let mut sink = std::io::sink();
+        for name in self.block_names() {
+            self.stream_block(&name, &mut sink)
+                .map_err(|e| Error::BlockIntegrity {
+                    file: label.to_string(),
+                    block: name.clone(),
+                    detail: e.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+}
+
+/// The size floor below which parallel verify isn't worth the thread-spawn + per-worker archive
+/// reopen overhead — mirrors the "a few hundred MiB" knee blake3's mmap/rayon path uses
+/// ([`crate::blob::blob_ref_streaming_parallel`]). Below this a `.tsra` verifies serially.
+const PARALLEL_VERIFY_MIN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The adaptive knee for [`verify_payloads_parallel`]: fan the L2 payload probe across workers only
+/// when it pays back — more than one worker, more than one block, and a file at least `min_bytes`
+/// (thread setup + per-worker reopen is then noise against the hashing). Small products stay serial
+/// (the same small-stays-single principle as the streaming write path, ADR-0026). `min_bytes` is a
+/// parameter so tests can drop it to `0` and exercise the fan-out branch on a small fixture.
+fn should_parallelize(file_size: u64, block_count: usize, workers: usize, min_bytes: u64) -> bool {
+    workers > 1 && block_count > 1 && file_size >= min_bytes
+}
+
+/// The parallel core: verify `names` by streaming each block's stored bytes through
+/// [`Reader::stream_block`] into a null sink, fanned across `n_threads` OS threads. Each thread opens
+/// its **own** [`Reader`] (a `.tsra` is a STORED zip so every block is independently addressable) and
+/// work-steals blocks via a shared cursor, so one huge blob never idles the other workers. Read-only
+/// and order-independent — identical result to the serial path. On corruption it returns the typed
+/// [`Error::BlockIntegrity`] for *a* bad block (whichever a worker reaches first, not necessarily the
+/// first in manifest order). `std::thread` — the same worker-pool idiom as the write engine, no new dep.
+fn verify_payloads_multithread(
+    path: &Path,
+    names: &[String],
+    label: &str,
+    n_threads: usize,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let cursor = AtomicUsize::new(0);
+    // Lock-free "someone already failed" flag gates the hot path (checked every iteration); the
+    // Mutex is only ever taken on the rare error path, and `swap` ensures exactly the first worker
+    // to fail records its error.
+    let failed = AtomicBool::new(false);
+    let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+    let record = |e: Error| {
+        if !failed.swap(true, Ordering::AcqRel) {
+            *first_err.lock().unwrap() = Some(e);
+        }
+    };
+    std::thread::scope(|s| {
+        for _ in 0..n_threads {
+            s.spawn(|| {
+                let mut r = match Reader::open(path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        record(e);
+                        return;
+                    }
+                };
+                let mut sink = std::io::sink();
+                loop {
+                    // Stop pulling work once any worker has recorded a failure (lock-free check).
+                    if failed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= names.len() {
+                        return;
+                    }
+                    if let Err(e) = r.stream_block(&names[i], &mut sink) {
+                        record(Error::BlockIntegrity {
+                            file: label.to_string(),
+                            block: names[i].clone(),
+                            detail: e.to_string(),
+                        });
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    match first_err.into_inner().unwrap() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Threshold-injectable core of [`verify_payloads_parallel`]: the public entry fixes `min_bytes` to
+/// [`PARALLEL_VERIFY_MIN_BYTES`]; tests pass `0` to force the fan-out branch on a small fixture.
+/// Returns the number of blocks verified, so a caller needn't reopen the archive to report the count.
+fn verify_payloads_parallel_with(
+    path: &Path,
+    label: &str,
+    workers: usize,
+    min_bytes: u64,
+) -> Result<usize> {
+    let names = Reader::open(path)?.block_names(); // L1 seal check + block list
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if should_parallelize(file_size, names.len(), workers, min_bytes) {
+        verify_payloads_multithread(path, &names, label, workers.min(names.len()))?;
+    } else {
+        Reader::open(path)?.verify_payloads(label)?;
+    }
+    Ok(names.len())
+}
+
+/// Parallel peer of [`Reader::verify_payloads`] for a **local** `.tsra` — the L2 payload probe fanned
+/// across up to `workers` OS threads. Above the [`should_parallelize`] knee it work-steals blocks
+/// across `min(workers, blocks)` threads via [`verify_payloads_multithread`]; below it (small file,
+/// single block, or `workers <= 1`) it falls back to the serial [`Reader::verify_payloads`], since the
+/// thread-spawn + reopen overhead doesn't pay back. The result — the block count on success, or a
+/// typed [`Error::BlockIntegrity`] — is identical to the serial path; only the wall-clock differs.
+pub fn verify_payloads_parallel(path: &Path, label: &str, workers: usize) -> Result<usize> {
+    verify_payloads_parallel_with(path, label, workers, PARALLEL_VERIFY_MIN_BYTES)
 }
 
 /// One aux member to add to an existing `.tsra` — a name **relative to `aux/`** (so
@@ -764,6 +890,242 @@ mod tests {
         match r.read_block("volume") {
             Err(Error::Integrity { what, .. }) => assert_eq!(what, "block_payload"),
             other => panic!("expected block_payload integrity error, got {other:?}"),
+        }
+    }
+
+    // Build a sealed multi-block product at `path`; return each block's (name, payload bytes).
+    fn sealed_multiblock(path: &Path, n: usize) -> Vec<(String, Vec<u8>)> {
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2024-01-01T00:00:00Z");
+        let blocks: Vec<ArrayBlock> = (0..n)
+            .map(|i| ArrayBlock::new(format!("vol{i}"), ArraySpec::new(vec![8, 8, 8], "int16")))
+            .collect();
+        let mut out = Vec::new();
+        for (i, blk) in blocks.iter().enumerate() {
+            b.add_block(blk).unwrap();
+            out.push((format!("vol{i}"), serde_json::to_vec(&blk.spec).unwrap()));
+        }
+        let sealed = b.seal().unwrap();
+        let payloads: Vec<BlockPayload> = out
+            .iter()
+            .map(|(name, bytes)| BlockPayload::new(name.clone(), bytes.clone()))
+            .collect();
+        pack(&sealed, &payloads, path).unwrap();
+        out
+    }
+
+    #[test]
+    fn should_parallelize_respects_the_knee() {
+        let floor = PARALLEL_VERIFY_MIN_BYTES;
+        assert!(
+            should_parallelize(floor, 4, 8, floor),
+            "at the floor + multi-block + workers → parallel"
+        );
+        assert!(
+            !should_parallelize(floor - 1, 4, 8, floor),
+            "one byte below the floor → serial"
+        );
+        assert!(
+            !should_parallelize(floor, 1, 8, floor),
+            "single block → serial"
+        );
+        assert!(
+            !should_parallelize(floor, 4, 1, floor),
+            "single worker → serial"
+        );
+    }
+
+    #[test]
+    fn parallel_core_verifies_clean_multiblock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tsra");
+        let names: Vec<String> = sealed_multiblock(&path, 5)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        verify_payloads_multithread(&path, &names, &path.display().to_string(), 4).unwrap();
+    }
+
+    #[test]
+    fn parallel_core_catches_a_tampered_block() {
+        // One block's payload is flipped while its recorded digest stays — a worker re-deriving the
+        // digest from the stored bytes must catch it, even though other workers verify clean blocks.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tsra");
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2024-01-01T00:00:00Z");
+        let mut names = Vec::new();
+        let mut payloads = Vec::new();
+        for i in 0..5 {
+            let blk = ArrayBlock::new(format!("vol{i}"), ArraySpec::new(vec![8, 8, 8], "int16"));
+            b.add_block(&blk).unwrap();
+            let mut bytes = serde_json::to_vec(&blk.spec).unwrap();
+            if i == 3 {
+                bytes[0] ^= 0xFF; // corrupt vol3's payload
+            }
+            names.push(format!("vol{i}"));
+            payloads.push(BlockPayload::new(format!("vol{i}"), bytes));
+        }
+        let sealed = b.seal().unwrap();
+        pack(&sealed, &payloads, &path).unwrap();
+        match verify_payloads_multithread(&path, &names, &path.display().to_string(), 4) {
+            Err(Error::BlockIntegrity { block, .. }) => assert_eq!(block, "vol3"),
+            other => panic!("expected a BlockIntegrity error for vol3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parallel_and_serial_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tsra");
+        let names: Vec<String> = sealed_multiblock(&path, 5)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        let label = path.display().to_string();
+        // serial L2, the parallel core, and the public entry (which for this small file takes the
+        // serial fallback) must all agree that a clean product verifies.
+        Reader::open(&path)
+            .unwrap()
+            .verify_payloads(&label)
+            .unwrap();
+        verify_payloads_multithread(&path, &names, &label, 4).unwrap();
+        assert_eq!(verify_payloads_parallel(&path, &label, 8).unwrap(), 5);
+    }
+
+    #[test]
+    fn forced_parallel_dispatch_runs_end_to_end() {
+        // Exercise the PUBLIC entry's fan-out branch on a small fixture by dropping the size floor to
+        // 0 — so should_parallelize → true and verify_payloads_parallel_with dispatches to the
+        // multithread core (the branch the 256 MiB threshold hides from the other tests). Clean
+        // product → Ok(block count).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tsra");
+        sealed_multiblock(&path, 5);
+        let label = path.display().to_string();
+        assert_eq!(
+            verify_payloads_parallel_with(&path, &label, 4, 0).unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn forced_parallel_dispatch_catches_tamper() {
+        // Same forced fan-out, but one block is corrupt: the dispatch → multithread → typed error
+        // path must surface the bad block (not silently pass).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tsra");
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2024-01-01T00:00:00Z");
+        let mut payloads = Vec::new();
+        for i in 0..5 {
+            let blk = ArrayBlock::new(format!("vol{i}"), ArraySpec::new(vec![8, 8, 8], "int16"));
+            b.add_block(&blk).unwrap();
+            let mut bytes = serde_json::to_vec(&blk.spec).unwrap();
+            if i == 2 {
+                bytes[0] ^= 0xFF;
+            }
+            payloads.push(BlockPayload::new(format!("vol{i}"), bytes));
+        }
+        let sealed = b.seal().unwrap();
+        pack(&sealed, &payloads, &path).unwrap();
+        match verify_payloads_parallel_with(&path, &path.display().to_string(), 4, 0) {
+            Err(Error::BlockIntegrity { block, .. }) => assert_eq!(block, "vol2"),
+            other => panic!("expected a BlockIntegrity error for vol2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tampered_table_block_payload_fails_on_read() {
+        // The Vortex-table twin of tampered_block_payload_fails_on_read (which uses an int16 array):
+        // flipping a single value's byte in an encoded table payload trips the block_payload digest
+        // on read, exactly as for an array/zarr block — the guarantee is kind-agnostic.
+        use tessera_core::block::table::{Column, TableBlock, TableSpec};
+        let spec = TableSpec {
+            columns: vec![Column {
+                name: "energy".into(),
+                dtype: "f4".into(),
+                ..Default::default()
+            }],
+            rows: 2_696_935,
+            row_index: Some("ms".into()),
+        };
+        // The valid payload is exactly what the block digest is computed over (the spec, in the
+        // spike — a real Vortex backend stores encoded column chunks with the same property).
+        let good = serde_json::to_vec(&spec).unwrap();
+        let events = TableBlock::new("events_3p", spec);
+
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2024-01-01T00:00:00Z");
+        b.add_block(&events).unwrap();
+        let sealed = b.seal().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        // Happy path: the correct payload reads back.
+        let good_path = dir.path().join("good.tsra");
+        pack(
+            &sealed,
+            &[BlockPayload::new("events_3p", good.clone())],
+            &good_path,
+        )
+        .unwrap();
+        assert_eq!(
+            Reader::open(&good_path)
+                .unwrap()
+                .read_block("events_3p")
+                .unwrap(),
+            good
+        );
+
+        // Flip ONE byte (a single value in the table) → block_payload integrity error on read.
+        let mut bad = good.clone();
+        bad[0] ^= 0xFF;
+        let bad_path = dir.path().join("bad.tsra");
+        pack(&sealed, &[BlockPayload::new("events_3p", bad)], &bad_path).unwrap();
+        match Reader::open(&bad_path).unwrap().read_block("events_3p") {
+            Err(Error::Integrity { what, .. }) => assert_eq!(what, "block_payload"),
+            other => panic!("expected block_payload integrity error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_verify_is_l1_only_payload_flip_needs_read_path() {
+        // The verify escalation ladder, as an executable spec:
+        //   L1 = manifest.verify(): recomputes id / content_hash / manifest_hash from the RECORDED
+        //        block digests. It never reads block payloads, so a flipped payload left alongside
+        //        an untouched recorded digest still PASSES L1.
+        //   L2 = read_block: re-derives the digest from the ACTUAL stored bytes → catches the flip.
+        // (L3 = per-chunk sub-block Merkle, #214 / ADR-0028 §3, would localise WHICH chunk — n/a here.)
+        use tessera_core::block::table::{Column, TableBlock, TableSpec};
+        let spec = TableSpec {
+            columns: vec![Column {
+                name: "energy".into(),
+                dtype: "f4".into(),
+                ..Default::default()
+            }],
+            rows: 10,
+            row_index: Some("ms".into()),
+        };
+        let good = serde_json::to_vec(&spec).unwrap();
+        let events = TableBlock::new("events_3p", spec);
+
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2024-01-01T00:00:00Z");
+        b.add_block(&events).unwrap();
+        let sealed = b.seal().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flipped.tsra");
+        // Pack a FLIPPED payload but leave the manifest — and its recorded digest — untouched.
+        let mut flipped = good.clone();
+        flipped[0] ^= 0xFF;
+        pack(&sealed, &[BlockPayload::new("events_3p", flipped)], &path).unwrap();
+
+        let mut r = Reader::open(&path).unwrap();
+        // L1: the manifest itself still verifies — recorded digests, roots and seal are internally
+        // consistent because none of them were touched. L1 does not read payloads.
+        r.manifest()
+            .verify()
+            .expect("L1 (manifest self-consistency) passes: payload bytes are never read");
+        // L2: reading the block re-derives the digest from the stored bytes and catches the flip.
+        match r.read_block("events_3p") {
+            Err(Error::Integrity { what, .. }) => assert_eq!(what, "block_payload"),
+            other => panic!("expected a block_payload integrity error at L2, got {other:?}"),
         }
     }
 

@@ -4,8 +4,11 @@
 Keeps fd5's model (one immutable, content-hashed, self-describing FAIR product) but generalises
 the substrate from a single HDF5 file → manifest + shape-dispatched storage blocks.
 
-**Where:** repo `vig-os/tessera`, branch **`spike/tessera-core`** (worktree `~/worktrees/tessera-core`).
-fd5 white-paper (the founding vision): `~/Projects/tessera/white-paper.md`.
+**Where:** repo `vig-os/tessera`. Default branch **`main`**; integration branch **`dev`** — branch from
+`dev`, PR into `dev`. (The old `spike/tessera-core` branch was graduated in #322 and no longer exists;
+so does the `~/worktrees/tessera-core` path. Allocate a worktree with `anvil-task new tessera <branch>` —
+never share one clone between two concurrent agents.)
+fd5 white-paper (the founding vision): `white-paper.md` at the repo root.
 
 **Read in this order:**
 1. `docs/rfc-tessera.md` — the design (§0 capstone = the decisions; §13 fd5 conventions; §14 impl-readiness).
@@ -36,11 +39,14 @@ fd5 white-paper (the founding vision): `~/Projects/tessera/white-paper.md`.
   (pre-1.0) / cross-arch untested → hedge = pin codec versions + ship vendored readers.
 
 ## Phase & next steps
-Spike phase **done** (S0–S15 + 3 fresh-agent reviews + corrections). **Build phase next** — do the
-**P0 ADRs before code** (they poison fixtures if deferred): #20 canonical-JSON(JCS)+identity-reconciliation+manifest/BlockRef
-schema · #22 versioning-DAG+`.tsra` container spec · #19 restore fd5 conventions+fields · #21
-read-path/Reader-API+error-taxonomy+conformance-corpus. Then S5 (zarrs backend), S17 (write engine),
-S9 (DICOM ingest), S16 (signing). Track everything against `FEATURE-MATRIX.md` gates.
+**Do not read a static task list from this file — it rots.** The spike phase and the P0 ADRs are long
+done; the build phase is deep in flight (33 ADRs in `docs/adr/`, version `0.1.0-alpha.1`, signing /
+WASM / OCI / WORM / ingest all shipped). Get current status from, in this order:
+
+1. `tessera/docs/FEATURE-MATRIX.md` — what passes, and the test+gate proving each row.
+2. `docs/adr/README.md` — the ADR index and status table.
+3. `gh issue list` / `gh pr list` — the live backlog.
+4. `tessera/docs/ROADMAP.md` — dependency order (phases → release gates).
 
 ## Dev environment (Nix + guardrails)
 The whole repo is Nix-managed. **`direnv allow`** (or `nix develop`) at the repo root loads the
@@ -63,8 +69,23 @@ build is ~link time.
   pcodec/vortex/zarr/duckdb/blake3/pydicom/hdf5plugin/numcodecs installed (`uv run python …`).
   Bench scratch: `…/processed/_bench/` (kept: `fd5_product/`, `h5_int16_slice_gzip4.h5`).
 - **ALOCA** — concise, decision-line-per-item; lead with the verdict + the number that drives it.
-- **Tests:** `cd tessera && cargo test` (17 pass) — or `cargo nextest run`.
-- **Commits:** inside the devShell, `prek` gates run (the intended path). From raw agent Bash
-  (no devShell), the installed hook can't find `prek`/the gates, so commit with
-  `git -c commit.gpgsign=false commit --no-verify` (signing key also absent here). Prefer running
-  commits from within `nix develop` so the gates actually fire.
+- **The gate is `nix flake check`** at the repo ROOT — not `cargo test`. It is hermetic and supplies
+  hdf5 + libclang, which the `tessera-ingest` / `tessera-cli` crates need and plain cargo lacks; a
+  green `cargo test` with a red flake check is the normal failure mode, not a fluke.
+  - `nix flake check -L --keep-going` — **always pass `--keep-going`**, or it stops at the first
+    failing attribute and you pay a full cycle per failure.
+  - Single check, warm, seconds: `nix build -L .#checks.x86_64-linux.<attr>` (`workspace-clippy`,
+    `workspace-test`, `workspace-fmt`, `workspace-doctest`, `sql-tests`, `tessera-py-import`,
+    `guardrails-gates`, …). Cold first run is ~25 min locally, ~46 min per arch in CI.
+- **Tests:** `cd tessera && cargo nextest run` — **346** tests. Two traps:
+  - `tessera-cli` is **bin-only** (use `--bins`, not `--lib`) and its `sql` module is behind
+    `--features sql`; bare `cargo test` silently covers neither the SQL nor the cloud paths. The
+    flake has dedicated `sql-tests` / `minio-range-read` checks for exactly this.
+  - **nextest runs one process per test**, which hides cross-call regressions (a dropped runtime
+    poisoning a cached session passed 345/345 and was caught only by `tessera-py-import`). Issue
+    #356 is the mirror case — it fails only in shared-process `cargo test`. Both isolation modes
+    hide a different bug class; the flake is the only thing that runs both.
+- **Commits:** commit inside `nix develop` so the `prek` gates fire. If a hook fails to *install*,
+  that is a bug worth fixing at the source — do not reach for `--no-verify` by reflex, because it
+  disables every other gate in `.pre-commit-config.yaml` too. (Commit signing is unavailable on the
+  agent VMs, so `-c commit.gpgsign=false` is expected; that is not the same as skipping gates.)

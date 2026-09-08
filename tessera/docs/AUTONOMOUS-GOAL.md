@@ -1,5 +1,24 @@
 # Autonomous goal — full proven parity
 
+> ## ⚠ ARCHIVED — DO NOT PASTE THIS AS A GOAL
+>
+> Kept for the historical record of the ~100-increment autonomous run and its findings (the
+> resolution and terminal-state notes at the bottom are still the best account of how the
+> external-blocker scope was settled). **It is no longer executable**, and running it will send an
+> agent somewhere that does not exist:
+>
+> - The goal block targets **`spike/tessera-core`** and says "do NOT merge to main". That branch was
+>   graduated in **#322**; work now branches from **`dev`** and lands by PR into `dev`.
+> - `~/worktrees/tessera-core` does not exist. Use `anvil-task new tessera <branch>`.
+> - Step 6 institutionalises `commit --no-verify`. That bypasses every gate in
+>   `.pre-commit-config.yaml`, not just the failing one — see `tessera/CLAUDE.md` for the current
+>   commit rule.
+> - The "single irreducible external — an ARM CI runner" conclusion is **stale**: `.github/workflows/ci.yml`
+>   has run a GitHub-hosted `ubuntu-24.04-arm` leg since the CI shim landed, and it is green on `dev`.
+>
+> For current status use `FEATURE-MATRIX.md`, `docs/adr/README.md`, `ROADMAP.md`, and the live issue
+> list — not this file.
+
 This is the standing directive for an autonomous landing run. Paste the fenced block below as the
 agent's goal (optionally prefixed with `/goal`). It starts at the empirical-overhead spike (#221) and
 loops — measure → flip → implement → **independently verify** → repeat — terminating **only** on proven

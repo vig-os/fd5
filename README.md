@@ -4,10 +4,10 @@
 content-addressed, self-describing product (manifest + shape-dispatched storage blocks), with a
 single identity / provenance / integrity / versioning spine.
 
-> ⚠️ **Pre-1.0 — the on-disk format is not yet frozen.** Tessera is in late-stage alpha on the
-> `spike/tessera-core` branch. The model, container, and CLI are real and tested, but the byte format
-> may still change before the v0.1 freeze. **Keep your original data** — do not yet rely on a `.tsra`
-> as the only copy of something irreplaceable.
+> ⚠️ **Pre-1.0 — the on-disk format is not yet frozen.** Tessera is in late-stage alpha (development on
+> `dev`). The model, container, and CLI are real and tested, but the byte format may still change before
+> the v0.1 freeze. **Keep your original data** — do not yet rely on a `.tsra` as the only copy of
+> something irreplaceable.
 
 ## Why
 
@@ -22,17 +22,77 @@ does not invent a codec; it **composes the proven engine per shape** under one F
 - **Identity & integrity** — blake3 hash-on-write, a Merkle-Mountain-Range `content_hash`, and a
   `manifest_hash` seal that transitively commits to every block digest + all metadata.
 
-## Install / build
+**Why not just Parquet or HDF5?** They store bytes; Tessera adds the seal, provenance, versioning,
+signing and cloud/FAIR distribution *around* them — see the capability comparison in
+**[docs/book/src/why-tessera.md](docs/book/src/why-tessera.md)**.
 
-The repository is Nix-managed. The reliable path is the dev shell:
+## Install
+
+Tessera's one native dependency is **libhdf5** (used only to *read* vendor acquisitions at ingest). How
+you get it decides which install path fits. In order of least-effort-for-a-user first:
+
+**1. Prebuilt binary (recommended)** — self-contained `tessera`, HDF5 bundled in, zero system deps.
+Published to [GitHub Releases](https://github.com/vig-os/tessera/releases) by
+[cargo-dist](https://opensource.axo.dev/cargo-dist/) for Linux & macOS (x86-64 + arm64):
 
 ```bash
-direnv allow          # or: nix develop   — loads the pinned toolchain + native deps (hdf5/zstd/…)
-cd tessera && cargo test
-cargo build --release -p tessera-cli   # the `tessera` binary
+# curl | sh installer (from a release) — or `cargo binstall tessera-cli`, or grab the tarball
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/vig-os/tessera/releases/latest/download/tessera-cli-installer.sh | sh
 ```
 
-(Building outside the Nix shell needs HDF5 headers + libs on `HDF5_DIR`; see `tessera/CLAUDE.md`.)
+The first release (`0.1.0-alpha.1`) is staged but deliberately **held** — see `release-plz.toml`. Until
+it is cut, build from source with one of the paths below.
+
+**2. From source, self-contained** — no system HDF5 needed; builds a private copy from vendored source.
+Needs **CMake + a C compiler** (and a few minutes). Works on any distro, including `lib64` ones
+(Fedora / RHEL / SUSE / nix):
+
+```bash
+cargo install --git https://github.com/vig-os/tessera --features static-hdf5 tessera-cli
+```
+
+**3. From source, system HDF5 (fastest dev build)** — links a libhdf5 already on the box via
+`pkg-config`. This is the default (no `static-hdf5` feature):
+
+```bash
+cd tessera && cargo build --release -p tessera-cli    # needs libhdf5 + pkg-config installed
+```
+
+**4. Nix (run, or install onto PATH)** — the flake exposes `tessera` as a package; nix supplies the
+whole runtime closure (incl. libhdf5), so nothing is vendored and builds are reproducible:
+
+```bash
+nix run     github:vig-os/tessera -- inspect study.tsra   # run without installing
+nix profile install github:vig-os/tessera                 # put `tessera` on PATH
+```
+
+**5. Nix dev shell (contributors)** — pins the whole toolchain + native deps (hdf5/zstd/…):
+
+```bash
+direnv allow          # or: nix develop
+cd tessera && cargo test
+```
+
+*Why bundled HDF5 is safe:* HDF5 is a read-only *input* format — Tessera re-encodes everything to
+Zarr+pcodec / Vortex on write, so the libhdf5 build is never in a sealed `.tsra`'s byte-path and can
+never affect a `content_hash`.
+
+> **Consuming Tessera from another repo?** See [docs/CONSUMING.md](docs/CONSUMING.md) — git/flake refs while the crates.io/PyPI release stays held.
+
+### Python
+
+The `tessera` Python package (read / verify / write `.tsra`, returning NumPy arrays and
+polars/pyarrow tables) is a pure [pyo3](https://pyo3.rs) `abi3` extension — one wheel serves CPython
+≥ 3.9. Build the reproducible wheel with nix:
+
+```bash
+nix build github:vig-os/tessera#wheel      # → result/tessera-*-cp39-abi3-linux_<arch>.whl
+pip install result/*.whl                   # needs a libstdc++ on the loader path
+```
+
+(The nix-built wheel is a `linux_<arch>` wheel, not yet `manylinux` — auditwheel/manylinux repair for
+a PyPI upload is a tracked follow-up. It installs and imports today in any compatible-glibc env.)
 
 ## Quickstart
 
@@ -47,7 +107,17 @@ tessera verify  corpus/files/recon_int16.tsra
 # Navigate the structure like a zarr hierarchy
 tessera tree corpus/files/listmode_events.tsra      # root status · meta · blocks+columns · sources
 tessera ls   corpus/files/listmode_events.tsra events
-tessera read corpus/files/listmode_events.tsra events -c e0 --limit 5   # cross-block column → CSV
+
+# Read a table column → CSV: a preview, or the whole column, or a row range
+tessera read corpus/files/listmode_events.tsra events -c e0 --limit 5    # preview
+tessera read corpus/files/listmode_events.tsra events -c e0 --all > e0.csv
+tessera read corpus/files/listmode_events.tsra events -c e0 --rows 0:100 # a slice
+
+# Look at an array without decoding the whole volume
+tessera stats   corpus/files/recon_int16.tsra volume              # shape · dtype · codec · min/max/mean
+tessera slice   corpus/files/recon_int16.tsra volume --index "32,:,:"   # one plane → CSV
+tessera project corpus/files/recon_int16.tsra volume --axis z --mode max  # MIP → CSV
+# (Prefer NumPy/DataFrames? the `tessera` Python package returns np.ndarray / polars / pyarrow.)
 
 # Ingest a vendor acquisition (normalise at the door), or a declarative multi-product spec
 tessera ingest ge-hdf5 LIST.h5 out.tsra --name DP06-lm --timestamp 2024-01-01T00:00:00Z

@@ -16,6 +16,9 @@ tessera-core.workspace = true
 tessera-io.workspace = true
 tessera-ingest.workspace = true
 serde_json.workspace = true
+# `[resources]` config-file parsing for the resource-cap resolver (#368) — flag > env > conf > default.
+serde.workspace = true
+toml.workspace = true
 clap.workspace = true
 # Surface library WARNs (e.g. the schema recommended-field nudge from the ingest engine) on stderr.
 tracing.workspace = true
@@ -56,6 +59,10 @@ cloud = ["tessera-io/cloud"]
 # `tessera sql` still parses (uniform UX) but returns a typed "rebuild with --features sql" error,
 # same shape as the `cloud`-gated `push`/`pull` fallback.
 sql = ["dep:datafusion", "dep:tokio", "dep:arrow"]
+# `static-hdf5`: forward the vendored-libhdf5 build down to `tessera-ingest` (see its Cargo.toml). The
+# release channels build the CLI with this ON so the shipped `tessera`/`tsra` binaries and a source
+# `cargo install --features static-hdf5` carry their own HDF5 — no system libhdf5 / pkg-config needed.
+static-hdf5 = ["tessera-ingest/static-hdf5"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -73,3 +80,8 @@ trycmd = "0.15"
 # elided; the dev-dep crates still build, but they're already cached from tessera-io's graph.
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
 tokio = { version = "1", features = ["rt"] }
+
+# Reset the SIGPIPE disposition at startup (main.rs) so `tessera … | head` terminates quietly like a
+# standard Unix tool instead of erroring on the closed pipe. Unix-only; already in the dep tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

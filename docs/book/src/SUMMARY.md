@@ -1,6 +1,8 @@
 # Summary
 
 - [Introduction](./intro.md)
+- [Why Tessera? (vs Parquet, HDF5, Zarr)](./why-tessera.md)
+- [Installing Tessera](./install.md)
 - [Getting started](./getting-started.md)
 
 # The format

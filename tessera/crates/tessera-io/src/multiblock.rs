@@ -19,7 +19,7 @@ use tessera_core::{Error, Result};
 
 use crate::chunk_index::cidx_name;
 use crate::container::Reader;
-use crate::table::{decode, decode_column, ColumnData, TableData};
+use crate::table::{decode_column, decode_rows, ColumnData, TableData};
 
 /// A logical view over the partitioned table named by `prefix`: the ordered concatenation of every
 /// block in [`Reader::block_group`]'s result. Cheap to build (manifest-only; no block bytes read)
@@ -109,8 +109,7 @@ impl LogicalTableView {
     /// For very large columns prefer [`Self::column_blocks`] — it yields one block's worth at a
     /// time so callers can stream the column without materialising it all.
     pub fn column<R: Read + Seek>(&self, reader: &mut Reader<R>, name: &str) -> Result<ColumnData> {
-        let code = self.column_dtype(name)?;
-        let mut out = ColumnData::from_le_bytes(code, &[])?;
+        let mut out = ColumnData::empty_for(self.column_spec(name)?)?;
         for (bname, spec) in self.block_names.iter().zip(&self.specs) {
             let blob = reader.read_block(bname)?;
             let chunk = decode_column(spec, &blob, name)?;
@@ -160,21 +159,34 @@ impl LogicalTableView {
         for &g in global_rows {
             mapping.push(self.locate(g)?);
         }
-        // Decode each touched block exactly once (BTreeMap keeps the keyed cache simple).
-        let mut decoded: BTreeMap<usize, TableData> = BTreeMap::new();
-        for &(b, _) in &mapping {
-            if let std::collections::btree_map::Entry::Vacant(e) = decoded.entry(b) {
-                let blob = reader.read_block(&self.block_names[b])?;
-                e.insert(decode(&self.specs[b], &blob)?);
-            }
+        // Per touched block, decode ONLY the requested rows — Vortex row-index pushdown, so a
+        // scattered take reads just the covering segments instead of materialising whole blocks.
+        // `decode_rows` requires sorted-unique indices and returns them in that order, so the
+        // per-block row list is deduped here and mapped back to caller order below.
+        let mut wanted: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+        for &(b, l) in &mapping {
+            wanted.entry(b).or_default().push(l as u64);
+        }
+        let mut decoded: BTreeMap<usize, (Vec<u64>, TableData)> = BTreeMap::new();
+        for (&b, rows) in wanted.iter_mut() {
+            rows.sort_unstable();
+            rows.dedup();
+            let blob = reader.read_block(&self.block_names[b])?;
+            let sub = decode_rows(&self.specs[b], &blob, rows)?;
+            decoded.insert(b, (std::mem::take(rows), sub));
         }
         // Build output columns in spec order; gather one row at a time in caller order.
         let mut out: TableData = Vec::with_capacity(columns.len());
         for (col_idx, col) in columns.iter().enumerate() {
-            let mut typed = ColumnData::from_le_bytes(&col.dtype, &[])?;
+            let mut typed = ColumnData::empty_for(col)?;
             for &(b, l) in &mapping {
-                let src = decoded.get(&b).ok_or_else(|| {
+                let (rows, src) = decoded.get(&b).ok_or_else(|| {
                     Error::Codec(format!("take: missing decoded cache for block {b}"))
+                })?;
+                // Position of this row within the block's sorted-unique selection. A duplicate
+                // request resolves to the same position, so asking for a row twice is free.
+                let pos = rows.binary_search(&(l as u64)).map_err(|_| {
+                    Error::Codec(format!("take: row {l} missing from block {b}'s selection"))
                 })?;
                 let cell = src
                     .get(col_idx)
@@ -185,7 +197,7 @@ impl LogicalTableView {
                         ))
                     })?
                     .1
-                    .slice(l, l + 1);
+                    .slice(pos, pos + 1);
                 typed.extend(&cell)?;
             }
             out.push((col.name.clone(), typed));
@@ -225,6 +237,22 @@ impl LogicalTableView {
             }
         }
         Ok(out)
+    }
+
+    /// The declaring [`Column`] for `name`, taken from the first block's spec (every block in a
+    /// logical table shares the schema). Needed alongside [`Self::column_dtype`] because a
+    /// cross-block accumulator must match the per-block chunks' *nullability*, not just dtype —
+    /// `extend` rejects a bare column extended by a nullable one.
+    fn column_spec(&self, name: &str) -> Result<&tessera_core::block::table::Column> {
+        self.specs
+            .first()
+            .and_then(|s| s.columns.iter().find(|c| c.name == name))
+            .ok_or_else(|| {
+                Error::Codec(format!(
+                    "logical_table('{}'): no column '{name}'",
+                    self.prefix
+                ))
+            })
     }
 
     fn column_dtype(&self, name: &str) -> Result<&str> {
@@ -398,6 +426,7 @@ mod tests {
             name: name.into(),
             dtype: dtype.into(),
             codec: None,
+            ..Default::default()
         }
     }
 
