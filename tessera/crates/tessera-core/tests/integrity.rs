@@ -21,6 +21,7 @@ fn sample_product() -> Manifest {
             name: "lt".into(),
             dtype: "f4".into(),
             codec: Some("zstd".into()),
+            ..Default::default()
         }],
         rows: 2_696_935,
         row_index: Some("ms".into()),
@@ -123,6 +124,7 @@ fn tamper_one_block_changes_content_hash() {
                 name: "lt".into(),
                 dtype: "f4".into(),
                 codec: Some("zstd".into()),
+                ..Default::default()
             }],
             rows: 2_696_935,
             row_index: Some("ms".into()),
@@ -143,6 +145,7 @@ fn block_reorder_changes_content_hash() {
                 name: "lt".into(),
                 dtype: "f4".into(),
                 codec: None,
+                ..Default::default()
             }],
             rows: 1,
             row_index: None,
@@ -157,6 +160,59 @@ fn block_reorder_changes_content_hash() {
     assert_ne!(
         a.seal().unwrap().content_hash,
         b.seal().unwrap().content_hash
+    );
+}
+
+// ---- metadata tamper / seal-vs-fingerprint -----------------------------------------------
+
+#[test]
+fn tamper_metadata_scalar_fails_verify() {
+    // The everyday "someone edited a field" attack. Seal a product carrying a metadata scalar,
+    // then flip it in the sealed manifest. id_inputs + blocks are untouched, so id and content_hash
+    // still recompute — verify() trips specifically on manifest_hash (metadata is under the seal).
+    let mut b = ProductBuilder::new("recon", "DP06", "d", "2023-12-08T00:00:00Z");
+    b.add_block(&ArrayBlock::new(
+        "volume",
+        ArraySpec::new(vec![8, 8, 8], "int16"),
+    ))
+    .unwrap();
+    b.with_field("patient_id", serde_json::json!("ANON9297"));
+    let mut m = b.seal().unwrap();
+    m.verify().expect("a freshly sealed product verifies");
+
+    m.metadata
+        .insert("patient_id".into(), serde_json::json!("EVIL"));
+    match m.verify() {
+        Err(tessera_core::Error::Integrity { what, .. }) => assert_eq!(what, "manifest_hash"),
+        other => panic!("expected a manifest_hash integrity error, got {other:?}"),
+    }
+}
+
+#[test]
+fn metadata_edit_moves_manifest_hash_not_content_hash() {
+    // Two products, identical blocks + id_inputs, one metadata field differs: the seal
+    // (manifest_hash) moves, the data fingerprint (content_hash) does NOT. Metadata is committed
+    // by the seal but is not part of the Merkle root over block digests — the two-hash separation.
+    fn sealed_with(modality: &str) -> Manifest {
+        let mut b = ProductBuilder::new("recon", "DP06", "d", "2023-12-08T00:00:00Z");
+        b.add_block(&ArrayBlock::new(
+            "volume",
+            ArraySpec::new(vec![8, 8, 8], "int16"),
+        ))
+        .unwrap();
+        b.with_field("modality", serde_json::json!(modality));
+        b.seal().unwrap()
+    }
+    let ct = sealed_with("CT");
+    let pt = sealed_with("PT");
+    assert_eq!(ct.id, pt.id, "id_inputs are unchanged");
+    assert_eq!(
+        ct.content_hash, pt.content_hash,
+        "a metadata edit must NOT move the data fingerprint (content_hash)"
+    );
+    assert_ne!(
+        ct.manifest_hash, pt.manifest_hash,
+        "a metadata edit MUST move the seal (manifest_hash)"
     );
 }
 
@@ -214,7 +270,7 @@ proptest! {
             .map(|(i, _)| ArrayBlock::new(format!("a{i}"), ArraySpec::new(vec![2, 2, 2], "int16"))).collect();
         let tables: Vec<_> = kinds.iter().enumerate().filter(|(_, k)| !**k)
             .map(|(i, _)| TableBlock::new(format!("t{i}"),
-                TableSpec { columns: vec![Column { name: "c".into(), dtype: "f4".into(), codec: None }], rows: i as u64, row_index: None })).collect();
+                TableSpec { columns: vec![Column { name: "c".into(), dtype: "f4".into(), codec: None, ..Default::default() }], rows: i as u64, row_index: None })).collect();
         for a in &arrays { b.add_block(a).unwrap(); }
         for t in &tables { b.add_block(t).unwrap(); }
         let m = b.seal().unwrap();

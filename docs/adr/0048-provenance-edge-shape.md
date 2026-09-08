@@ -4,6 +4,14 @@
 **ADR-0042** (self-contained `aux/` members, outside the seal), **ADR-0034/S15** (writer-determinism),
 and the FAIR-export half of #267 already shipped (#275: opaque `urn:tessera:source:<merkle>` entities).
 
+**Relationship:** orthogonal to **ADR-0058** (generation provenance + schema-driven identity
+inheritance). ADR-0058 adds sealed `producer` / `generation` and a per-field `inherit` axis on
+`FieldSpec` — *what identity a product carries* and *how it was made*. This ADR governs the **shape of
+the `Source` edge itself** — *how a product references its parents* (single merkle-rooted reference vs
+a path list in the seal). The two decisions do not overlap and neither overrides the other: ADR-0058
+does not touch `Source.reference` / `Source.content_hash`, and this ADR does not touch `Producer` /
+`Generation` / inherited-metadata bytes.
+
 ## Context — what "provenance-as-list" was supposed to fix, and the trap in the obvious fix
 
 A multi-file provenance edge (a DICOM series' `ingested_from`) records its sources as a **comma-joined

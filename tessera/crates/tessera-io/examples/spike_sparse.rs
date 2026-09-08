@@ -107,6 +107,7 @@ fn col(name: &str, dt: &str) -> Column {
         name: name.into(),
         dtype: dt.into(),
         codec: None,
+        ..Default::default()
     }
 }
 

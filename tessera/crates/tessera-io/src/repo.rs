@@ -438,6 +438,7 @@ mod tests {
                 name: "x".into(),
                 dtype: "u4".into(),
                 codec: None,
+                ..Default::default()
             }],
             rows: 3,
             row_index: None,

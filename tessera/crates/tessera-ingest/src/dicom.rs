@@ -68,6 +68,33 @@ pub struct DicomImage {
     /// destined for `manifest.extra["dicom_header"]`. Deterministic ordering — the underlying
     /// map is a [`BTreeMap`] keyed by `"GGGG,EEEE"` uppercase hex, so re-ingest is byte-identical.
     pub header_json: serde_json::Value,
+    /// `Some` when a per-slice-rescaled series was collapsed to one global int16 scale
+    /// ([`RescaleMode::GlobalInt16`], #300) — carries the original per-slice slopes + worst-case
+    /// error so the lossy transform is auditable. `None` for single images and uniform series.
+    pub rescale_provenance: Option<GlobalRescaleProvenance>,
+}
+
+/// How a series whose slices carry DIFFERENT `RescaleSlope`s is encoded (#300). GE PET stores a
+/// per-slice slope (Bq·mL⁻¹); `BitExact` (default) rejects such a series (its stored int16 samples
+/// can't be stacked losslessly under one slope); `GlobalInt16` requantizes every slice to ONE global
+/// int16 scale — physically lossless (error ≪ measurement resolution) and 64³-clean, with the
+/// per-slice slopes preserved in metadata for auditability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RescaleMode {
+    #[default]
+    BitExact,
+    GlobalInt16,
+}
+
+/// Provenance of a [`RescaleMode::GlobalInt16`] requantization (#300) — recorded on the product so
+/// the lossy transform is auditable and (given the preserved raw DICOM) invertible.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalRescaleProvenance {
+    /// The original per-slice `RescaleSlope`s, in stacked (InstanceNumber) order.
+    pub per_slice_slopes: Vec<f64>,
+    /// Worst-case absolute error introduced by the global quantization (physical units).
+    pub max_abs_err: f64,
 }
 
 /// Curated DICOM tags carried into the `recon` schema (ADR-0040 §1 / PS3.15 seeding). Every
@@ -113,6 +140,18 @@ pub fn read_image_deidentified(path: &std::path::Path) -> Result<DicomImage> {
 
 /// Decode an already-parsed DICOM object (testable without touching the filesystem).
 pub fn read_object(obj: &FileDicomObject<InMemDicomObject>) -> Result<DicomImage> {
+    // #301: not every DICOM object is an image. Raw sinogram/projection objects (e.g. GE
+    // `GEMS_PET_RAW`), structured reports, and exam reports carry no pixel grid. Detect that up
+    // front and point the operator at the blob (cold/archival) tier, instead of failing deep in the
+    // decoder with a cryptic "No such data element with tag (0028,0010)".
+    if obj.element(ROWS).is_err() || obj.element(PIXEL_DATA).is_err() {
+        return Err(Error::Invalid(
+            "dicom: non-image DICOM object (no Rows/PixelData — e.g. a raw sinogram/projection, \
+             structured report, or exam report). Preserve it bit-faithfully with \
+             `tessera ingest blob` (the cold/archival tier), not the recon path (#301)."
+                .into(),
+        ));
+    }
     let modality = obj
         .element(MODALITY)
         .map_err(de)?
@@ -162,6 +201,7 @@ pub fn read_object(obj: &FileDicomObject<InMemDicomObject>) -> Result<DicomImage
         rescale_intercept,
         curated,
         header_json,
+        rescale_provenance: None,
     })
 }
 
@@ -297,21 +337,36 @@ fn nested_object_to_json(item: &InMemDicomObject) -> serde_json::Value {
 /// InstanceNumber (geometric ImagePositionPatient ordering is a later refinement). Every slice must
 /// share rows/cols/modality/rescale, else the series is rejected as non-uniform.
 pub fn read_series(paths: &[std::path::PathBuf]) -> Result<DicomImage> {
-    read_series_inner(paths, false)
+    read_series_inner(paths, false, RescaleMode::BitExact)
 }
 
 /// Same as [`read_series`] but applies PS3.15 de-identification ([`deidentify`]) to **every** slice
 /// in memory before decoding — the per-slice analogue of [`read_image_deidentified`]. PHI never
 /// reaches the stacked volume.
 pub fn read_series_deidentified(paths: &[std::path::PathBuf]) -> Result<DicomImage> {
-    read_series_inner(paths, true)
+    read_series_inner(paths, true, RescaleMode::BitExact)
+}
+
+/// [`read_series`] with an explicit [`RescaleMode`] (#300) — `GlobalInt16` collapses a per-slice-
+/// rescaled series (e.g. GE quantitative PET) to one global int16 scale instead of rejecting it.
+/// `strip_phi` mirrors the de-identified variant.
+pub fn read_series_rescaled(
+    paths: &[std::path::PathBuf],
+    strip_phi: bool,
+    mode: RescaleMode,
+) -> Result<DicomImage> {
+    read_series_inner(paths, strip_phi, mode)
 }
 
 /// Shared series body for [`read_series`] / [`read_series_deidentified`] — opening each slice, then
 /// optionally stripping PHI via [`deidentify`] before [`read_object`] decodes the pixels, then
 /// stacking by `InstanceNumber`. The PHI is gone before the pixels are even decoded; non-uniform
 /// shape/modality/rescale across slices is rejected as in the non-de-id path.
-fn read_series_inner(paths: &[std::path::PathBuf], strip_phi: bool) -> Result<DicomImage> {
+fn read_series_inner(
+    paths: &[std::path::PathBuf],
+    strip_phi: bool,
+    mode: RescaleMode,
+) -> Result<DicomImage> {
     if paths.is_empty() {
         return Err(Error::Invalid("dicom: empty series".into()));
     }
@@ -331,35 +386,94 @@ fn read_series_inner(paths: &[std::path::PathBuf], strip_phi: bool) -> Result<Di
     slices.sort_by_key(|(k, _)| *k);
 
     let first = slices[0].1.clone();
+    // Shape / modality / intercept must be uniform in every mode — only the per-slice `RescaleSlope`
+    // is what `GlobalInt16` is allowed to reconcile.
     for (_, s) in &slices {
         if s.shape != first.shape
             || s.modality != first.modality
-            || s.rescale_slope != first.rescale_slope
             || s.rescale_intercept != first.rescale_intercept
         {
             return Err(Error::Invalid(
-                "dicom: non-uniform series (shape/modality/rescale differ between slices)".into(),
+                "dicom: non-uniform series (shape/modality/intercept differ between slices)".into(),
             ));
         }
-    }
-    let mut voxels = Vec::with_capacity(slices.len() * first.voxels.len());
-    for (_, s) in &slices {
-        voxels.extend_from_slice(&s.voxels);
     }
     let z = u64::try_from(slices.len())
         .map_err(|e| Error::Invalid(format!("dicom: series slice count overflow: {e}")))?;
     // Curated tags + header live on the representative (first-by-InstanceNumber) slice — the
     // series is uniform for study/series-level tags, and the per-slice diff (InstanceNumber,
     // ImagePositionPatient, …) matters far less than the study/series/manufacturer context.
-    Ok(DicomImage {
-        shape: vec![z, first.shape[0], first.shape[1]],
-        voxels,
-        modality: first.modality,
-        rescale_slope: first.rescale_slope,
-        rescale_intercept: first.rescale_intercept,
-        curated: first.curated,
-        header_json: first.header_json,
-    })
+    let slopes_uniform = slices
+        .iter()
+        .all(|(_, s)| s.rescale_slope == first.rescale_slope);
+
+    if slopes_uniform {
+        // Uniform slope → stack the stored int16 samples verbatim (bit-exact), one scalar slope.
+        let mut voxels = Vec::with_capacity(slices.len() * first.voxels.len());
+        for (_, s) in &slices {
+            voxels.extend_from_slice(&s.voxels);
+        }
+        return Ok(DicomImage {
+            shape: vec![z, first.shape[0], first.shape[1]],
+            voxels,
+            modality: first.modality,
+            rescale_slope: first.rescale_slope,
+            rescale_intercept: first.rescale_intercept,
+            curated: first.curated,
+            header_json: first.header_json,
+            rescale_provenance: None,
+        });
+    }
+
+    // Slopes differ across slices (e.g. GE quantitative PET stores a per-slice Bq·mL⁻¹ scale).
+    match mode {
+        RescaleMode::BitExact => Err(Error::Invalid(
+            "dicom: non-uniform series (per-slice RescaleSlope differs) — pass \
+             --rescale-mode global-int16 to requantize to a single int16 scale (#300)"
+                .into(),
+        )),
+        RescaleMode::GlobalInt16 => {
+            // Physical field = stored × per-slice slope (+ uniform intercept). Requantize the whole
+            // 3-D field to ONE global int16 scale sized by its max magnitude — physically lossless
+            // (error ≪ measurement resolution), 64³-clean, single scalar slope. The original
+            // per-slice slopes + worst-case error are recorded for auditability.
+            let gmax = slices
+                .iter()
+                .flat_map(|(_, s)| s.voxels.iter().map(|&v| (v as f64 * s.rescale_slope).abs()))
+                .fold(0.0f64, f64::max);
+            let global_slope = if gmax == 0.0 {
+                1.0
+            } else {
+                gmax / i16::MAX as f64
+            };
+            let per_slice_slopes: Vec<f64> = slices.iter().map(|(_, s)| s.rescale_slope).collect();
+            let mut voxels = Vec::with_capacity(slices.len() * first.voxels.len());
+            let mut max_abs_err = 0.0f64;
+            for (_, s) in &slices {
+                for &v in &s.voxels {
+                    let real = v as f64 * s.rescale_slope;
+                    let q = (real / global_slope)
+                        .round()
+                        .clamp(i16::MIN as f64, i16::MAX as f64);
+                    max_abs_err = max_abs_err.max((q * global_slope - real).abs());
+                    voxels.push(q as i16);
+                }
+            }
+            Ok(DicomImage {
+                shape: vec![z, first.shape[0], first.shape[1]],
+                voxels,
+                modality: first.modality,
+                rescale_slope: global_slope,
+                rescale_intercept: first.rescale_intercept,
+                curated: first.curated,
+                header_json: first.header_json,
+                rescale_provenance: Some(GlobalRescaleProvenance {
+                    per_slice_slopes,
+                    max_abs_err,
+                }),
+            })
+        }
+    }
 }
 
 /// PS3.15 Basic Application Level Confidentiality — the core direct-identifier (PHI) tags Tessera
@@ -442,6 +556,31 @@ pub fn to_recon_product(
         serde_json::json!({"_vocabulary": "DICOM", "_code": img.modality}),
     );
 
+    // #300: a per-slice-rescaled series collapsed to one global int16 scale is a LOSSY transform —
+    // record its parameters (mode + original per-slice slopes + worst-case error) so a consumer can
+    // tell it happened, invert it against the raw DICOM, and requantify. Emit a matching WARN.
+    if let Some(rp) = &img.rescale_provenance {
+        let unit = unit_for(&img.modality).unwrap_or("units");
+        tracing::warn!(
+            target: "tessera::ingest",
+            member = %name,
+            product = "recon",
+            n_slopes = rp.per_slice_slopes.len(),
+            "lossy rescale: {} per-slice RescaleSlopes collapsed to one global int16 scale \
+             (slope={:.6}, max abs err ±{:.4} {unit}). Per-slice slopes preserved in metadata; \
+             raw DICOM recoverable from the source (#300).",
+            rp.per_slice_slopes.len(),
+            img.rescale_slope,
+            rp.max_abs_err,
+        );
+        b.with_field("rescale_mode", serde_json::json!("global-int16"));
+        b.with_field(
+            "rescale_slope_per_slice",
+            serde_json::json!(rp.per_slice_slopes),
+        );
+        b.with_field("rescale_max_abs_err", serde_json::json!(rp.max_abs_err));
+    }
+
     // Curated DICOM tags → `recon` schema fields (each is `recommended`, so absence is fine).
     let c = &img.curated;
     if let Some(v) = &c.study_instance_uid {
@@ -504,6 +643,7 @@ mod tests {
             rescale_intercept: -1024.0,
             curated: DicomCuratedTags::default(),
             header_json: serde_json::Value::Null,
+            rescale_provenance: None,
         }
     }
 
@@ -538,6 +678,31 @@ mod tests {
     }
 
     /// Synthesize a minimal uncompressed CT DICOM, write it, read it back, ingest — fully hermetic.
+    #[test]
+    fn non_image_dicom_object_gives_actionable_blob_guidance() {
+        // A DICOM object with no pixel grid (raw sinogram / SR / report — e.g. GE `GEMS_PET_RAW`).
+        let obj = InMemDicomObject::from_element_iter([
+            DataElement::new(MODALITY, VR::CS, PrimitiveValue::from("PT")),
+            // deliberately NO Rows / Columns / PixelData.
+        ]);
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2")
+            .media_storage_sop_instance_uid("1.2.3.4.5.6.7.8.9.1")
+            .implementation_class_uid("1.2.826.0.1.3680043.tessera")
+            .build()
+            .unwrap();
+        let file_obj = obj.with_exact_meta(meta);
+
+        let err = read_object(&file_obj).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("non-image DICOM"), "not actionable: {msg}");
+        assert!(
+            msg.contains("tessera ingest blob"),
+            "no blob-tier guidance: {msg}"
+        );
+    }
+
     #[test]
     fn roundtrip_synthetic_dicom_file() {
         let (rows, cols) = (8u16, 8u16);
@@ -780,6 +945,91 @@ mod tests {
             .build()
             .unwrap();
         obj.with_exact_meta(meta).write_to_file(path).unwrap();
+    }
+
+    /// Like [`write_slice`] but with a caller-set `RescaleSlope` — used to synthesize the GE
+    /// quantitative-PET per-slice-rescale pattern (#300): uniform shape/modality/intercept, differing
+    /// slopes. Signed pixels (PixelRepresentation = 1), 8×8, intercept 0.
+    fn write_slice_slope(path: &std::path::Path, instance: i32, base: u16, slope: &str) {
+        let pixels: Vec<u16> = (0..64).map(|k| base + k as u16).collect();
+        let obj = InMemDicomObject::from_element_iter([
+            DataElement::new(MODALITY, VR::CS, PrimitiveValue::from("CT")),
+            DataElement::new(ROWS, VR::US, PrimitiveValue::from(8u16)),
+            DataElement::new(COLUMNS, VR::US, PrimitiveValue::from(8u16)),
+            DataElement::new(
+                INSTANCE_NUMBER,
+                VR::IS,
+                PrimitiveValue::from(instance.to_string()),
+            ),
+            DataElement::new(Tag(0x0028, 0x0002), VR::US, PrimitiveValue::from(1u16)),
+            DataElement::new(
+                Tag(0x0028, 0x0004),
+                VR::CS,
+                PrimitiveValue::from("MONOCHROME2"),
+            ),
+            DataElement::new(Tag(0x0028, 0x0100), VR::US, PrimitiveValue::from(16u16)),
+            DataElement::new(Tag(0x0028, 0x0101), VR::US, PrimitiveValue::from(16u16)),
+            DataElement::new(Tag(0x0028, 0x0102), VR::US, PrimitiveValue::from(15u16)),
+            DataElement::new(Tag(0x0028, 0x0103), VR::US, PrimitiveValue::from(1u16)),
+            DataElement::new(RESCALE_INTERCEPT, VR::DS, PrimitiveValue::from("0")),
+            DataElement::new(RESCALE_SLOPE, VR::DS, PrimitiveValue::from(slope)),
+            DataElement::new(
+                Tag(0x7FE0, 0x0010),
+                VR::OW,
+                PrimitiveValue::U16(pixels.into()),
+            ),
+        ]);
+        let meta = FileMetaTableBuilder::new()
+            .transfer_syntax("1.2.840.10008.1.2.1")
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2")
+            .media_storage_sop_instance_uid(format!("1.2.3.{instance}"))
+            .implementation_class_uid("1.2.826.0.1.3680043.tessera")
+            .build()
+            .unwrap();
+        obj.with_exact_meta(meta).write_to_file(path).unwrap();
+    }
+
+    #[test]
+    fn per_slice_rescale_rejected_bit_exact_then_requantized_global_int16() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.dcm");
+        let p2 = dir.path().join("b.dcm");
+        // Uniform shape/modality/intercept, DIFFERENT rescale slopes (the GE PET pattern).
+        write_slice_slope(&p1, 1, 100, "1.0");
+        write_slice_slope(&p2, 2, 100, "10.0");
+
+        // BitExact (default) rejects with an actionable message.
+        let err = read_series(&[p1.clone(), p2.clone()]).unwrap_err();
+        assert!(
+            format!("{err}").contains("per-slice RescaleSlope"),
+            "unexpected: {err}"
+        );
+
+        // GlobalInt16 requantizes to one scale + records provenance.
+        let vol = read_series_rescaled(&[p1, p2], false, RescaleMode::GlobalInt16).unwrap();
+        assert_eq!(vol.shape, vec![2, 8, 8]);
+        let rp = vol.rescale_provenance.clone().expect("provenance recorded");
+        assert_eq!(rp.per_slice_slopes, vec![1.0, 10.0]);
+        // Physically lossless: worst-case error ≤ one global step, and a slice-1 voxel reconstructs.
+        let step = vol.rescale_slope;
+        assert!(
+            rp.max_abs_err <= step,
+            "err {} > step {}",
+            rp.max_abs_err,
+            step
+        );
+        let phys0 = vol.voxels[0] as f64 * vol.rescale_slope; // slice-1 stored×1 = 100
+        assert!((phys0 - 100.0).abs() <= step, "phys0={phys0}");
+
+        // The lossy transform is self-documented in the sealed manifest.
+        let (sealed, _payloads) =
+            to_recon_product(&vol, "PET", "2024-01-01T00:00:00Z", "src", None, &[]).unwrap();
+        assert_eq!(sealed.metadata["rescale_mode"], "global-int16");
+        assert_eq!(
+            sealed.metadata["rescale_slope_per_slice"],
+            serde_json::json!([1.0, 10.0])
+        );
+        assert!(sealed.metadata.contains_key("rescale_max_abs_err"));
     }
 
     #[test]
