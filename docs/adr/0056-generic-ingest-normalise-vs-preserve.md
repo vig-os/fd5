@@ -472,12 +472,56 @@ objection directly**, and the lens converged. Its position is preserved because 
 the reason the decoder record is *sealed* rather than filed in `aux/` is its argument, and the reason
 it is not a *bespoke field* is the parsimony argument that beat it in pass two.
 
-The remaining residual, stated by every lens and answered by none: `Generation.config` is a
-non-opinionated bag, so no format-level schema forces `ingest_decoder` to be present, well-named or
-well-formed. A 2050 implementation gets a stable name to reach for and no guarantee anyone used it.
-The alternative — a declared field — imposes a Rust-toolchain-shaped obligation on producers who cannot
-honestly compute it. Well-known-key-in-an-opaque-bag is how ungoverned surface accretes, and holding
-the "documented, not mandatory" line is a review discipline this ADR asserts rather than enforces.
+### Closing the bag residual — describe the key, require the key, recommend the triple
+
+Every lens named the same residual and treated it as the price of R1: `Generation.config` is a
+non-opinionated bag, so nothing forces `ingest_decoder` to be present, well-named or well-formed, and a
+2050 reader gets a stable name to reach for with no assurance anyone used it. That statement conflates
+two gaps with different answers, and both are closable inside the mechanisms this project already has.
+
+**Gap A — discoverability: what does this key mean?** The panel reasoned as though the bag were
+schema-less. It need not be. `seal()` **embeds the resolved product schema into the manifest**
+(`product.rs:136-140`) precisely so a `.tsra` carries its own contract. If the builtin `table` / `array`
+schemas *describe* the recipe key — stable id, human-readable description, dtype — then the artifact
+explains `ingest_decoder` to a reader holding nothing but the file, with no external ADR and no registry
+lookup. This requires `ProductSchema` to describe **generation keys** as well as metadata fields, which
+is an addition to **schema data**, not to the manifest: exactly where this project already puts policy.
+
+**Gap B — presence: did anyone write it?** The parsimony objection that ruled out a mandatory field was
+to requiring a value non-Rust producers **cannot compute** — not to requiring the key. "Name the decoder
+you used" is universally computable: a pyarrow writer records `"pyarrow 15.0.0"`, a Julia writer its
+own. Only the resolved-feature digest is Rust-shaped. So:
+
+> **Require the key. Recommend the triple.**
+
+A product claiming the builtin `table` / `array` schema must carry an `ingest_decoder` recipe key; the
+full triple is the *recommended* form that Tessera's own ingest always writes, and a foreign producer
+satisfies the requirement with whatever honestly identifies its decoder. Convention becomes guarantee
+for the population that can satisfy it, and nobody is conscripted into Rust terms.
+
+**The enforcement mechanism already exists**, one notch coarser. `ProductSchema.requires_generation` is
+a schema-declared flag checked in `validate()`, with the rule stated as *"the policy lives in the
+schema, not the engine (a domain opts in per product kind)"*. Required **recipe keys** are that same
+pattern applied one level finer — same validation path, same severity ladder as
+`FieldSpec::required` / `recommended`, and still no domain knowledge in the engine.
+
+Three properties keep this from re-becoming the bespoke field parsimony rejected:
+
+- It binds only products that **claim a builtin schema**. Open-world products embed no schema and stay
+  unconstrained — the permissive escape hatch is untouched.
+- The obligation is a key with a description, not a toolchain-derived string.
+- It lives in versioned schema data, so it can evolve without a format revision.
+
+**Operator backstop.** For archives that want it hard at their own boundary rather than asking the
+format to enforce it universally, a `verify --require-recipe` gate in the same idiom as §7's
+`--require-classified` and ADR-0037's `--require-signer`.
+
+**What remains genuinely open**, stated without varnish: a producer can always declare an open-world
+product and carry no schema at all, and no format can guarantee anything about producers who decline its
+schemas. This also cannot reach artifacts sealed before it lands. The residual therefore shrinks from
+*"a stable name and no assurance anyone used it"* to *"guaranteed and self-describing for anything
+claiming the `table`/`array` schema; deliberately unconstrained outside it"* — which is as far as a
+format can honestly go.
 
 ## §7 — Schema, sensitivity, and the laundering rule
 
@@ -811,11 +855,14 @@ dependencies is out of scope here but is the larger prize, and is named for a fu
   yanked crate, or a crates.io outliving its usefulness, turns the record into a dangling reference.
   Binding each `=` pin to a content-addressed source digest lodged in a WORM archive is out of scope
   here and tracked separately.
-- **The recipe bag is non-opinionated, so `ingest_decoder` is a convention, not a guarantee.** No
-  format-level schema forces the key to be present, well-named or well-formed, and an independent 2050
-  implementation gets a stable name to reach for and no assurance anyone used it. This is the accepted
-  cost of not imposing a Rust-toolchain-shaped obligation on producers who cannot compute it; whether
-  well-known recipe keys eventually deserve a registry is left open.
+- **Schema-declared recipe keys are specified but not built.** §6a's remedy for the bag residual —
+  describe `ingest_decoder` in the builtin `table`/`array` schemas and require the key while
+  recommending the triple — needs `ProductSchema` to describe generation keys, and needs
+  `requires_generation`'s validation path extended to per-key requirements. Tracked separately, and
+  gated on the same provenance model as the rest of this axis.
+- **Nothing binds producers who decline the builtin schemas.** An open-world product embeds no schema
+  and carries no recipe obligation, by design. That is the permissive escape hatch working, not a
+  defect, but it means the guarantee is scoped to schema-claiming products and always will be.
 - **`tessera-ingest`'s own canonicalisation code is attributed by nothing**, and only partially by
   `ingest_transform`. §6a's home makes the fix cheap and symmetric — a companion recipe key holding a
   build-time digest of the canonicalisation tree — but it is not decided here, and until it is, the
