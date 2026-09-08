@@ -361,6 +361,20 @@ fn dispatch(
             )?;
             Ok((m, ()))
         }
+        FormatOptions::BlobSeries { inputs, media_type } => {
+            // Block-per-file preservation → one `.tsra`, no tar (#301/#329). In-memory seal (each file
+            // read whole in turn); DICOM-series-scale slices fit comfortably.
+            let (m, payloads) = crate::blob::to_blob_multi_product(
+                inputs,
+                name,
+                &timestamp,
+                media_type.as_deref(),
+                label,
+                extra_sources,
+            )?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
+            Ok((m, ()))
+        }
         FormatOptions::Dicom { input, deidentify } => {
             let img = if *deidentify {
                 crate::dicom::read_image_deidentified(input)?
