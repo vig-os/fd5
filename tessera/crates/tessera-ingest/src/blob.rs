@@ -20,6 +20,20 @@ use tessera_io::BlockPayload;
 /// **Memory:** reads the whole file into RAM (peak RSS ≈ file size). The in-memory convenience for when
 /// you already hold/produce the bytes; for a large file on disk prefer [`to_blob_product_streaming`]
 /// (what the ingest engine uses) — bounded memory, byte-identical sealed result.
+/// The `filename` recorded in a blob's [`tessera_io::blob::BlobSpec`]: the `source_label` when given
+/// (PHI hygiene — #269; directory separators collapsed so it stays a single valid filename for
+/// `extract`), else the input path's own filename (legacy behavior; missing → `"blob"`).
+fn blob_filename(path: &Path, source_label: Option<&str>) -> String {
+    match source_label {
+        Some(label) => label.replace(['/', '\\'], "_"),
+        None => path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("blob")
+            .to_string(),
+    }
+}
+
 pub fn to_blob_product(
     path: &Path,
     name: &str,
@@ -29,8 +43,12 @@ pub fn to_blob_product(
     extra_sources: &[tessera_core::provenance::Source],
 ) -> Result<(Manifest, Vec<BlockPayload>)> {
     let bytes = std::fs::read(path).map_err(Error::from)?;
-    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
-    let (block_ref, payload) = blob_block("data", filename, media_type, bytes)?;
+    // PHI hygiene (#269): when a `source_label` is given, it also becomes the blob's stored
+    // `filename` — a vendor filename (`PATIENT_SMITH.l64`) is itself PHI and would otherwise ride in
+    // the sealed `BlobSpec.filename`, a side-channel the redacted `ingested_from` reference wouldn't
+    // catch. Without a label, the real filename is kept (the legacy behavior, needed by `extract`).
+    let filename = blob_filename(path, source_label);
+    let (block_ref, payload) = blob_block("data", &filename, media_type, bytes)?;
     // The blob block's digest already IS blake3(file bytes) — reuse it as the source-of-record hash
     // on the `ingested_from` edge (no second read of a possibly-multi-GB file).
     let src_digest = block_ref.digest.clone();
@@ -50,6 +68,53 @@ pub fn to_blob_product(
     Ok((sealed, vec![payload]))
 }
 
+/// Seal MANY files as ONE `blob` product with a **`Blob` block per file** — the block-per-file "junk"
+/// tier for a multi-file vendor series (e.g. a DICOM series' slices). Each file is preserved
+/// bit-faithfully inside a single `.tsra` container (**no intermediate tar** — the `.tsra` is already a
+/// STORED-zip archive), independently `read`/`extract`-able, and range-readable (O(1) seek regardless of
+/// block count; the only cost is a larger manifest, linear in file count). Block names are `file_NNNN`
+/// in input order; each block's descriptor keeps the source basename (`tessera ls` shows them).
+///
+/// `source_label` overrides the recorded `ingested_from` reference (PHI hygiene). Memory: reads each
+/// file whole in turn (peak RSS ≈ largest single file), so it fits multi-file series of MB-scale slices.
+pub fn to_blob_multi_product(
+    paths: &[std::path::PathBuf],
+    name: &str,
+    timestamp: &str,
+    media_type: Option<&str>,
+    source_label: Option<&str>,
+    extra_sources: &[tessera_core::provenance::Source],
+) -> Result<(Manifest, Vec<BlockPayload>)> {
+    if paths.is_empty() {
+        return Err(Error::Invalid("blob-multi: no input files".into()));
+    }
+    let mut b = ProductBuilder::new(
+        "blob",
+        name,
+        "opaque preserved files (one block per file)",
+        timestamp,
+    );
+    let mut payloads = Vec::with_capacity(paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        let bytes = std::fs::read(p).map_err(Error::from)?;
+        let filename = p.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
+        let block_name = format!("file_{i:04}");
+        let (block_ref, payload) = blob_block(&block_name, filename, media_type, bytes)?;
+        b.add_block_ref(block_ref);
+        payloads.push(payload);
+    }
+    let source_ref = source_label
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{} files", paths.len()));
+    let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    b.add_source(crate::provenance::ingested_from(&path_refs, source_ref)?);
+    for s in extra_sources {
+        b.add_source(s.clone());
+    }
+    let sealed = b.seal()?;
+    Ok((sealed, payloads))
+}
+
 /// Like [`to_blob_product`] but **bounded-memory**: streams the file through blake3 (no whole-file
 /// `Vec`) and returns only the sealed manifest — the caller seals it with [`tessera_io::pack_streaming`]
 /// handing the **same `path`** as the `data` block's fragment, so a multi-GB file never enters RAM. The
@@ -64,8 +129,8 @@ pub fn to_blob_product_streaming(
     source_label: Option<&str>,
     extra_sources: &[tessera_core::provenance::Source],
 ) -> Result<Manifest> {
-    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("blob");
-    let block_ref = tessera_io::blob::blob_ref_streaming("data", filename, media_type, path)?;
+    let filename = blob_filename(path, source_label);
+    let block_ref = tessera_io::blob::blob_ref_streaming("data", &filename, media_type, path)?;
     // The streamed block digest already IS blake3(file bytes) — reuse it, no second pass.
     let src_digest = block_ref.digest.clone();
     let mut b = ProductBuilder::new("blob", name, "opaque preserved file", timestamp);
@@ -117,6 +182,41 @@ mod tests {
             .any(|s| s.reference.contains("testscan.l64")));
     }
 
+    #[test]
+    fn seals_many_files_as_one_blob_product_block_per_file() {
+        // Block-per-file preservation (no tar): N files → one `.tsra`, a Blob block per file,
+        // each bit-faithful.
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        let mut all_bytes = Vec::new();
+        for i in 0..3u32 {
+            let p = dir.path().join(format!("slice_{i}.img"));
+            let bytes: Vec<u8> = (0..1000u32).map(|k| ((k + i * 7) % 256) as u8).collect();
+            std::fs::write(&p, &bytes).unwrap();
+            paths.push(p);
+            all_bytes.push(bytes);
+        }
+        let (m, payloads) = to_blob_multi_product(
+            &paths,
+            "DP01-series",
+            "2024-01-01T00:00:00Z",
+            Some("application/dicom"),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(m.product, "blob");
+        assert_eq!(m.blocks.len(), 3, "one Blob block per file");
+        for (i, blk) in m.blocks.iter().enumerate() {
+            assert_eq!(blk.name, format!("file_{i:04}"));
+            assert_eq!(
+                blk.digest.as_deref(),
+                Some(tessera_core::hash::digest(&all_bytes[i]).as_str())
+            );
+            assert_eq!(payloads[i].bytes, all_bytes[i], "block {i} bit-faithful");
+        }
+    }
+
     /// ADR-0040: when `source_label` is given, the recorded `ingested_from` reference is the LABEL,
     /// not the (potentially PHI-bearing) path. Proves the seam reaches the manifest on BOTH
     /// constructors (the streaming variant is what the engine drives).
@@ -162,6 +262,18 @@ mod tests {
                 .map(|s| s.reference.as_str()),
             Some("DUPLET-07/raw"),
         );
+
+        // #269: the label ALSO redacts the sealed `BlobSpec.filename` — the vendor filename
+        // (`scan.l64`) is itself PHI and must not survive as a side-channel. Directory separators in
+        // the label are collapsed so it stays a valid single filename for `extract`.
+        for man in [&m, &m2] {
+            let spec = tessera_io::blob::spec_of(&man.blocks[0]).unwrap();
+            assert_eq!(spec.filename, "DUPLET-07_raw");
+            assert!(
+                !spec.filename.contains("scan.l64"),
+                "PHI-bearing filename leaked into the sealed BlobSpec"
+            );
+        }
     }
 
     #[test]
