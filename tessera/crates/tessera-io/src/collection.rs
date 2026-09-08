@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use tessera_core::collection::{Collection, Role};
+use tessera_core::collection::{Collection, MemberKind, Role};
 use tessera_core::export::{dataset_entity, ro_crate_descriptor};
 use tessera_core::manifest::Manifest;
 use tessera_core::{Error, Result};
@@ -101,6 +101,15 @@ pub fn to_rocrate(c: &Collection, members: &[(&str, &Manifest)]) -> Value {
         };
         if let Some(obj) = entity.as_object_mut() {
             obj.insert("isPartOf".into(), json!({ "@id": c.id }));
+            if member.kind == MemberKind::Collection {
+                // A sub-collection member is itself an RO-Crate (a nested collection) — mark it so a
+                // consumer fetches its own `ro-crate-metadata.json` rather than treating it as a flat
+                // product Dataset. Full nested-crate rendering (crate-per-child) is #294.
+                obj.insert(
+                    "conformsTo".into(),
+                    json!({ "@id": "https://w3id.org/ro/crate/1.1" }),
+                );
+            }
             if !member.derived_from.is_empty() {
                 let derived: Vec<Value> = member
                     .derived_from
@@ -149,6 +158,17 @@ pub fn to_oci_index(c: &Collection, members: &[(&str, &str, u64)]) -> Result<Val
         .members
         .iter()
         .map(|m| {
+            // Interim (ADR-0049 §Consequences): a sub-collection member's OCI artifact is itself an
+            // image *index* (nested indexes are legal in OCI 1.1), not a manifest. Rendering it with
+            // MANIFEST_MEDIA_TYPE would be wrong — refuse loudly until the recursive index-of-indexes
+            // projection lands (#294), rather than emit a broken index.
+            if m.kind != MemberKind::Product {
+                return Err(Error::Container(format!(
+                    "to_oci_index: nested sub-collection member '{}' — recursive OCI index-of-indexes \
+                     is not yet supported (tracked in #294)",
+                    m.reference
+                )));
+            }
             let (digest, size) = by_ref.get(m.reference.as_str()).copied().ok_or_else(|| {
                 Error::Container(format!(
                     "to_oci_index: no OCI artifact descriptor supplied for member '{}'",
@@ -193,18 +213,26 @@ pub enum LayoutKind {
 
 /// Project the collection onto an S3/MinIO key prefix — pure layout, no I/O. Returns
 /// `(object_key, member_reference)` pairs in declared member order, then a final
-/// `("<prefix>/collection.json", <collection_id>)` for the catalog descriptor. The prefix of N
-/// independently range-readable `.tsra` objects under this layout IS the collection on S3 (the
-/// third projection): a reader range-reads `collection.json` once, then range-reads each member's
-/// manifest + the blocks it actually needs — no whole-collection download.
+/// `("<prefix>/collection.json", <collection_id>)` for the catalog descriptor. A product member is a
+/// `<prefix>/<id>.tsra` object; a **sub-collection** member is a `<prefix>/<id>.collection.json`
+/// descriptor (ADR-0049 §4 — `kind` is authoritative, the suffix is *derived* from it). The prefix
+/// of N independently range-readable objects under this layout IS the collection on S3 (the third
+/// projection): a reader range-reads `collection.json` once, then each member it actually needs.
 pub fn prefix_layout(c: &Collection, prefix: &str) -> Vec<(String, String)> {
     let prefix = prefix.trim_end_matches('/');
     let mut out: Vec<(String, String)> = c
         .members
         .iter()
         .map(|m| {
+            // `MemberKind` is `#[non_exhaustive]`, so resolve the known nested case and default the
+            // rest to a product object (a future kind must revisit this suffix rule).
+            let ext = if m.kind == MemberKind::Collection {
+                "collection.json"
+            } else {
+                "tsra"
+            };
             (
-                format!("{prefix}/{}.tsra", m.reference),
+                format!("{prefix}/{}.{ext}", m.reference),
                 m.reference.clone(),
             )
         })
@@ -390,5 +418,54 @@ mod tests {
         // Governance (audited bypass). This is the ADR-0033 raw/derived boundary.
         assert_eq!(retention_mode(Role::Raw), RetentionMode::Compliance);
         assert_eq!(retention_mode(Role::Derived), RetentionMode::Governance);
+    }
+
+    /// The projections handle a nested sub-collection member honestly (ADR-0049, round-2 review) —
+    /// no silently-broken output: `prefix_layout` resolves a `.collection.json` object, `to_oci_index`
+    /// refuses (index-of-indexes is #294), `to_rocrate` marks it `conformsTo` a nested crate.
+    #[test]
+    fn projections_handle_a_nested_sub_collection_member() {
+        use tessera_core::collection::{CollectionHandle, ProductHandle};
+        let (_, recon, exam) = build_collection(); // `exam` = a sealed L1 collection to nest
+        let mut cb = CollectionBuilder::new("cohort", "a cohort", TS);
+        cb.add_product(
+            &ProductHandle::of(&recon).unwrap(),
+            Role::Derived,
+            Vec::new(),
+        );
+        cb.add_subcollection(
+            &CollectionHandle::of(&exam).unwrap(),
+            Role::Derived,
+            Vec::new(),
+        );
+        let cohort = cb.seal().unwrap();
+
+        // prefix_layout: the sub-collection resolves to `<id>.collection.json`, the product to `.tsra`.
+        let layout = prefix_layout(&cohort, "s3://b/cohort");
+        assert!(layout
+            .iter()
+            .any(|(k, r)| r == &exam.id && k.ends_with(&format!("{}.collection.json", exam.id))));
+        assert!(layout
+            .iter()
+            .any(|(k, r)| r == &recon.id && k.ends_with(".tsra")));
+
+        // to_oci_index: refuses the nested member loudly (recursive index-of-indexes = #294).
+        assert!(to_oci_index(
+            &cohort,
+            &[(&recon.id, "sha256:d", 1), (&exam.id, "sha256:e", 1)]
+        )
+        .is_err());
+
+        // to_rocrate: the sub-collection member entity carries the nested-crate `conformsTo` marker.
+        let rc = to_rocrate(&cohort, &[(&recon.id, &recon)]);
+        let graph = rc["@graph"].as_array().unwrap();
+        let exam_entity = graph
+            .iter()
+            .find(|e| e["@id"] == json!(exam.id))
+            .expect("exam member entity present");
+        assert_eq!(
+            exam_entity["conformsTo"]["@id"],
+            "https://w3id.org/ro/crate/1.1"
+        );
     }
 }

@@ -549,11 +549,13 @@ mod tests {
                 name: "ms".into(),
                 dtype: "u8".into(),
                 codec: None,
+                ..Default::default()
             },
             Column {
                 name: "e".into(),
                 dtype: "f4".into(),
                 codec: None,
+                ..Default::default()
             },
         ];
         let spec = TableSpec {

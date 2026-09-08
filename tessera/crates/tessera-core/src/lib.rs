@@ -29,6 +29,7 @@ pub use collection::{Collection, CollectionBuilder, CollectionMember, Role};
 pub use error::{Error, Result};
 pub use manifest::Manifest;
 pub use product::ProductBuilder;
+pub use provenance::{inherit_identity, Generation, Producer, ProducerRef, Source};
 pub use schema::{validate_manifest, ProductSchema, SchemaRegistry};
 
 #[cfg(test)]
@@ -164,11 +165,13 @@ mod tests {
                     name: "lt".into(),
                     dtype: "f4".into(),
                     codec: Some("zstd".into()),
+                    ..Default::default()
                 },
                 Column {
                     name: "en0".into(),
                     dtype: "f4".into(),
                     codec: Some("zstd".into()),
+                    ..Default::default()
                 },
             ],
             rows: 2_696_935,

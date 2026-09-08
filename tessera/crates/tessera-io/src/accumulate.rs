@@ -35,24 +35,42 @@ fn empty_cols(columns: &[Column]) -> TableData {
         .map(|c| {
             (
                 c.name.clone(),
-                ColumnData::from_le_bytes(&c.dtype, &[]).expect("validated dtype"),
+                ColumnData::empty_for(c).expect("validated dtype"),
             )
         })
         .collect()
 }
 
+/// Magic + version prefixing every staged fragment. A fragment is transient staging state, but it
+/// is `sync_all`'d for crash recovery, so a stage dir written by an older binary can outlive it.
+/// The v1 format began directly with `u64 n_rows` and derived each column's length from
+/// `dtype_size`; parsing a v1 fragment with the v2 reader (or vice versa) would silently split
+/// the columns at the wrong offsets rather than fail, so the version is explicit.
+const FRAG_MAGIC: &[u8; 8] = b"TSRAFRG\x02";
+
 /// Write one row-group [`TableData`] to a durable fragment file — the internal staging format the
-/// streaming table writers spill to (NOT the sealed format). Shape: `u64 le n_rows · column[0].le_bytes
-/// · column[1].le_bytes · …`, columns in spec order. Shared by [`TableStreamWriter`] (single block)
-/// and the multi-block sink so both stage in the **same** trivial format, and so the parallel
-/// per-block encode jobs read fragments written by either path.
+/// streaming table writers spill to (NOT the sealed format). Shape:
+/// `magic · u64 le n_rows · per column { u64 le byte_len · le_bytes }`, columns in spec order.
+///
+/// The per-column byte length is what makes **variable-width** columns representable: `str` has no
+/// element size, so a reader cannot derive its extent from the row count. Storing the length also
+/// removes the reader's dependence on `dtype_size` entirely, which is what previously restricted
+/// staging to fixed-width numerics.
+///
+/// Shared by [`TableStreamWriter`] (single block) and the multi-block sink so both stage in the
+/// **same** format, and so the parallel per-block encode jobs read fragments written by either path.
 pub(crate) fn write_fragment(path: &Path, group: &TableData) -> Result<()> {
     let n_rows = u64::try_from(group.first().map(|(_, c)| c.len()).unwrap_or(0))
         .map_err(|e| Error::Codec(format!("fragment: row count overflows u64: {e}")))?;
     let mut f = File::create(path)?;
+    f.write_all(FRAG_MAGIC)?;
     f.write_all(&n_rows.to_le_bytes())?;
     for (_, c) in group {
-        f.write_all(&c.to_le_bytes())?;
+        let raw = c.to_le_bytes();
+        let len = u64::try_from(raw.len())
+            .map_err(|e| Error::Codec(format!("fragment: column length overflows u64: {e}")))?;
+        f.write_all(&len.to_le_bytes())?;
+        f.write_all(&raw)?;
     }
     f.sync_all()?; // durable: a committed row-group survives a crash
     Ok(())
@@ -63,22 +81,50 @@ pub(crate) fn write_fragment(path: &Path, group: &TableData) -> Result<()> {
 /// pull fragments inside a per-block encode job.
 pub(crate) fn read_fragment(path: &Path, columns: &[Column]) -> Result<TableData> {
     let bytes = fs::read(path)?;
-    let head = bytes
+    let magic = bytes
         .get(0..8)
         .ok_or_else(|| Error::Codec("fragment: truncated header".into()))?;
-    let head_arr: [u8; 8] = head
+    if magic != FRAG_MAGIC {
+        return Err(Error::Codec(format!(
+            "fragment: bad magic (stale or foreign staging file at {})",
+            path.display()
+        )));
+    }
+    let head_arr: [u8; 8] = bytes
+        .get(8..16)
+        .ok_or_else(|| Error::Codec("fragment: truncated header".into()))?
         .try_into()
         .map_err(|e| Error::Codec(format!("fragment: corrupt header: {e}")))?;
     let n_rows = usize::try_from(u64::from_le_bytes(head_arr))
         .map_err(|e| Error::Codec(format!("fragment: row count exceeds usize: {e}")))?;
-    let mut off = 8usize;
+    let mut off = 16usize;
     let mut out = Vec::with_capacity(columns.len());
     for c in columns {
-        let len = n_rows * ColumnData::dtype_size(&c.dtype)?;
+        let len_arr: [u8; 8] = bytes
+            .get(off..off + 8)
+            .ok_or_else(|| {
+                Error::Codec(format!(
+                    "fragment: truncated length for column '{}'",
+                    c.name
+                ))
+            })?
+            .try_into()
+            .map_err(|e| Error::Codec(format!("fragment: corrupt column length: {e}")))?;
+        let len = usize::try_from(u64::from_le_bytes(len_arr))
+            .map_err(|e| Error::Codec(format!("fragment: column length exceeds usize: {e}")))?;
+        off += 8;
         let raw = bytes
             .get(off..off + len)
             .ok_or_else(|| Error::Codec(format!("fragment: truncated column '{}'", c.name)))?;
-        out.push((c.name.clone(), ColumnData::from_le_bytes(&c.dtype, raw)?));
+        let col = ColumnData::from_column_bytes(c, raw, n_rows)?;
+        if col.len() != n_rows {
+            return Err(Error::Codec(format!(
+                "fragment: column '{}' decoded {} rows, header says {n_rows}",
+                c.name,
+                col.len()
+            )));
+        }
+        out.push((c.name.clone(), col));
         off += len;
     }
     Ok(out)
@@ -102,8 +148,11 @@ impl TableStreamWriter {
     /// Create a writer staging row-group fragments under `stage` (created if absent).
     pub fn new(spec: TableSpec, stage: &Path) -> Result<Self> {
         // Validate every column dtype up front so later empty-column construction is infallible.
+        // `validate_dtype`, NOT `dtype_size`: the latter rejects the variable-width `str` (and,
+        // before it was added there, `b1`), which made this the front door that locked boolean and
+        // string columns out of every streaming/DAQ/ingest write path.
         for c in &spec.columns {
-            ColumnData::dtype_size(&c.dtype)?;
+            ColumnData::validate_dtype(&c.dtype)?;
         }
         fs::create_dir_all(stage)?;
         let buf = empty_cols(&spec.columns);
@@ -332,7 +381,7 @@ impl<'a> TableMultiBlockSink<'a> {
             )));
         }
         for c in &columns {
-            ColumnData::dtype_size(&c.dtype)?;
+            ColumnData::validate_dtype(&c.dtype)?;
         }
         fs::create_dir_all(stage)?;
         let buf = empty_cols(&columns);
@@ -478,7 +527,104 @@ mod tests {
             name: name.into(),
             dtype: dtype.into(),
             codec: None,
+            ..Default::default()
         }
+    }
+
+    /// Streaming a table containing a `b1` and a `str` column must work and must be byte-identical
+    /// to a batch encode of the same rows.
+    ///
+    /// Regression for the half-landed #354: `TableStreamWriter::new` validated dtypes with
+    /// `ColumnData::dtype_size`, which errors for the variable-width `str` (and errored for `b1`
+    /// too), so constructing a writer over the new column types failed outright — every
+    /// streaming/DAQ/ingest path was locked out of the very types #354 added. The fragment reader
+    /// then compounded it by deriving each column's extent as `dtype_size * n_rows`, which is
+    /// structurally wrong for length-prefixed `Utf8` regardless of validation.
+    #[test]
+    fn streaming_bool_and_utf8_equals_batch_encode() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = ROWS_PER_GROUP + 4321; // spans a group boundary + a remainder
+        let spec = TableSpec {
+            columns: vec![col("t", "u8"), col("flag", "b1"), col("origin", "str")],
+            rows: rows as u64,
+            row_index: Some("t".into()),
+        };
+        // Deliberately variable-length strings, so a fixed-width offset assumption cannot survive.
+        let origins: Vec<String> = (0..rows)
+            .map(|k| match k % 4 {
+                0 => "annih511".to_string(),
+                1 => "prompt_nuclear".to_string(),
+                2 => String::new(),
+                _ => format!("scatter-{k}"),
+            })
+            .collect();
+        let full: TableData = vec![
+            ("t".into(), ColumnData::U64((0..rows as u64).collect())),
+            (
+                "flag".into(),
+                ColumnData::Bool((0..rows).map(|k| k % 3 == 0).collect()),
+            ),
+            ("origin".into(), ColumnData::Utf8(origins)),
+        ];
+
+        let mut w = TableStreamWriter::new(spec.clone(), &dir.path().join("stage")).unwrap();
+        let mut pushed = 0usize;
+        while pushed < rows {
+            let n = 9999.min(rows - pushed);
+            let batch: TableData = full
+                .iter()
+                .map(|(name, c)| (name.clone(), c.slice(pushed, pushed + n)))
+                .collect();
+            w.push(batch).unwrap();
+            pushed += n;
+        }
+        let streamed = w.finish().unwrap();
+
+        let batch = table::encode(&spec, &full).unwrap();
+        assert_eq!(
+            streamed, batch,
+            "streamed b1/str block != batch encode of the same rows"
+        );
+        assert_eq!(
+            table::decode(&spec, &streamed).unwrap(),
+            full,
+            "b1/str roundtrip through the streaming path lost data"
+        );
+    }
+
+    /// A fragment round-trips a variable-width column exactly. Targets the fragment format itself
+    /// rather than the whole writer, so a regression in the length framing is attributed directly.
+    #[test]
+    fn fragment_roundtrips_variable_width_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.frag");
+        let columns = vec![col("flag", "b1"), col("origin", "str"), col("t", "u8")];
+        let group: TableData = vec![
+            ("flag".into(), ColumnData::Bool(vec![true, false, true])),
+            (
+                "origin".into(),
+                ColumnData::Utf8(vec!["".into(), "a-much-longer-value".into(), "x".into()]),
+            ),
+            ("t".into(), ColumnData::U64(vec![7, 8, 9])),
+        ];
+        write_fragment(&path, &group).unwrap();
+        assert_eq!(read_fragment(&path, &columns).unwrap(), group);
+    }
+
+    /// A staging file that is not a v2 fragment fails loudly instead of splitting columns wrongly.
+    #[test]
+    fn fragment_with_bad_magic_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.frag");
+        // v1 shape: bare `u64 n_rows` then raw column bytes, no magic.
+        let mut bytes = 3u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[1, 0, 1]);
+        std::fs::write(&path, &bytes).unwrap();
+        let err = read_fragment(&path, &[col("flag", "b1")]).unwrap_err();
+        assert!(
+            format!("{err}").contains("bad magic"),
+            "expected a magic mismatch, got: {err}"
+        );
     }
 
     #[test]

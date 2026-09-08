@@ -22,8 +22,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    RecordBatch, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Int8Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::csv::WriterBuilder;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -33,10 +33,11 @@ use tessera_io::{ColumnData, Reader};
 
 use crate::nav::Format;
 
-/// Convert one Tessera [`ColumnData`] to an Arrow [`ArrayRef`] — one branch per numeric dtype
+/// Convert one Tessera [`ColumnData`] to an Arrow [`ArrayRef`] — one branch per dtype
 /// (`ColumnData` is a closed enum, so every variant is covered exhaustively). Small vectors go
 /// through `.clone()`; f32/f64 are copied verbatim (no NaN canonicalisation — DataFusion honours
-/// IEEE-754 comparison semantics the same way the tests below assert).
+/// IEEE-754 comparison semantics the same way the tests below assert). `Bool`/`Utf8` map to
+/// Arrow `Boolean`/`Utf8`; every column is non-nullable, so no null buffer is built.
 fn column_to_array(col: ColumnData) -> ArrayRef {
     match col {
         ColumnData::I8(v) => Arc::new(Int8Array::from(v)) as ArrayRef,
@@ -49,11 +50,50 @@ fn column_to_array(col: ColumnData) -> ArrayRef {
         ColumnData::U64(v) => Arc::new(UInt64Array::from(v)) as ArrayRef,
         ColumnData::F32(v) => Arc::new(Float32Array::from(v)) as ArrayRef,
         ColumnData::F64(v) => Arc::new(Float64Array::from(v)) as ArrayRef,
+        ColumnData::Bool(v) => Arc::new(BooleanArray::from(v)) as ArrayRef,
+        ColumnData::Utf8(v) => Arc::new(StringArray::from(v)) as ArrayRef,
+        // Build a genuine Arrow validity bitmap rather than substituting a sentinel, so
+        // DataFusion's own NULL semantics apply: `IS NULL` matches, and aggregates like AVG
+        // skip nulls instead of averaging in a placeholder.
+        ColumnData::Nullable { values, validity } => nullable_to_array(*values, &validity),
     }
 }
 
-/// Map an fd5 numpy-style dtype code (`i2`/`u4`/`f4`/…) to its Arrow [`DataType`]. Same closed
-/// mapping the encoder writes; a code outside the table's supported set is a typed schema error.
+/// Convert a nullable [`ColumnData`] to an Arrow array carrying a validity bitmap.
+///
+/// Nullability currently covers the fixed-width numeric dtypes (`table::validate` rejects a
+/// nullable Bool/Utf8 before a block can be sealed), so a nullable column reaching the reader
+/// with any other payload means the writer bypassed validation.
+fn nullable_to_array(values: ColumnData, validity: &[bool]) -> ArrayRef {
+    macro_rules! opt {
+        ($v:expr, $arr:ty) => {
+            Arc::new(<$arr>::from_iter(
+                $v.into_iter().zip(validity).map(|(x, &ok)| ok.then_some(x)),
+            )) as ArrayRef
+        };
+    }
+    match values {
+        ColumnData::I8(v) => opt!(v, Int8Array),
+        ColumnData::I16(v) => opt!(v, Int16Array),
+        ColumnData::I32(v) => opt!(v, Int32Array),
+        ColumnData::I64(v) => opt!(v, Int64Array),
+        ColumnData::U8(v) => opt!(v, UInt8Array),
+        ColumnData::U16(v) => opt!(v, UInt16Array),
+        ColumnData::U32(v) => opt!(v, UInt32Array),
+        ColumnData::U64(v) => opt!(v, UInt64Array),
+        ColumnData::F32(v) => opt!(v, Float32Array),
+        ColumnData::F64(v) => opt!(v, Float64Array),
+        other => unreachable!(
+            "nullable '{}' is rejected by table::validate before a block can be sealed",
+            other.numpy_code()
+        ),
+    }
+}
+
+/// Map an fd5 numpy-style dtype code (`i2`/`u4`/`f4`/`b1`/`str`/…) to its Arrow [`DataType`]. Same
+/// closed mapping the encoder writes — it must stay in lockstep with [`column_to_array`], since the
+/// declared field type and the built array are paired into one `RecordBatch`. A code outside the
+/// table's supported set is a typed schema error.
 fn numpy_to_arrow(code: &str) -> tessera_core::Result<DataType> {
     Ok(match code {
         "i1" => DataType::Int8,
@@ -66,9 +106,12 @@ fn numpy_to_arrow(code: &str) -> tessera_core::Result<DataType> {
         "u8" => DataType::UInt64,
         "f4" => DataType::Float32,
         "f8" => DataType::Float64,
+        "b1" => DataType::Boolean,
+        "str" => DataType::Utf8,
         other => {
             return Err(tessera_core::Error::Invalid(format!(
-                "tessera sql: unsupported column dtype '{other}' (table cols are numeric)"
+                "tessera sql: unsupported column dtype '{other}' \
+                 (table cols are numeric, b1 or str)"
             )))
         }
     })
@@ -126,7 +169,13 @@ pub fn run_with(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for col in &columns {
         let data = view.column(&mut r, &col.name)?;
-        fields.push(Field::new(&col.name, numpy_to_arrow(&col.dtype)?, false));
+        // The declared nullability must match the array's: `RecordBatch::try_new` rejects a
+        // nullable array under a non-nullable field.
+        fields.push(Field::new(
+            &col.name,
+            numpy_to_arrow(&col.dtype)?,
+            col.nullable,
+        ));
         arrays.push(column_to_array(data));
     }
     let schema = Arc::new(Schema::new(fields));
@@ -186,11 +235,13 @@ mod tests {
                     name: "ms".into(),
                     dtype: "u4".into(),
                     codec: None,
+                    ..Default::default()
                 },
                 Column {
                     name: "en".into(),
                     dtype: "f4".into(),
                     codec: None,
+                    ..Default::default()
                 },
             ],
             rows: 4,
@@ -332,6 +383,146 @@ mod tests {
         assert!(
             format!("{err}").contains("ndjson"),
             "typed rejection expected"
+        );
+    }
+
+    /// Seal a table with a nullable numeric column (#330).
+    fn sample_nullable(path: &std::path::Path) {
+        let spec = TableSpec {
+            columns: vec![Column::new("ms", "u4"), Column::new("en", "f4").nullable()],
+            rows: 4,
+            row_index: None,
+        };
+        let data: TableData = vec![
+            ("ms".into(), ColumnData::U32(vec![10, 20, 30, 40])),
+            (
+                "en".into(),
+                ColumnData::Nullable {
+                    // canonical: 0.0 beneath every null (encoding normalises masked slots)
+                    values: Box::new(ColumnData::F32(vec![1.0, 0.0, 3.0, 0.0])),
+                    validity: vec![true, false, true, false],
+                },
+            ),
+        ];
+        let (block_ref, payload) = table_block("events", &spec, &data).unwrap();
+        let mut b = ProductBuilder::new("listmode", "DP", "d", "2024-01-01T00:00:00Z");
+        b.add_block_ref(block_ref);
+        let sealed = b.seal().unwrap();
+        pack(&sealed, &[payload], path).unwrap();
+    }
+
+    /// NULL reaches DataFusion as a real Arrow validity bit, so SQL NULL semantics apply:
+    /// `IS NULL` matches the masked rows, and `AVG` skips them rather than averaging in the 0.0
+    /// placeholder that sits under a null on disk. Averaging the placeholder would give 1.0;
+    /// skipping gives 2.0.
+    #[test]
+    fn sql_over_nullable_column_honours_null_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_nullable(&tsra);
+
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT ms FROM events WHERE en IS NULL ORDER BY ms",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "ms\n20\n40\n");
+
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT avg(en) AS a FROM events",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("2.0"),
+            "AVG must skip NULLs (expected 2.0, not 1.0): {text:?}"
+        );
+    }
+
+    /// Seal a tiny `b1` + `str` table — the non-numeric column types (#354).
+    fn sample_bool_utf8(path: &std::path::Path) {
+        let spec = TableSpec {
+            columns: vec![Column::new("flag", "b1"), Column::new("origin", "str")],
+            rows: 4,
+            row_index: None,
+        };
+        let data: TableData = vec![
+            (
+                "flag".into(),
+                ColumnData::Bool(vec![true, false, true, false]),
+            ),
+            (
+                "origin".into(),
+                ColumnData::Utf8(
+                    ["annih511", "prompt_nuclear", "annih511", "other"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                ),
+            ),
+        ];
+        let (block_ref, payload) = table_block("events", &spec, &data).unwrap();
+        let mut b = ProductBuilder::new("listmode", "DP", "d", "2024-01-01T00:00:00Z");
+        b.add_block_ref(block_ref);
+        let sealed = b.seal().unwrap();
+        pack(&sealed, &[payload], path).unwrap();
+    }
+
+    /// `b1`/`str` columns survive the whole SQL path: `numpy_to_arrow` declares Boolean/Utf8,
+    /// `column_to_array` builds the matching arrays (a mismatch would fail `RecordBatch::try_new`),
+    /// and DataFusion filters on both — a boolean predicate and a string equality.
+    #[test]
+    fn bool_and_utf8_columns_query_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_bool_utf8(&tsra);
+
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT origin FROM events WHERE flag AND origin = 'annih511'",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        // Rows: (true,"annih511"), (false,"prompt_nuclear"), (true,"annih511"), (false,"other")
+        // → both `flag`-true rows carry origin "annih511".
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "origin\nannih511\nannih511\n"
+        );
+    }
+
+    /// The whole b1/str table renders — proves the Boolean array reaches the CSV writer as
+    /// `true`/`false` rather than erroring or coming back numeric.
+    #[test]
+    fn bool_column_renders_as_true_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let tsra = dir.path().join("p.tsra");
+        sample_bool_utf8(&tsra);
+
+        let mut out = Vec::<u8>::new();
+        run_with(
+            &tsra,
+            "events",
+            "SELECT flag, origin FROM events WHERE origin = 'other'",
+            Format::Csv,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "flag,origin\nfalse,other\n"
         );
     }
 }

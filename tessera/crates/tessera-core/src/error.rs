@@ -32,6 +32,17 @@ pub enum Error {
         actual: String,
     },
 
+    /// A block's stored payload failed its integrity check while reading/verifying a `.tsra` —
+    /// names the container `file` and the `block` so an operator sees exactly what is corrupt,
+    /// instead of a bare `io: Invalid checksum` with no locus (#268). `detail` carries the
+    /// underlying cause (the zip CRC error, or an `Integrity` mismatch with expected/actual).
+    #[error("integrity: block '{block}' in {file} failed verification: {detail}")]
+    BlockIntegrity {
+        file: String,
+        block: String,
+        detail: String,
+    },
+
     /// The manifest's spec version is unparseable or newer than this reader supports.
     #[error("unsupported version: {0}")]
     UnsupportedVersion(String),

@@ -156,6 +156,7 @@ fn listmode_columns() -> Vec<Column> {
             name: (*n).into(),
             dtype: d.into(),
             codec: None,
+            ..Default::default()
         })
         .collect()
 }
@@ -291,6 +292,8 @@ fn run_listmode_real(
         "ms",
         None,
         &[],
+        &std::collections::BTreeMap::new(),
+        None,
         &std::collections::BTreeMap::new(),
     )?;
     let wall_s = t.elapsed().as_secs_f64();
