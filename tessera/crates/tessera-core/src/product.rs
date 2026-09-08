@@ -211,6 +211,71 @@ mod tests {
         );
     }
 
+    /// ADR-0056 §6a: decoder drift is detectable from **sealed data alone**, even before the
+    /// decoder identity is recorded.
+    ///
+    /// This is the property that makes the decoder identity a *recipe fact* — recorded in the
+    /// sealed provenance bag under the well-known key `ingest_decoder` (ADR-0056 §6a), not a
+    /// bespoke sealed field. The seal already pins both ends of the ingest transform — the input,
+    /// via the `ingested_from` edge's source digest, and the output, via `content_hash` — so
+    /// *same source digest + different content_hash* means the interpretation changed, and no
+    /// dedicated field is needed to *detect* it. Recording the decoder is for *attribution*, not
+    /// detection.
+    ///
+    /// If a refactor ever dropped the source digest from the edge, or folded product metadata into
+    /// `content_hash`, that inference would break silently and #403's decision would lose its
+    /// premise. Both halves are asserted here.
+    #[test]
+    fn the_sealed_source_and_content_hashes_bracket_the_ingest_transform() {
+        // Same source file, decoded twice. `decoded` is the block digest, standing in for whatever
+        // logical values the decoder extracted; `context` is a piece of recorded metadata — sealed,
+        // but not part of `content_hash`.
+        let sealed = |decoded: &str, context: &str| {
+            let mut b = ProductBuilder::new("table", "trades", "d", "2024-01-01T00:00:00Z");
+            b.add_block_ref(block("data", decoded));
+            b.add_source(
+                Source::new("ingested_from", "trades.parquet").with_content_hash("blake3:src"),
+            );
+            b.with_field("source_format", serde_json::json!(context));
+            b.seal().unwrap()
+        };
+
+        let same_values = sealed("blake3:aa", "parquet");
+        let drifted = sealed("blake3:bb", "parquet");
+
+        // The input is pinned inside the seal — this is what makes the comparison meaningful.
+        let src = |m: &Manifest| {
+            m.sources
+                .iter()
+                .find(|s| s.role == "ingested_from")
+                .and_then(|s| s.content_hash.clone())
+                .expect("ingest stamps a source digest")
+        };
+        assert_eq!(src(&same_values), src(&drifted), "same source file");
+
+        // Same source + moved content_hash ⇒ the interpretation changed. Detection, from the seal.
+        assert_ne!(
+            same_values.content_hash, drifted.content_hash,
+            "different extracted values must move content_hash"
+        );
+        assert_ne!(same_values.manifest_hash, drifted.manifest_hash);
+        assert_eq!(
+            same_values.id, drifted.id,
+            "drift is a new version of one logical product, not a new product"
+        );
+
+        // The other half: a value-preserving change to recorded context moves `manifest_hash`
+        // (metadata changed) but never `content_hash`/`id` — the data fingerprint tracks the
+        // extracted *values*, not the recipe. That is exactly why recording the decoder (§6a) is a
+        // sealed recipe fact that can never move `content_hash` on its own.
+        let relabelled = sealed("blake3:aa", "parquet-v2");
+        assert_eq!(
+            same_values.content_hash, relabelled.content_hash,
+            "content_hash is a Merkle over block digests; manifest metadata is not in it"
+        );
+        assert_eq!(same_values.id, relabelled.id);
+    }
+
     #[test]
     fn seal_embeds_the_product_schema_for_a_known_product() {
         // A known product's sealed manifest carries its own contract (self-describing, obligatory).
