@@ -106,6 +106,17 @@ pub struct ProductSpec {
     /// Use this for the small handful of fd5 schema fields the engine doesn't compute itself.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, Value>,
+    /// Generation record (ADR-0058 §2) — *how* this product was made: the producing tool's config
+    /// as a generic bag. TOML: `[product.generation] config = { … }` or `config_ref = "blake3:…"`.
+    /// Sealed into `manifest_hash`; required at validate for schemas that set `requires_generation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<tessera_core::Generation>,
+    /// Producer identity (ADR-0058 §1) — the tool/build that generated this product. TOML:
+    /// `[product.producer] tool = "ge-listmode-daq" version = "…"`. Overrides the default `tessera`
+    /// stamp so an external DAQ/SIM records itself. Sealed. Always structured (a spec never writes a
+    /// legacy bare string), so `Producer` not `ProducerRef`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<tessera_core::Producer>,
     /// Format-tagged decoder options. The `format` discriminator picks the backend; the rest of
     /// the fields are backend-specific. Flattened via `#[serde(flatten)]` so a TOML
     /// `format = "hdf-compound"` reads sibling fields (`input`, `dataset`, …) directly off the

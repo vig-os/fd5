@@ -46,6 +46,9 @@ impl ProductBuilder {
         manifest.schema = parent.schema.clone();
         manifest.metadata = parent.metadata.clone();
         manifest.extra = parent.extra.clone();
+        // `producer` and `generation` are intentionally NOT carried: a new version is sealed by
+        // *this* build (producer is re-stamped in `seal`), and its generation recipe is a property of
+        // how *this* revision was made — the caller re-attaches one via `with_generation` if needed.
         // Keep derivation/provenance edges; drop the parent's version edges (walked, not accumulated).
         manifest.sources = parent
             .sources
@@ -112,6 +115,34 @@ impl ProductBuilder {
         self
     }
 
+    /// Declare the producing tool/build (ADR-0058 §1) — an external DAQ/SIM/recon records its own
+    /// identity here, overriding the default `tessera` stamp. Sealed provenance.
+    pub fn with_producer(&mut self, producer: crate::provenance::Producer) -> &mut Self {
+        self.manifest.producer = Some(crate::provenance::ProducerRef::Structured(producer));
+        self
+    }
+
+    /// Attach the generation record (ADR-0058 §2) — *how* this product was made, as a generic bag
+    /// (inline `config` and/or a `config_ref` to a carried block). Required at validate for schemas
+    /// that set `requires_generation`.
+    pub fn with_generation(&mut self, generation: crate::provenance::Generation) -> &mut Self {
+        self.manifest.generation = Some(generation);
+        self
+    }
+
+    /// Inherit **schema-flagged identity** fields from a resolved `derived_from` parent (ADR-0058
+    /// §5) — the DAG-walk caller (the ingest engine) supplies the parent manifest + this product's
+    /// schema; only fields the schema marks `inherit` flow, and an explicit child value always wins.
+    /// Call before `seal` so the inherited identity is covered by the seal.
+    pub fn inherit_identity_from(
+        &mut self,
+        parent: &Manifest,
+        schema: &crate::schema::ProductSchema,
+    ) -> &mut Self {
+        crate::provenance::inherit_identity(&mut self.manifest, parent, schema);
+        self
+    }
+
     /// Seal: roll block digests into the content Merkle root, then hash the whole manifest into
     /// the `manifest_hash` seal, freeze, and return it.
     ///
@@ -138,13 +169,19 @@ impl ProductBuilder {
                 self.manifest.schema = Some(s.to_value()?);
             }
         }
-        // Sealed provenance: stamp the **format version** that wrote the file — identity-relevant and
-        // stable across software/crate version bumps (ADR-0052). The build-tool/*software* version is
-        // non-sealed provenance and lives in `aux/provenance.json` (ADR-0042), so a `cargo` version
-        // bump never changes the seal or forces a conformance-corpus regen. (`TESSERA_VERSION` only
-        // changes on a *deliberate* format revision — where a regen is expected.)
+        // Sealed provenance: stamp the producing tool/build so a reader knows what wrote the file
+        // (ADR-0058 §1 — structured [`ProducerRef::tessera()`], tool + `TESSERA_VERSION` +
+        // optional build commit). Re-stamped per version (not inherited) — a new version is sealed
+        // by *this* tool.
+        //
+        // Note the seal keys off the **format version** (`TESSERA_VERSION`), not the software
+        // (`CARGO_PKG_VERSION`) — identity-relevant and stable across software/crate version
+        // bumps. The build-tool/software version is non-sealed provenance and lives in
+        // `aux/provenance.json` (ADR-0042), so a `cargo` version bump never changes the seal or
+        // forces a conformance-corpus regen. (`TESSERA_VERSION` only changes on a *deliberate*
+        // format revision — where a regen is expected.)
         if self.manifest.producer.is_none() {
-            self.manifest.producer = Some(format!("tessera/{}", crate::manifest::TESSERA_VERSION));
+            self.manifest.producer = Some(crate::provenance::ProducerRef::tessera());
         }
         // The seal is computed last, over the manifest with `manifest_hash` excluded, so it
         // transitively commits to id_inputs, sources, the producer, the embedded schema, and blocks.

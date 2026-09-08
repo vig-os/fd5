@@ -292,7 +292,7 @@ never typed by a maintainer.
 
 ### Axis (i) — the option space the first two passes missed
 
-Tessera already has a sealed provenance model (ADR-0052 generation-provenance, and see *Sequencing*
+Tessera already has a sealed provenance model (ADR-0058 generation-provenance, and see *Sequencing*
 below): `Producer{tool, version, git_commit, …}` — *who made it*, where Tessera stamps its own and an
 external DAQ or sim fills its own via `Producer::new`; `Source{role, reference, content_hash}` — *what
 went in*; and `Generation{config, config_ref}` — ***how it was made***, a deliberately non-opinionated
@@ -438,13 +438,13 @@ inputs, and no option escapes that.
 
 ### Sequencing — this ADR must be correct before and after the provenance model lands
 
-**The sealed provenance model is not on `dev`.** `Producer` and `Generation` live on
-`feature/324-generation-provenance-adr`, whose PR is open against `spike/tessera-core` — the
-pre-graduation branch — so it has never flowed to trunk. `dev`'s `Manifest` today carries the legacy
-`producer: Option<String>` and has no `generation` field. There is also an **ADR-number collision**:
-that branch's ADR-0052 is generation-provenance, while `dev`'s ADR-0052 is versioning-and-release.
-Both are tracked in the follow-up issue; ADR-0056 does not resolve them, but neither does it pretend
-they are absent.
+**The sealed provenance model landed on `dev` as ADR-0058** via #409 (superseding stranded PR #346;
+the ADR-number collision — the branch had numbered itself ADR-0052 while `dev`'s ADR-0052 is
+versioning-and-release — was resolved by renumbering to the next free slot). `Producer`,
+`ProducerRef`, and `Generation` are now trunk-visible; `Manifest` carries the structured
+`producer: Option<ProducerRef>` (a legacy bare string still round-trips byte-identically) and a
+`generation: Option<Generation>` field. This section is kept as the design-time record of the wiring
+that made this ADR neutral to that landing.
 
 Therefore:
 
@@ -867,6 +867,7 @@ dependencies is out of scope here but is the larger prize, and is named for a fu
   `ingest_transform`. §6a's home makes the fix cheap and symmetric — a companion recipe key holding a
   build-time digest of the canonicalisation tree — but it is not decided here, and until it is, the
   recipe names the third-party decoder more precisely than it names us.
-- **The sealed provenance model is not on `dev`**, and its ADR number collides with the shipped
-  ADR-0052 (versioning-and-release). Both are tracked in the follow-up issue; ADR-0056 depends on that
-  resolution and does not attempt it.
+- **The sealed provenance model landed on `dev` as ADR-0058** via #409 (superseding stranded PR #346;
+  the ADR-number collision with the shipped ADR-0052 versioning-and-release was resolved by
+  renumbering to the next free slot). ADR-0056 §6a's recipe-bag home is now realisable against a
+  trunk-visible `Producer`/`Generation`.

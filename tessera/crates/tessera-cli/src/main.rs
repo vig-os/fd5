@@ -922,7 +922,7 @@ fn run(cmd: Cmd) -> tessera_core::Result<()> {
             println!("name          {}", m.name);
             println!("timestamp     {}", m.timestamp);
             if let Some(p) = &m.producer {
-                println!("producer      {p}");
+                println!("producer      {}", p.display());
             }
             if let Some(s) = &m.study {
                 println!("study         {s}");
@@ -1702,6 +1702,8 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
+                    generation: None,
+                    producer: None,
                     options: FormatOptions::Dicom { input, deidentify },
                 }],
             },
@@ -1733,6 +1735,8 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
+                    generation: None,
+                    producer: None,
                     options: FormatOptions::DicomSeries {
                         inputs,
                         deidentify,
@@ -1773,6 +1777,8 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
+                    generation: None,
+                    producer: None,
                     options: FormatOptions::HdfCompound {
                         input,
                         dataset,
@@ -1811,6 +1817,8 @@ fn ingest_src_to_spec(src: IngestSrc) -> tessera_core::Result<(ingest_spec::Inge
                     derived_from: Vec::new(),
                     source_label,
                     metadata: parse_meta(&meta)?,
+                    generation: None,
+                    producer: None,
                     options: FormatOptions::Blob { input, media_type },
                 }],
             },

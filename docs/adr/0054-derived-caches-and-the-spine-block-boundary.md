@@ -141,14 +141,14 @@ along, both already in the type:
   `Identifying` field is not projected into a browsable cross-tenant index by default (this is the
   #267 export-PHI-leak hazard, resolved at the source instead of per-exporter). A local/private
   catalog may include them; the tier decides, not a hardcoded column list.
-- **`FieldSpec.inherit`** (ADR-0052) means a value present on a derived member's row may have been
+- **`FieldSpec.inherit`** (ADR-0058) means a value present on a derived member's row may have been
   filled from a parent — the catalog records it as a normal column; provenance of *where it came
   from* stays in the sealed `sources`, not duplicated into the catalog.
 
 This is the single discipline that keeps the RDM domain-agnostic: **PET/radiology is one registered
 schema whose `FieldSpec`s happen to name `patient_id`/`study_date`/etc.; the catalog builder never
 learns those names.** A new domain registers its own schema and its columns appear with zero
-catalog-code change — exactly the ADR-0052 engine-holds-no-domain-field rule, extended to the
+catalog-code change — exactly the ADR-0058 engine-holds-no-domain-field rule, extended to the
 index. (Note: the block-column annotation triad `short_name`/`description`/`unit` already lives on
 `block::table::Column`; the catalog guard is about *metadata* fields — `FieldSpec` — not data
 columns, though the same "annotation is schema data, not engine code" principle governs both, cf.

@@ -87,6 +87,19 @@ pub struct FieldSpec {
     /// `#[serde(default)]` keeps existing on-disk schemas back-compat (absent ⇒ `Public`).
     #[serde(default)]
     pub sensitivity: Sensitivity,
+    /// Whether this field is **inheritable identity** (ADR-0058 §5): copied from a `derived_from`
+    /// parent into a child product's metadata at seal (unless the child overrides). This is the
+    /// *inheritance* axis — orthogonal to [`sensitivity`](Self::sensitivity) (the PHI axis), and an
+    /// inherited field carries its tier with it. `skip_serializing_if` keeps the default (`false`)
+    /// out of the embedded schema, so existing sealed products' bytes — and seals — are unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inherit: bool,
+}
+
+/// `skip_serializing_if` predicate for a `bool` that defaults to `false`: omit it when false so
+/// adding the field leaves existing sealed manifests' embedded-schema bytes (and seals) untouched.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl FieldSpec {
@@ -103,6 +116,7 @@ impl FieldSpec {
             required: true,
             recommended: false,
             sensitivity: Sensitivity::Public,
+            inherit: false,
         }
     }
 
@@ -142,6 +156,13 @@ impl FieldSpec {
     /// it up automatically.
     pub fn with_sensitivity(mut self, s: Sensitivity) -> Self {
         self.sensitivity = s;
+        self
+    }
+
+    /// Builder: mark this field **inheritable identity** (ADR-0058 §5) — it flows from a
+    /// `derived_from` parent into a child product at seal unless the child overrides it.
+    pub fn inheritable(mut self) -> Self {
+        self.inherit = true;
         self
     }
 }
@@ -198,6 +219,13 @@ pub struct ProductSchema {
     pub fields: Vec<FieldSpec>,
     #[serde(default)]
     pub blocks: Vec<BlockRequirement>,
+    /// Whether a product of this schema **must** carry a generation record (ADR-0058 §3): the
+    /// schema-declared "this product needs a recipe" rule. `true` on schemas for computed products
+    /// (a DAQ/SIM/recon output); absence at validate is a hard block. Default `false` (permissive,
+    /// back-compat) with `skip_serializing_if` so existing embedded schemas' bytes are unchanged —
+    /// the policy lives in the schema, not the engine (a domain opts in per product kind).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_generation: bool,
 }
 
 impl ProductSchema {
@@ -230,7 +258,22 @@ impl ProductSchema {
                 )));
             }
         }
+        // ADR-0058 §3: a schema-declared "needs a recipe" rule — reuse the same block-on-missing
+        // mechanism as required fields, applied to the generation slot. Policy is schema data.
+        if self.requires_generation && m.generation.as_ref().is_none_or(|g| g.is_empty()) {
+            return Err(crate::Error::Invalid(format!(
+                "schema '{}' requires a generation record (producer config/config_ref) — ADR-0058 §3",
+                self.product
+            )));
+        }
         Ok(())
+    }
+
+    /// The fields this schema marks **inheritable identity** (ADR-0058 §5) — the allowlist
+    /// [`crate::provenance::inherit_identity`] copies from a `derived_from` parent. Pure schema data;
+    /// the engine holds no field list. Order matches schema declaration.
+    pub fn inheritable_fields(&self) -> Vec<&FieldSpec> {
+        self.fields.iter().filter(|f| f.inherit).collect()
     }
 
     /// The schema's **recommended** fields (the warn tier) that this manifest does **not** carry and
@@ -355,6 +398,7 @@ fn schema(product: &str, version: &str, description: &str) -> ProductSchema {
         description: description.into(),
         fields: Vec::new(),
         blocks: Vec::new(),
+        requires_generation: false,
     }
 }
 
@@ -363,9 +407,11 @@ fn schema(product: &str, version: &str, description: &str) -> ProductSchema {
 /// `diffusion_mri` / `multicontrast_mri` rather than repeated per schema (DRY). `with` appends the
 /// schema's own extra fields.
 fn imaging_base(with: Vec<FieldSpec>) -> Vec<FieldSpec> {
+    // `modality` is intrinsic acquisition identity — it flows raw→derived (ADR-0058 §5).
     let mut fields = vec![FieldSpec::required("modality", "Imaging modality", "coded")
         .vocabulary("DICOM")
-        .with_sensitivity(Sensitivity::Coded)];
+        .with_sensitivity(Sensitivity::Coded)
+        .inheritable()];
     fields.extend(with);
     fields
 }
@@ -414,13 +460,15 @@ fn builtin_schemas() -> Vec<ProductSchema> {
                     "Pseudonymised patient handle (DICOM PS3.15 Patient Name / Patient ID family — direct PHI; supply a site-issued pseudonym, never the raw MRN)",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Identifying),
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
                 FieldSpec::optional(
                     "acquisition_uid",
                     "Acquisition UID (DICOM PS3.15 UID family — Study/Series/SOPInstance UID; linking PHI under the confidentiality profile)",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Identifying),
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
                 // ── DICOM curated-tag port (#253) ──────────────────────────────────────────
                 // Ported straight from the DICOM header at ingest time. Sensitivity tiers
                 // seeded from PS3.15 — the UIDs link back to the patient/study so they are
@@ -432,29 +480,34 @@ fn builtin_schemas() -> Vec<ProductSchema> {
                     "DICOM StudyInstanceUID (0020,000D) — PS3.15 UID family, links back to the patient/study",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Identifying),
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
                 FieldSpec::recommended(
                     "series_instance_uid",
                     "DICOM SeriesInstanceUID (0020,000E) — PS3.15 UID family, links back to the series",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Identifying),
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
                 FieldSpec::recommended(
                     "study_date",
                     "DICOM StudyDate (0008,0020), YYYYMMDD — scan context, access-controlled",
                     "string",
                 )
-                .with_sensitivity(Sensitivity::Sensitive),
+                .with_sensitivity(Sensitivity::Sensitive)
+                .inheritable(),
                 FieldSpec::recommended(
                     "manufacturer",
                     "DICOM Manufacturer (0008,0070) — device vendor",
                     "string",
-                ),
+                )
+                .inheritable(),
                 FieldSpec::recommended(
                     "model_name",
                     "DICOM ManufacturerModelName (0008,1090) — device model",
                     "string",
-                ),
+                )
+                .inheritable(),
                 FieldSpec::recommended("kvp", "DICOM KVP (0018,0060), CT peak kilovoltage", "float64")
                     .unit("kV"),
                 FieldSpec::recommended(
@@ -482,11 +535,52 @@ fn builtin_schemas() -> Vec<ProductSchema> {
             )
         },
         ProductSchema {
-            fields: vec![FieldSpec::required(
-                "coincidence_mode",
-                "Acquisition mode (singles / prompt-coincidence / extended-coincidence)",
-                "string",
-            )],
+            // `coincidence_mode` is per-level (singles vs prompt vs extended) — NOT inherited.
+            // The acquisition-identity fields ARE intrinsic to the acquisition and flow raw→derived
+            // (ADR-0058 §5): the raw `.dat` carries them, the derived singles/coin/events inherit
+            // them so each product is self-describing. Vendor acquisition *config* (cal files, the
+            // acq `.cfg`, load-point) is the raw's `generation.config` recipe, not inheritable identity.
+            fields: vec![
+                FieldSpec::required(
+                    "coincidence_mode",
+                    "Acquisition mode (singles / prompt-coincidence / extended-coincidence)",
+                    "string",
+                ),
+                FieldSpec::optional(
+                    "patient_id",
+                    "Pseudonymised patient handle for this acquisition (direct PHI — supply a site pseudonym, never the raw MRN)",
+                    "string",
+                )
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
+                FieldSpec::optional(
+                    "exam",
+                    "Exam / study number linking the acquisition to its study",
+                    "string",
+                )
+                .with_sensitivity(Sensitivity::Identifying)
+                .inheritable(),
+                FieldSpec::optional(
+                    "study_date",
+                    "Acquisition date (YYYYMMDD or RFC-3339) — scan context, access-controlled",
+                    "string",
+                )
+                .with_sensitivity(Sensitivity::Sensitive)
+                .inheritable(),
+                FieldSpec::optional(
+                    "acquisition_start",
+                    "Acquisition start instant",
+                    "string",
+                )
+                .with_sensitivity(Sensitivity::Sensitive)
+                .inheritable(),
+                FieldSpec::optional("acquisition_stop", "Acquisition stop instant", "string")
+                    .with_sensitivity(Sensitivity::Sensitive)
+                    .inheritable(),
+                FieldSpec::optional("acquisition_duration", "Acquisition duration", "float64")
+                    .unit("s")
+                    .inheritable(),
+            ],
             blocks: vec![one(
                 "events",
                 Some(Table),
@@ -1087,5 +1181,33 @@ mod tests {
         assert!(r
             .fields_by_sensitivity(&m, Sensitivity::Identifying)
             .is_empty());
+    }
+
+    /// ADR-0058 §3: the "needs a recipe" rule is schema data — a schema with `requires_generation`
+    /// blocks a product carrying no (or an empty) generation record, and accepts one with a config.
+    /// A schema that does not opt in never blocks (the permissive back-compat default).
+    #[test]
+    fn requires_generation_is_a_schema_declared_block() {
+        let ts = "2024-01-01T00:00:00Z";
+        let mut m = Manifest::new("daq", "x", "d", ts);
+
+        // Opt-in schema: no generation → block.
+        let mut s = schema("daq", "1", "a DAQ product");
+        s.requires_generation = true;
+        assert!(s.validate(&m).is_err(), "missing recipe must block");
+
+        // An empty generation record is still "no recipe" → block.
+        m.generation = Some(crate::provenance::Generation::default());
+        assert!(s.validate(&m).is_err(), "empty recipe must block");
+
+        // A non-empty inline config satisfies it.
+        m.generation =
+            Some(crate::provenance::Generation::default().with("seed", serde_json::json!(42)));
+        assert!(s.validate(&m).is_ok(), "a real recipe passes");
+
+        // A schema that does not opt in never blocks on generation.
+        let permissive = schema("daq", "1", "a DAQ product");
+        let bare = Manifest::new("daq", "y", "d", ts);
+        assert!(permissive.validate(&bare).is_ok(), "default is permissive");
     }
 }
