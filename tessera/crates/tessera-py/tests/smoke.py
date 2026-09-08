@@ -91,6 +91,32 @@ with tempfile.TemporaryDirectory() as td:
     assert rr.table("events")["idx"].to_list() == idx.tolist()
     assert rr.table_arrow("events").column("en").to_pylist() == en.tolist()
 
+# str + b1 columns through the ergonomic reads (#421): str crashed _ndarray
+# ("<str" is not a dtype) and b1 silently decoded as int8 instead of bool_.
+import struct
+
+els = ["He", "Li", "", "Beryllium"]  # empty string is the edge worth pinning
+framed = b"".join(struct.pack("<I", len(s.encode())) + s.encode() for s in els)
+flags = np.array([1, 0, 1, 1], dtype="<u1")
+
+with tempfile.TemporaryDirectory() as td:
+    out = pathlib.Path(td) / "strcols.tsra"
+    b = tessera.Builder("recon", "sc", "str/b1 column roundtrip", "2024-01-01T00:00:00Z")
+    b.add_table(
+        "props",
+        [("el", "str", framed), ("stable", "b1", flags.tobytes()), ("z", "u1", bytes([2, 3, 4, 4]))],
+        None,
+    )
+    b.pack(str(out))
+
+    rr = tessera.open(out)
+    rr.verify()
+    cols = rr.table_dict("props")
+    assert cols["el"].tolist() == els, f"str column mangled: {cols['el']!r}"
+    assert cols["stable"].dtype == np.bool_, f"b1 must decode as bool_, got {cols['stable'].dtype}"
+    assert cols["stable"].tolist() == [True, False, True, True]
+    assert rr.table_arrow("props").column("el").to_pylist() == els
+
 print(
     f"tessera-py smoke OK: {verified} corpus archives via the ergonomic surface "
     "(numpy / polars / pyarrow) + numpy write→read roundtrip"

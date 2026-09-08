@@ -28,7 +28,30 @@ __all__ = ["Reader", "Builder", "open", "verify", "TesseraError", "__version__"]
 
 
 def _ndarray(buf: bytes, code: str, shape=None) -> "_np.ndarray":
-    """Reconstruct a C-order, little-endian array from the FFI ``(bytes, numpy_code)``."""
+    """Reconstruct a C-order, little-endian array from the FFI ``(bytes, numpy_code)``.
+
+    Two codes are not numpy dtypes and get their own decode (#421):
+
+    * ``str`` — the ``[u32 LE len | bytes]*`` framing from
+      ``ColumnData::from_le_bytes``; returned as an object array so the values
+      round-trip exactly (a fixed-width ``U`` dtype would silently pad/truncate).
+    * ``b1`` — stored as one byte per value; without the cast
+      ``np.frombuffer(buf, "<b1")`` happens to parse as int8, which is the wrong
+      dtype rather than an error, so bools silently came back as integers.
+    """
+    if code == "str":
+        vals, i, n = [], 0, len(buf)
+        while i + 4 <= n:
+            ln = int.from_bytes(buf[i : i + 4], "little")
+            i += 4
+            vals.append(buf[i : i + ln].decode())
+            i += ln
+        a = _np.empty(len(vals), dtype=object)
+        a[:] = vals
+        return a.reshape(tuple(shape)) if shape is not None else a
+    if code == "b1":
+        a = _np.frombuffer(buf, "<u1").astype(_np.bool_)
+        return a.reshape(tuple(shape)) if shape is not None else a
     a = _np.frombuffer(buf, "<" + code)
     return a.reshape(tuple(shape)) if shape is not None else a
 
