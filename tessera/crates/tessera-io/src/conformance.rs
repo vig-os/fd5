@@ -98,6 +98,7 @@ fn col(name: &str, dtype: &str, codec: Option<&str>) -> Column {
         name: name.into(),
         dtype: dtype.into(),
         codec: codec.map(Into::into),
+        ..Default::default()
     }
 }
 

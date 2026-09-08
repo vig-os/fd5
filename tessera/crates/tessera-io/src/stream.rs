@@ -127,8 +127,7 @@ pub fn table_job_from_fragments(
                 .map(|c| {
                     (
                         c.name.clone(),
-                        crate::table::ColumnData::from_le_bytes(&c.dtype, &[])
-                            .expect("validated dtype"),
+                        crate::table::ColumnData::empty_for(c).expect("validated dtype"),
                     )
                 })
                 .collect::<crate::table::TableData>()

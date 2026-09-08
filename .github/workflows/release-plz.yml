@@ -1,0 +1,43 @@
+# Opens/updates a HELD release PR (workspace version bump + CHANGELOG) — ADR-0052. It does NOT tag or
+# publish; the alpha is cut only by deliberately merging that release PR.
+#
+# TRIGGER = manual (workflow_dispatch) while the release is *held*: the crates are `0.0.0` with no
+# published/tagged baseline, so release-plz cannot determine a next version yet ("first-release
+# bootstrap"). Run this manually once the workspace version is bootstrapped to `0.1.0-alpha.1` — the
+# `producer` is now decoupled from the crate version (ADR-0052), so that bump costs no corpus regen.
+# Switch back to `push: [dev]` after the first release, when auto-updating the PR is useful.
+#
+# NOTE: for GITHUB_TOKEN to open the PR, enable Settings → Actions → "Allow GitHub Actions to create and
+# approve pull requests", or add a PAT as secrets.RELEASE_PLZ_TOKEN (used first when present).
+name: release-plz
+
+on:  # yamllint disable-line rule:truthy
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-plz
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: release-plz release-pr
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4  # stable
+      - name: release-plz release-pr (held — no tag/publish)
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9  # v0.5
+        with:
+          command: release-pr
+          # The Cargo workspace is nested under `tessera/`, not the repo root.
+          manifest_path: tessera/Cargo.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
