@@ -372,7 +372,7 @@ fn dispatch(
                 label,
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             Ok((m, ()))
         }
         FormatOptions::Dicom { input, deidentify } => {

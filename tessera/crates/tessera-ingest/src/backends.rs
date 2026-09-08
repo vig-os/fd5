@@ -27,6 +27,7 @@
 /// out of serde's own "unknown variant" error rather than a hand-written copy.
 pub const BACKENDS_ALL: &[&str] = &[
     "blob",
+    "blob-series",
     "dicom",
     "dicom-series",
     "hdf-compound",
@@ -53,6 +54,8 @@ pub const BACKENDS_ALL: &[&str] = &[
 pub const BACKENDS_ENABLED: &[&str] = &[
     // in-tree: ADR-0038 opaque preservation tier. Never gated off in practice.
     "blob",
+    // in-tree: block-per-file multi-file preservation (#301/#329).
+    "blob-series",
     // `dep:dicom` + `dep:dicom-transfer-syntax-registry` (Phase 1: feature `dicom`)
     "dicom",
     "dicom-series",
@@ -110,6 +113,7 @@ pub fn backend_name(opts: &crate::spec::FormatOptions) -> &'static str {
     use crate::spec::FormatOptions as F;
     match opts {
         F::Blob { .. } => "blob",
+        F::BlobSeries { .. } => "blob-series",
         F::Dicom { .. } => "dicom",
         F::DicomSeries { .. } => "dicom-series",
         F::HdfCompound { .. } => "hdf-compound",
