@@ -94,8 +94,18 @@ shape, default 64³), `axes`, and `codec` (one of `"pcodec"`, `"zstd"`, `"auto"`
     pure function of the data, so writer-determinism still holds. **Readers never see `"auto"`** in
     a sealed manifest — `BlockRef.spec.codec` is always a concrete codec id.
 
-  Supported dtypes are `int16/32/64`, `uint16/32/64`, `float32/64` for every codec (8-bit and
-  `float16` are intentionally out of scope so the dtype envelope does not depend on the codec). Float
+  Supported dtypes are the full numpy **fixed-width numeric ladder plus bool**, for every codec:
+  `int8/16/32/64`, `uint8/16/32/64`, `float16/32/64`, `bool`. The sub-16-bit dtypes are stored
+  **widened** to a pcodec-native width — `int8`/`uint8`/`bool` to 16-bit ints, `float16` exactly to
+  `float32` — because pcodec operates on ≥16-bit numbers while label/segmentation volumes are
+  canonically `uint8` and masks `bool`. The writer widens transparently, `spec.dtype` records the
+  logical dtype (the source of truth; the zarr metadata inside the payload declares the widened
+  storage dtype), and the reader narrows back, rejecting out-of-range values as corruption (`bool`
+  is strict 0/1; `float16` is bit-roundtrip-checked). The widening is lossless by construction and
+  free in output size (pcodec absorbs the redundancy). Deliberately excluded, each with a reason:
+  `complex64/128` (MRI k-space; plane-split vs interleave is an open storage-design fork),
+  `datetime64` (= `int64` + epoch/unit metadata), `bfloat16` (not numpy-native; on demand), and
+  strings (table blocks). Float
   bit patterns (incl `NaN`, `±inf`, `−0.0`, denormals) MUST be preserved exactly for all three codec
   ids — bit-exact lossless is a property of the format, not of the codec choice.
 - **Codec choice does NOT affect slice/ROI access.** Slice / sub-cube locality is a property of the

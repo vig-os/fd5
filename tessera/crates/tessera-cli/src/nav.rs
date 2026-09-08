@@ -972,6 +972,8 @@ fn array_stats(d: &ArrayData) -> (f64, f64, f64, f64, usize) {
         }};
     }
     match d {
+        ArrayData::I8(v) => reduce!(v),
+        ArrayData::U8(v) => reduce!(v),
         ArrayData::I16(v) => reduce!(v),
         ArrayData::I32(v) => reduce!(v),
         ArrayData::I64(v) => reduce!(v),
@@ -980,6 +982,11 @@ fn array_stats(d: &ArrayData) -> (f64, f64, f64, f64, usize) {
         ArrayData::U64(v) => reduce!(v),
         ArrayData::F32(v) => reduce!(v),
         ArrayData::F64(v) => reduce!(v),
+        // f16/bool have no `as f64` cast — go through the lossless f64 view.
+        ArrayData::F16(_) | ArrayData::Bool(_) => {
+            let v = d.as_f64();
+            reduce!(v)
+        }
     }
 }
 
@@ -1112,6 +1119,8 @@ fn region_to_f64(d: &ArrayData, rescale: Option<(f64, f64)>) -> Vec<f64> {
         };
     }
     match d {
+        ArrayData::I8(v) => conv!(v),
+        ArrayData::U8(v) => conv!(v),
         ArrayData::I16(v) => conv!(v),
         ArrayData::I32(v) => conv!(v),
         ArrayData::I64(v) => conv!(v),
@@ -1120,6 +1129,11 @@ fn region_to_f64(d: &ArrayData, rescale: Option<(f64, f64)>) -> Vec<f64> {
         ArrayData::U64(v) => conv!(v),
         ArrayData::F32(v) => conv!(v),
         ArrayData::F64(v) => conv!(v),
+        // f16/bool have no `as f64` cast — go through the lossless f64 view.
+        ArrayData::F16(_) | ArrayData::Bool(_) => {
+            let v = d.as_f64();
+            conv!(v)
+        }
     }
 }
 

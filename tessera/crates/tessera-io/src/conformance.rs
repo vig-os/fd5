@@ -269,6 +269,59 @@ pub fn fixtures() -> Vec<Fixture> {
         });
     }
 
+    // 8 — segmentation: the widened-dtype tier (#418). Three blocks, one per widening —
+    // `uint8` labels (organ masks / material-ID grids), a `bool` mask, and a `float16`
+    // probability map with IEEE specials. Gates the transparent-widening convention cross-arch:
+    // the payloads store widened 16/32-bit zarr data while the specs record the logical dtypes,
+    // and the bytes must be identical on every arch/build like every other fixture. Labels are
+    // spatially clustered (4 z-bands over a 32³ grid) — the shape real segmentations have.
+    {
+        use half::f16;
+        let side = 32usize;
+        let n = side * side * side;
+        let labels = ArrayData::U8((0..n).map(|k| ((k / (side * side)) / 8) as u8).collect());
+        let mask = ArrayData::Bool((0..n).map(|k| (k / (side * side)) >= 16).collect());
+        let probs = ArrayData::F16(
+            (0..n)
+                .map(|k| match k % 97 {
+                    0 => f16::NAN,
+                    1 => f16::INFINITY,
+                    2 => f16::NEG_ZERO,
+                    _ => f16::from_f32((k % 97) as f32 / 96.0),
+                })
+                .collect(),
+        );
+        let mut b =
+            ProductBuilder::new("segmentation", "labels-uint8", "widened-dtype volumes", TS);
+        let l_pl = push_array(
+            &mut b,
+            "labels",
+            &ArraySpec::new(vec![32, 32, 32], "uint8"),
+            labels,
+        );
+        let m_pl = push_array(
+            &mut b,
+            "mask",
+            &ArraySpec::new(vec![32, 32, 32], "bool"),
+            mask,
+        );
+        let p_pl = push_array(
+            &mut b,
+            "probability",
+            &ArraySpec::new(vec![32, 32, 32], "float16"),
+            probs,
+        );
+        b.with_field(
+            "modality",
+            serde_json::json!({"_vocabulary": "DICOM", "_code": "SEG"}),
+        );
+        out.push(Fixture {
+            name: "segmentation_uint8",
+            manifest: b.seal().unwrap(),
+            payloads: vec![l_pl, m_pl, p_pl],
+        });
+    }
+
     out
 }
 

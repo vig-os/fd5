@@ -12,11 +12,24 @@
 //! release gate. The blob is a faithful Zarr store, so the exploded form can later materialize it
 //! as real OME-Zarr files.
 //!
-//! ## Dtypes
-//! pcodec operates on ≥16-bit numbers, which covers every dtype real imaging volumes use (int16
-//! CT/PET, float32 µ-maps/SUV, uint16/32 counts). The eight pcodec-native dtypes are supported via
-//! [`ArrayData`]; 8-bit (`int8`/`uint8`) and `float16` are intentionally out of scope (the zstd
-//! backend uses the same [`ArrayData`] surface, so its dtype envelope matches pcodec's).
+//! ## Dtypes — the settled envelope (#418, decided once)
+//! Every numpy **fixed-width numeric dtype plus bool** is supported; nothing else is patched in
+//! on demand. pcodec operates on ≥16-bit numbers, so the envelope splits in two tiers:
+//! - **pcodec-native**: `int16/32/64`, `uint16/32/64`, `float32/64` — stored as-is.
+//! - **widened** (transparent): `int8`/`uint8` (label/segmentation volumes, material-ID grids),
+//!   `bool` (binary masks) widen to 16-bit ints; `float16` widens **exactly** to `float32`
+//!   (every f16 value — incl NaN payloads, ±inf, −0.0, denormals — embeds losslessly, converted
+//!   in software by `half`, deterministic across arch/build). The spec records the logical
+//!   dtype (the source of truth; the zarr metadata inside the payload declares the widened
+//!   storage dtype), decode narrows back and **rejects out-of-range values as corruption**
+//!   (bool is strict 0/1; f16 is bit-roundtrip-checked). Widening is provably free in output
+//!   size — pcodec absorbs the redundancy; a 256³ 4-label u8 volume lands *smaller* than the
+//!   same data flattened into a table block.
+//!
+//! **Deliberately excluded** (each with a reason, so nothing is ambient): `complex64/128`
+//! (MRI k-space — a real case, but plane-split vs interleave is a storage-design fork, tracked
+//! separately), `datetime64` (an `int64` + epoch/unit metadata, which arrays already carry),
+//! `bfloat16` (not numpy-native; on demand), strings/objects (table blocks).
 //!
 //! ## Codecs (`ArraySpec.codec`)
 //! Three values are accepted on encode:
@@ -62,6 +75,7 @@ use tessera_core::hash::digest;
 use tessera_core::{Error, Result};
 
 use crate::table::{ColumnData, TableData};
+use half::f16;
 use zarrs::array::builder::ArrayBuilderFillValue;
 use zarrs::array::codec::array_to_bytes::pcodec::{PcodecCodec, PcodecCodecConfiguration};
 use zarrs::array::codec::ZstdCodec;
@@ -99,45 +113,62 @@ impl Codec {
 }
 
 /// A typed, in-memory array buffer — the decoded form of an array block's samples, in C
-/// (row-major) order matching the spec's `shape`/`axes`. One variant per pcodec-native dtype.
+/// (row-major) order matching the spec's `shape`/`axes`. One variant per pcodec-native dtype,
+/// plus the **widened** dtypes (#418): `I8`/`U8` (label/segmentation volumes), `F16` (half-float
+/// maps) and `Bool` (binary masks) are stored widened to a pcodec-native width — 8-bit ints and
+/// bool to 16-bit ints, `f16` exactly to `f32`. The widening is transparent (provably free in
+/// output size: pcodec absorbs the redundancy), the spec records the logical dtype, and decode
+/// narrows back losslessly, rejecting out-of-range values as corruption.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArrayData {
+    I8(Vec<i8>),
+    U8(Vec<u8>),
     I16(Vec<i16>),
     I32(Vec<i32>),
     I64(Vec<i64>),
     U16(Vec<u16>),
     U32(Vec<u32>),
     U64(Vec<u64>),
+    F16(Vec<f16>),
     F32(Vec<f32>),
     F64(Vec<f64>),
+    Bool(Vec<bool>),
 }
 
 impl ArrayData {
     /// The Tessera dtype name (matches [`tessera_core::dtype::DType::as_str`]).
     pub fn dtype(&self) -> &'static str {
         match self {
+            ArrayData::I8(_) => "int8",
+            ArrayData::U8(_) => "uint8",
             ArrayData::I16(_) => "int16",
             ArrayData::I32(_) => "int32",
             ArrayData::I64(_) => "int64",
             ArrayData::U16(_) => "uint16",
             ArrayData::U32(_) => "uint32",
             ArrayData::U64(_) => "uint64",
+            ArrayData::F16(_) => "float16",
             ArrayData::F32(_) => "float32",
             ArrayData::F64(_) => "float64",
+            ArrayData::Bool(_) => "bool",
         }
     }
 
     /// Number of samples held.
     pub fn len(&self) -> usize {
         match self {
+            ArrayData::I8(v) => v.len(),
+            ArrayData::U8(v) => v.len(),
             ArrayData::I16(v) => v.len(),
             ArrayData::I32(v) => v.len(),
             ArrayData::I64(v) => v.len(),
             ArrayData::U16(v) => v.len(),
             ArrayData::U32(v) => v.len(),
             ArrayData::U64(v) => v.len(),
+            ArrayData::F16(v) => v.len(),
             ArrayData::F32(v) => v.len(),
             ArrayData::F64(v) => v.len(),
+            ArrayData::Bool(v) => v.len(),
         }
     }
 
@@ -149,7 +180,8 @@ impl ArrayData {
     /// encode-path compression-ratio trace (no allocation, unlike [`Self::to_le_bytes`]).
     pub fn byte_len(&self) -> usize {
         let width = match self {
-            ArrayData::I16(_) | ArrayData::U16(_) => 2,
+            ArrayData::I8(_) | ArrayData::U8(_) | ArrayData::Bool(_) => 1,
+            ArrayData::I16(_) | ArrayData::U16(_) | ArrayData::F16(_) => 2,
             ArrayData::I32(_) | ArrayData::U32(_) | ArrayData::F32(_) => 4,
             ArrayData::I64(_) | ArrayData::U64(_) | ArrayData::F64(_) => 8,
         };
@@ -162,6 +194,8 @@ impl ArrayData {
     /// canonical reduction before stats — ADR-0024). Mirrors [`crate::table::ColumnData::as_i64`].
     pub fn as_i64(&self) -> Option<Vec<i64>> {
         match self {
+            ArrayData::I8(v) => Some(v.iter().map(|&x| x as i64).collect()),
+            ArrayData::U8(v) => Some(v.iter().map(|&x| x as i64).collect()),
             ArrayData::I16(v) => Some(v.iter().map(|&x| x as i64).collect()),
             ArrayData::I32(v) => Some(v.iter().map(|&x| x as i64).collect()),
             ArrayData::I64(v) => Some(v.clone()),
@@ -171,7 +205,8 @@ impl ArrayData {
                 .iter()
                 .all(|&x| x <= i64::MAX as u64)
                 .then(|| v.iter().map(|&x| x as i64).collect()),
-            ArrayData::F32(_) | ArrayData::F64(_) => None,
+            ArrayData::Bool(v) => Some(v.iter().map(|&x| x as i64).collect()),
+            ArrayData::F16(_) | ArrayData::F32(_) | ArrayData::F64(_) => None,
         }
     }
 
@@ -180,14 +215,18 @@ impl ArrayData {
     /// Always succeeds (every variant is numeric).
     pub fn as_f64(&self) -> Vec<f64> {
         match self {
+            ArrayData::I8(v) => v.iter().map(|&x| x as f64).collect(),
+            ArrayData::U8(v) => v.iter().map(|&x| x as f64).collect(),
             ArrayData::I16(v) => v.iter().map(|&x| x as f64).collect(),
             ArrayData::I32(v) => v.iter().map(|&x| x as f64).collect(),
             ArrayData::I64(v) => v.iter().map(|&x| x as f64).collect(),
             ArrayData::U16(v) => v.iter().map(|&x| x as f64).collect(),
             ArrayData::U32(v) => v.iter().map(|&x| x as f64).collect(),
             ArrayData::U64(v) => v.iter().map(|&x| x as f64).collect(),
+            ArrayData::F16(v) => v.iter().map(|&x| x.to_f64()).collect(),
             ArrayData::F32(v) => v.iter().map(|&x| x as f64).collect(),
             ArrayData::F64(v) => v.clone(),
+            ArrayData::Bool(v) => v.iter().map(|&x| x as u8 as f64).collect(),
         }
     }
 
@@ -195,14 +234,18 @@ impl ArrayData {
     /// (`i2/i4/i8`, `u2/u4/u8`, `f4/f8`). Pair with little-endian [`Self::to_le_bytes`].
     pub fn numpy_code(&self) -> &'static str {
         match self {
+            ArrayData::I8(_) => "i1",
+            ArrayData::U8(_) => "u1",
             ArrayData::I16(_) => "i2",
             ArrayData::I32(_) => "i4",
             ArrayData::I64(_) => "i8",
             ArrayData::U16(_) => "u2",
             ArrayData::U32(_) => "u4",
             ArrayData::U64(_) => "u8",
+            ArrayData::F16(_) => "f2",
             ArrayData::F32(_) => "f4",
             ArrayData::F64(_) => "f8",
+            ArrayData::Bool(_) => "b1",
         }
     }
 
@@ -210,14 +253,18 @@ impl ArrayData {
     /// runtime — e.g. `numpy.frombuffer(buf, "<" + numpy_code).reshape(shape)`.
     pub fn to_le_bytes(&self) -> Vec<u8> {
         match self {
+            ArrayData::I8(v) => v.iter().map(|&x| x as u8).collect(),
+            ArrayData::U8(v) => v.clone(),
             ArrayData::I16(v) => le_bytes(v, i16::to_le_bytes),
             ArrayData::I32(v) => le_bytes(v, i32::to_le_bytes),
             ArrayData::I64(v) => le_bytes(v, i64::to_le_bytes),
             ArrayData::U16(v) => le_bytes(v, u16::to_le_bytes),
             ArrayData::U32(v) => le_bytes(v, u32::to_le_bytes),
             ArrayData::U64(v) => le_bytes(v, u64::to_le_bytes),
+            ArrayData::F16(v) => le_bytes(v, f16::to_le_bytes),
             ArrayData::F32(v) => le_bytes(v, f32::to_le_bytes),
             ArrayData::F64(v) => le_bytes(v, f64::to_le_bytes),
+            ArrayData::Bool(v) => v.iter().map(|&x| x as u8).collect(),
         }
     }
 }
@@ -252,17 +299,22 @@ impl ArrayData {
     /// (e.g. the Python bindings packing a numpy array).
     pub fn from_le_bytes(numpy_code: &str, bytes: &[u8]) -> Result<ArrayData> {
         Ok(match numpy_code {
+            "i1" => ArrayData::I8(bytes.iter().map(|&b| b as i8).collect()),
             "i2" => ArrayData::I16(from_le(bytes, i16::from_le_bytes)?),
             "i4" => ArrayData::I32(from_le(bytes, i32::from_le_bytes)?),
             "i8" => ArrayData::I64(from_le(bytes, i64::from_le_bytes)?),
+            "u1" => ArrayData::U8(bytes.to_vec()),
             "u2" => ArrayData::U16(from_le(bytes, u16::from_le_bytes)?),
             "u4" => ArrayData::U32(from_le(bytes, u32::from_le_bytes)?),
             "u8" => ArrayData::U64(from_le(bytes, u64::from_le_bytes)?),
+            "f2" => ArrayData::F16(from_le(bytes, f16::from_le_bytes)?),
             "f4" => ArrayData::F32(from_le(bytes, f32::from_le_bytes)?),
             "f8" => ArrayData::F64(from_le(bytes, f64::from_le_bytes)?),
+            // Mirrors the table Bool convention: any nonzero byte is true.
+            "b1" => ArrayData::Bool(bytes.iter().map(|&b| b != 0).collect()),
             other => {
                 return Err(Error::Codec(format!(
-                    "unsupported array dtype code '{other}' (pcodec backend needs ≥16-bit: i2/i4/i8, u2/u4/u8, f4/f8)"
+                    "unsupported array dtype code '{other}' (fixed-width numeric + bool: i1/i2/i4/i8, u1/u2/u4/u8, f2/f4/f8, b1 — for string data use a table block)"
                 )))
             }
         })
@@ -419,6 +471,29 @@ fn validate(spec: &ArraySpec, data: &ArrayData) -> Result<()> {
 fn encode_with(spec: &ArraySpec, data: &ArrayData, codec: Codec) -> Result<Vec<u8>> {
     let store: ReadableWritableListableStorage = Arc::new(MemoryStore::new());
     match data {
+        // 8-bit dtypes are stored **widened** to 16-bit (#418): pcodec needs ≥16-bit, and the
+        // widening is provably free in output size (pcodec absorbs the interleaved zero bytes —
+        // a 256³ 4-label u1 volume: 200 084 B widened vs 275 631 B flattened into a table).
+        // The spec keeps the logical 8-bit dtype; decode narrows back (lossless by construction).
+        ArrayData::I8(v) => {
+            let wide: Vec<i16> = v.iter().map(|&x| x as i16).collect();
+            build_filled(&store, spec, data_type::int16(), 0i16, &wide, codec)?
+        }
+        ArrayData::U8(v) => {
+            let wide: Vec<u16> = v.iter().map(|&x| x as u16).collect();
+            build_filled(&store, spec, data_type::uint16(), 0u16, &wide, codec)?
+        }
+        ArrayData::Bool(v) => {
+            let wide: Vec<u16> = v.iter().map(|&x| x as u16).collect();
+            build_filled(&store, spec, data_type::uint16(), 0u16, &wide, codec)?
+        }
+        // f16 → f32 is exact for every value (incl NaN payloads, ±inf, −0.0, denormals): the
+        // significand/exponent embed losslessly, and the `half` crate converts in software —
+        // deterministic across arch/build profile, like the integer widenings above.
+        ArrayData::F16(v) => {
+            let wide: Vec<f32> = v.iter().map(|&x| x.to_f32()).collect();
+            build_filled(&store, spec, data_type::float32(), 0.0f32, &wide, codec)?
+        }
         ArrayData::I16(v) => build_filled(&store, spec, data_type::int16(), 0i16, v, codec)?,
         ArrayData::I32(v) => build_filled(&store, spec, data_type::int32(), 0i32, v, codec)?,
         ArrayData::I64(v) => build_filled(&store, spec, data_type::int64(), 0i64, v, codec)?,
@@ -483,18 +558,72 @@ pub fn encode(spec: &ArraySpec, data: &ArrayData) -> Result<Vec<u8>> {
     Ok(encode_resolved(spec, data)?.1)
 }
 
+/// Narrow a widened payload back to its logical dtype (#418, inverse of the encode widening).
+/// Checked: every value written through the widening fits by construction, so an out-of-range
+/// value means a corrupt or foreign payload — fail loudly, never truncate.
+fn narrow<W, N>(wide: Vec<W>, dtype: &str) -> Result<Vec<N>>
+where
+    W: Copy + std::fmt::Display,
+    N: TryFrom<W>,
+{
+    wide.into_iter()
+        .map(|x| {
+            N::try_from(x).map_err(|_| {
+                Error::Codec(format!(
+                    "widened {dtype} payload holds out-of-range value {x} — corrupt or foreign block"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// [`narrow`] for bool: a widened mask must hold **strictly** 0 or 1 (any other value is corrupt —
+/// truthiness coercion would silently launder a damaged payload into a valid-looking mask).
+fn narrow_bool(wide: Vec<u16>) -> Result<Vec<bool>> {
+    wide.into_iter()
+        .map(|x| match x {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(Error::Codec(format!(
+                "widened bool payload holds out-of-range value {other} — corrupt or foreign block"
+            ))),
+        })
+        .collect()
+}
+
+/// [`narrow`] for f16: checked via the bit-exact round trip — a stored `f32` that did not come
+/// from the f16 widening (extra precision, out-of-range magnitude) fails instead of rounding.
+fn narrow_f16(wide: Vec<f32>) -> Result<Vec<f16>> {
+    wide.into_iter()
+        .map(|x| {
+            let h = f16::from_f32(x);
+            if h.to_f32().to_bits() == x.to_bits() {
+                Ok(h)
+            } else {
+                Err(Error::Codec(format!(
+                    "widened float16 payload holds non-f16-exact value {x:?} — corrupt or foreign block"
+                )))
+            }
+        })
+        .collect()
+}
+
 /// Decode the whole array from a block payload (inverse of [`encode`]).
 pub fn decode(spec: &ArraySpec, blob: &[u8]) -> Result<ArrayData> {
     let store = deserialize_store(blob)?;
     Ok(match spec.dtype.as_str() {
+        "int8" => ArrayData::I8(narrow(retrieve_all::<i16>(store)?, "int8")?),
+        "uint8" => ArrayData::U8(narrow(retrieve_all::<u16>(store)?, "uint8")?),
         "int16" => ArrayData::I16(retrieve_all(store)?),
         "int32" => ArrayData::I32(retrieve_all(store)?),
         "int64" => ArrayData::I64(retrieve_all(store)?),
         "uint16" => ArrayData::U16(retrieve_all(store)?),
         "uint32" => ArrayData::U32(retrieve_all(store)?),
         "uint64" => ArrayData::U64(retrieve_all(store)?),
+        "float16" => ArrayData::F16(narrow_f16(retrieve_all::<f32>(store)?)?),
         "float32" => ArrayData::F32(retrieve_all(store)?),
         "float64" => ArrayData::F64(retrieve_all(store)?),
+        "bool" => ArrayData::Bool(narrow_bool(retrieve_all::<u16>(store)?)?),
         other => {
             return Err(Error::Codec(format!(
                 "array decode: dtype '{other}' is not supported by the pcodec backend"
@@ -522,14 +651,24 @@ pub fn decode_subset(
     }
     let store = deserialize_store(blob)?;
     Ok(match spec.dtype.as_str() {
+        "int8" => ArrayData::I8(narrow(
+            retrieve_region::<i16>(store, start, shape)?,
+            "int8",
+        )?),
+        "uint8" => ArrayData::U8(narrow(
+            retrieve_region::<u16>(store, start, shape)?,
+            "uint8",
+        )?),
         "int16" => ArrayData::I16(retrieve_region(store, start, shape)?),
         "int32" => ArrayData::I32(retrieve_region(store, start, shape)?),
         "int64" => ArrayData::I64(retrieve_region(store, start, shape)?),
         "uint16" => ArrayData::U16(retrieve_region(store, start, shape)?),
         "uint32" => ArrayData::U32(retrieve_region(store, start, shape)?),
         "uint64" => ArrayData::U64(retrieve_region(store, start, shape)?),
+        "float16" => ArrayData::F16(narrow_f16(retrieve_region::<f32>(store, start, shape)?)?),
         "float32" => ArrayData::F32(retrieve_region(store, start, shape)?),
         "float64" => ArrayData::F64(retrieve_region(store, start, shape)?),
+        "bool" => ArrayData::Bool(narrow_bool(retrieve_region::<u16>(store, start, shape)?)?),
         other => {
             return Err(Error::Codec(format!(
                 "array decode: dtype '{other}' is not supported by the pcodec backend"
@@ -745,13 +884,17 @@ pub fn to_coo(data: &ArrayData, fill: i64) -> Option<(TableSpec, TableData)> {
 /// reduction needs ADR-0024 canonicalisation). Shared by the downsample and projection folds (DRY).
 fn rebuild_int_like(like: &ArrayData, out: Vec<i64>) -> Option<ArrayData> {
     Some(match like {
+        ArrayData::I8(_) => ArrayData::I8(out.iter().map(|&x| x as i8).collect()),
+        ArrayData::U8(_) => ArrayData::U8(out.iter().map(|&x| x as u8).collect()),
         ArrayData::I16(_) => ArrayData::I16(out.iter().map(|&x| x as i16).collect()),
         ArrayData::I32(_) => ArrayData::I32(out.iter().map(|&x| x as i32).collect()),
         ArrayData::I64(_) => ArrayData::I64(out),
         ArrayData::U16(_) => ArrayData::U16(out.iter().map(|&x| x as u16).collect()),
         ArrayData::U32(_) => ArrayData::U32(out.iter().map(|&x| x as u32).collect()),
         ArrayData::U64(_) => ArrayData::U64(out.iter().map(|&x| x as u64).collect()),
-        ArrayData::F32(_) | ArrayData::F64(_) => return None,
+        // max/min over {0,1} stays in {0,1} — the downsample of a mask is its logical OR/AND.
+        ArrayData::Bool(_) => ArrayData::Bool(out.iter().map(|&x| x != 0).collect()),
+        ArrayData::F16(_) | ArrayData::F32(_) | ArrayData::F64(_) => return None,
     })
 }
 
@@ -1078,6 +1221,8 @@ mod tests {
     #[test]
     fn from_le_bytes_inverts_to_le_bytes() {
         let cases = [
+            ArrayData::I8(vec![1, -2, 127, -128]),
+            ArrayData::U8(vec![0, 7, 255]),
             ArrayData::I16(vec![1, -2, 300]),
             ArrayData::U32(vec![0, 7, 4_000_000_000]),
             ArrayData::F64(vec![1.5, -0.0, 1e300]),
@@ -1086,7 +1231,11 @@ mod tests {
             let back = ArrayData::from_le_bytes(d.numpy_code(), &d.to_le_bytes()).unwrap();
             assert_eq!(back, d);
         }
-        assert!(ArrayData::from_le_bytes("u1", &[1, 2, 3]).is_err()); // 8-bit out of pcodec scope
+        assert_eq!(
+            ArrayData::from_le_bytes("b1", &[1, 0, 1]).unwrap(),
+            ArrayData::Bool(vec![true, false, true])
+        );
+        assert!(ArrayData::from_le_bytes("c8", &[0; 8]).is_err()); // complex → its own issue
         assert!(ArrayData::from_le_bytes("i2", &[1, 2, 3]).is_err()); // not a multiple of width
     }
 
@@ -1095,6 +1244,14 @@ mod tests {
         let shape = vec![4u64, 4, 4];
         let n = 64usize;
         let cases = [
+            ArrayData::I8((0..n).map(|k| k as i8 - 32).collect()),
+            ArrayData::U8((0..n).map(|k| (k * 3 % 251) as u8).collect()),
+            ArrayData::Bool((0..n).map(|k| k % 3 == 0).collect()),
+            ArrayData::F16(
+                (0..n)
+                    .map(|k| f16::from_f32(k as f32 * 0.25 - 8.0))
+                    .collect(),
+            ),
             ArrayData::I16((0..n).map(|k| k as i16 - 32).collect()),
             ArrayData::I32((0..n).map(|k| k as i32 * 7 - 100).collect()),
             ArrayData::I64((0..n).map(|k| k as i64 * 1_000_003 - 5).collect()),
@@ -1202,6 +1359,96 @@ mod tests {
     }
 
     #[test]
+    fn u8_label_volume_widens_compresses_and_narrows_back() {
+        // #418: a spatially-clustered label volume — the canonical uint8 case (organ masks,
+        // material-ID grids). It must (a) be accepted, (b) compress far below raw (the widening
+        // is free: pcodec absorbs the interleaved zero bytes), (c) round-trip bit-exactly, and
+        // (d) ROI-read without materialising the whole array.
+        let side = 32u64;
+        let n = (side * side * side) as usize;
+        let data = ArrayData::U8(
+            (0..n)
+                .map(|k| ((k as u64 / (side * side)) / 8) as u8) // 4 z-clustered labels
+                .collect(),
+        );
+        let spec = pcodec_spec(vec![side, side, side], "uint8");
+        let blob = encode(&spec, &data).unwrap();
+        assert!(
+            blob.len() * 4 < n,
+            "clustered u8 labels should compress ≥4x below the 8-bit raw size, got {} vs {n}",
+            blob.len()
+        );
+        assert_eq!(decode(&spec, &blob).unwrap(), data);
+        // ROI: one interior 2³ region, computable from the label rule above.
+        let sub = decode_subset(&spec, &blob, &[9, 0, 0], &[2, 2, 2]).unwrap();
+        assert_eq!(sub, ArrayData::U8(vec![1; 8])); // z=9,10 → label 9/8 = 1
+    }
+
+    #[test]
+    fn f16_specials_roundtrip_bit_exactly() {
+        // NaN (payload preserved), ±inf, −0.0 and a subnormal must survive the f32 widen →
+        // narrow round trip **bit-exactly**. PartialEq can't gate this (NaN != NaN and
+        // −0.0 == +0.0), so compare the raw bit patterns.
+        let specials = [
+            f16::NAN,
+            f16::INFINITY,
+            f16::NEG_INFINITY,
+            f16::NEG_ZERO,
+            f16::MIN_POSITIVE_SUBNORMAL,
+            f16::from_bits(0x7E01), // NaN with a non-canonical payload
+        ];
+        let data = ArrayData::F16(specials.iter().cycle().take(8).copied().collect());
+        let spec = pcodec_spec(vec![2, 2, 2], "float16");
+        let blob = encode(&spec, &data).unwrap();
+        let ArrayData::F16(back) = decode(&spec, &blob).unwrap() else {
+            panic!("dtype")
+        };
+        let ArrayData::F16(orig) = &data else {
+            unreachable!()
+        };
+        for (a, b) in orig.iter().zip(&back) {
+            assert_eq!(a.to_bits(), b.to_bits(), "bit drift: {a:?} -> {b:?}");
+        }
+    }
+
+    #[test]
+    fn bool_mask_widens_and_narrows_strictly() {
+        // A binary mask round-trips; a widened payload holding a value outside {0,1} is corrupt
+        // and must be rejected (truthiness coercion would launder damage into a valid mask).
+        let spec = pcodec_spec(vec![2, 2, 2], "bool");
+        let mask = ArrayData::Bool(vec![true, false, true, true, false, false, true, false]);
+        let blob = encode(&spec, &mask).unwrap();
+        assert_eq!(decode(&spec, &blob).unwrap(), mask);
+
+        let wide = pcodec_spec(vec![2, 2, 2], "uint16");
+        let bad = encode(&wide, &ArrayData::U16(vec![0, 1, 0, 1, 0, 1, 0, 2])).unwrap();
+        let err = decode(&spec, &bad).unwrap_err().to_string();
+        assert!(err.contains("out-of-range"), "got: {err}");
+    }
+
+    #[test]
+    fn f16_narrowing_rejects_non_representable() {
+        // A float32 payload with more precision than f16 can hold did not come from the f16
+        // widening — decode must fail, not round.
+        let wide = pcodec_spec(vec![1, 1, 2], "float32");
+        let blob = encode(&wide, &ArrayData::F32(vec![1.0, 1.0001])).unwrap();
+        let spec = pcodec_spec(vec![1, 1, 2], "float16");
+        let err = decode(&spec, &blob).unwrap_err().to_string();
+        assert!(err.contains("non-f16-exact"), "got: {err}");
+    }
+
+    #[test]
+    fn narrowing_rejects_out_of_range_widened_payload() {
+        // A payload whose 16-bit values exceed the logical 8-bit range is corrupt (or foreign) —
+        // decode must fail loudly, never truncate silently.
+        let spec_wide = pcodec_spec(vec![2, 2, 2], "uint16");
+        let blob = encode(&spec_wide, &ArrayData::U16(vec![0, 1, 2, 3, 4, 5, 6, 300])).unwrap();
+        let spec_narrow = pcodec_spec(vec![2, 2, 2], "uint8");
+        let err = decode(&spec_narrow, &blob).unwrap_err().to_string();
+        assert!(err.contains("out-of-range"), "got: {err}");
+    }
+
+    #[test]
     fn pcodec_compresses_smooth_int16_volume() {
         // perf-SLA §D, machine-INDEPENDENT floor: pcodec must shrink a CT-like smooth int16 volume
         // well below raw (the wall-clock floors are benched separately, not gated). Deterministic.
@@ -1266,6 +1513,14 @@ mod tests {
         let shape = vec![4u64, 4, 4];
         let n = 64usize;
         let cases = [
+            ArrayData::I8((0..n).map(|k| k as i8 - 32).collect()),
+            ArrayData::U8((0..n).map(|k| (k * 3 % 251) as u8).collect()),
+            ArrayData::Bool((0..n).map(|k| k % 3 == 0).collect()),
+            ArrayData::F16(
+                (0..n)
+                    .map(|k| f16::from_f32(k as f32 * 0.25 - 8.0))
+                    .collect(),
+            ),
             ArrayData::I16((0..n).map(|k| k as i16 - 32).collect()),
             ArrayData::I32((0..n).map(|k| k as i32 * 7 - 100).collect()),
             ArrayData::I64((0..n).map(|k| k as i64 * 1_000_003 - 5).collect()),

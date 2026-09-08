@@ -21,10 +21,10 @@ import numpy as np
 import tessera
 
 # Superset of plausible numpy-style codes: everything either path accepts today, plus
-# codes that must stay rejected (f2, i16, c8) so the probe demonstrably exercises the
-# rejection path too. A newly *accepted* code outside this list still fails the gate:
-# it would appear in the docstring (else undocumented elsewhere too) and trip the
-# "documented but not probed" assertion below.
+# codes that must stay rejected (i16, c8 — complex is tracked as its own issue) so the
+# probe demonstrably exercises the rejection path too. A newly *accepted* code outside
+# this list still fails the gate: it would appear in the docstring (else undocumented
+# elsewhere too) and trip the "documented but not probed" assertion below.
 CANDIDATES = [
     "i1",
     "i2",
@@ -109,10 +109,19 @@ def main() -> int:
     errors = check("add_table", table, tessera.Builder.add_table.__doc__ or "")
     errors += check("add_array", array, tessera.Builder.add_array.__doc__ or "")
 
-    # The relationship the docs sell ("add_table's set is a superset") must itself hold.
-    if not array <= table:
+    # The cross-references the docs sell must themselves hold: str is table-only, f2 is
+    # array-only (no native half-float in the columnar toolchain), everything else is shared.
+    if extra := (array - table) - {"f2"}:
         errors.append(
-            f"add_array accepts codes add_table rejects: {sorted(array - table)} — 'superset' claim broken"
+            f"add_array accepts codes add_table rejects (beyond the documented f2): {sorted(extra)}"
+        )
+    if "f2" in table:
+        errors.append(
+            "add_table accepts f2 — the docstrings document it as array-only; update both"
+        )
+    if "str" in array:
+        errors.append(
+            "add_array accepts str — the docstrings document it as table-only; update both"
         )
 
     for e in errors:

@@ -20,11 +20,13 @@ pub enum DType {
     Float16,
     Float32,
     Float64,
+    /// Binary masks (#418 follow-through) — stored widened like the 8-bit ints; strict 0/1.
+    Bool,
 }
 
 impl DType {
     /// Every supported dtype (the allowlist).
-    pub const ALL: [DType; 11] = [
+    pub const ALL: [DType; 12] = [
         DType::Int8,
         DType::Int16,
         DType::Int32,
@@ -36,6 +38,7 @@ impl DType {
         DType::Float16,
         DType::Float32,
         DType::Float64,
+        DType::Bool,
     ];
 
     /// Canonical name as stored in the manifest (numpy-style, matches Zarr conventions).
@@ -52,6 +55,7 @@ impl DType {
             DType::Float16 => "float16",
             DType::Float32 => "float32",
             DType::Float64 => "float64",
+            DType::Bool => "bool",
         }
     }
 
@@ -61,7 +65,7 @@ impl DType {
 
     pub fn byte_width(&self) -> usize {
         match self {
-            DType::Int8 | DType::UInt8 => 1,
+            DType::Int8 | DType::UInt8 | DType::Bool => 1,
             DType::Int16 | DType::UInt16 | DType::Float16 => 2,
             DType::Int32 | DType::UInt32 | DType::Float32 => 4,
             DType::Int64 | DType::UInt64 | DType::Float64 => 8,

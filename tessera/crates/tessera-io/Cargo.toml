@@ -24,6 +24,7 @@ blake3 = { workspace = true, features = ["rayon", "mmap"] }
 zip.workspace = true
 zarrs.workspace = true
 bytes.workspace = true
+half.workspace = true
 vortex-file.workspace = true
 vortex-array.workspace = true
 vortex-btrblocks.workspace = true
