@@ -6,6 +6,14 @@ ADR-0042 (aux sidecars, the seal/wall-clock line) · ADR-0045 (units/quantities 
 ADR-0046 (time model) · ADR-0049/0050 (collections, schema-enforced rules) · #324 · #342 · #305 ·
 #310 · #331. Found during the DUPLET first-user run (two independent fresh-context FAIR reviews).
 
+> **Renumbered 0052 → 0058.** This ADR was authored as ADR-0052 on
+> `feature/324-generation-provenance-adr` (PR #346) before that branch's base,
+> `spike/tessera-core`, was retired — so it never reached trunk, and trunk meanwhile assigned
+> 0052 to *Versioning policy & release pipeline*. Trunk numbering wins: the unmerged branch
+> yielded. Older commit messages, PR #346's body, and its archived mirror
+> (`docs/pull-requests/pr-346.md`) still say "ADR-0052" and mean **this** ADR; every citation
+> of ADR-0052 in live source and docs means versioning-and-release. Landed on `dev` via #409.
+
 ## Context — a single derived `.tsra` cannot answer "what is this?" or "how was it made?"
 
 The DUPLET conversion produced correct, integrity-sound products, but a scientist handed **one**
