@@ -150,11 +150,19 @@ pub enum FormatOptions {
         input: PathBuf,
         #[serde(default)]
         deidentify: bool,
+        /// Crypto-shred de-identification (ADR-0047): `age` recipient public keys. When non-empty,
+        /// the product is de-identified AND the stripped identity is encrypted to these keys and
+        /// carried as an `aux/identity/identity.age` envelope (`deidentify` is then implied).
+        #[serde(default)]
+        recipients: Vec<String>,
     },
     DicomSeries {
         inputs: Vec<PathBuf>,
         #[serde(default)]
         deidentify: bool,
+        /// Crypto-shred recipient `age` public keys (ADR-0047) — see [`FormatOptions::Dicom`].
+        #[serde(default)]
+        recipients: Vec<String>,
         /// How to encode a per-slice-rescaled series (#300): `bit-exact` (default) rejects differing
         /// `RescaleSlope`s; `global-int16` requantizes them to one int16 scale (GE quantitative PET).
         #[serde(default)]

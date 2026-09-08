@@ -194,6 +194,7 @@ mod tests {
             F::Dicom {
                 input: "x".into(),
                 deidentify: false,
+                recipients: Vec::new(),
             },
             F::Nifti { input: "x".into() },
         ];
