@@ -94,7 +94,7 @@ The flush trigger is the *only* change (timer ∨ buffer-full); the mechanism is
 blocks, packed as-is), sub-block/row-group streaming **compacts** at seal — fragments are durable
 **staging**, and `seal` re-chunks them to the **fixed 65536 grid** via `encode_streaming`. Consequences:
 - The sealed bytes are a pure function of *(rows, data)* — **independent of flush timing** → determinism
-  + content-addressing preserved.
+  - content-addressing preserved.
 - The per-chunk header overhead of small time-fragments stays on **transient staging**, not the `.tsra`.
 - A time-fragment is a **recovery unit, not a canonical Merkle leaf**: the design-2 leaves are the
   fixed-grid row-groups (recomputed at compaction). So there are two integrity notions — a

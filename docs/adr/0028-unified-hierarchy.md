@@ -115,6 +115,7 @@ sub-block Merkle is a first-class *companion*, not the block's name.**
 
 ### 5. The fused streaming pass — encode + hash + tree + stats in one flow
 The hierarchy is **built in the streaming pipeline**, not a separate pass:
+
 ```
 producer ─▶ bounded ring ─▶ ENCODE POOL (parallel, per-chunk, independent) ─▶ ORDERED COMMITTER (serial)
                               { encode (pcodec/zstd | Vortex)                   { durable fragment
@@ -122,6 +123,7 @@ producer ─▶ bounded ring ─▶ ENCODE POOL (parallel, per-chunk, independen
                                 + min/max/count/sum over raw column }              + fold stats up the tree
                                                                                    + advance the live root }
 ```
+
 Per-chunk work is independent → the pool (one touch while the chunk is resident in the ring, before the
 allocator recycles the slot; blake3 + stats ≪ codec cost → ~free). The **order-dependent fold**
 (MMR-append + stats roll-up) is the single serial committer (already ordered). The **live root advances
