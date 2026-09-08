@@ -49,10 +49,12 @@ completely, but carry the original identifying material as an **`age`-encrypted 
 On `tessera ingest dicom --crypto-shred --recipient <age-pubkey> [--recipient …]`:
 
 1. Read the DICOM object. Build the **identity document** — a deterministic JSON object:
+
    ```json
    { "v": 1, "dicom_header": { "0010,0010": {"vr":"PN","value":["…"]}, … },
      "curated_identifying": { "patient_pseudonym": "…", "study_instance_uid": "…", … } }
    ```
+
    The `dicom_header` is the full pre-scrub header (the same dump that used to leak into `extra`);
    `curated_identifying` echoes the curated fields whose schema `sensitivity` is `identifying`.
 2. Serialize it with the canonical JCS rules (ADR-0020) → deterministic plaintext bytes.

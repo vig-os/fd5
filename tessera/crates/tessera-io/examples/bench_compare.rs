@@ -138,16 +138,19 @@ fn listmode(rows: usize) -> (TableSpec, TableData) {
                 name: "t".into(),
                 dtype: "u8".into(),
                 codec: None,
+                ..Default::default()
             },
             Column {
                 name: "e0".into(),
                 dtype: "f4".into(),
                 codec: None,
+                ..Default::default()
             },
             Column {
                 name: "e1".into(),
                 dtype: "f4".into(),
                 codec: None,
+                ..Default::default()
             },
         ],
         rows: rows as u64,

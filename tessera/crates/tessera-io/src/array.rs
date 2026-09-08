@@ -725,6 +725,7 @@ pub fn to_coo(data: &ArrayData, fill: i64) -> Option<(TableSpec, TableData)> {
         name: name.into(),
         dtype: dt.into(),
         codec: None,
+        ..Default::default()
     };
     let spec = TableSpec {
         columns: vec![col("idx", "u8"), col("v", "i8")],

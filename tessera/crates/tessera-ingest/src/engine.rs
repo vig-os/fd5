@@ -31,7 +31,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use tessera_core::collection::CollectionBuilder;
+use tessera_core::collection::{
+    member_filename, sanitize_reference, CollectionBuilder, MemberKind,
+};
 use tessera_core::manifest::Manifest;
 use tessera_core::provenance::Source;
 use tessera_core::{Error, Result};
@@ -81,6 +83,73 @@ pub fn run(
     cfg: &tessera_io::WriteConfig,
     stream_threshold: u64,
 ) -> Result<tessera_core::Collection> {
+    // Atomicity (#302): the engine writes each member `.tsra` as it goes, so a failure on member N
+    // used to leave members 0..N orphaned in `out_dir` with NO `collection.json` — a half-written
+    // collection indistinguishable from a complete one. Fix: run the whole spec into a private
+    // staging dir, then PROMOTE it into `out_dir` only on full success (atomic per-file renames on
+    // the same filesystem). Any failure removes the staging dir → no orphans, no partial catalog.
+    std::fs::create_dir_all(out_dir).map_err(|e| {
+        Error::Invalid(format!(
+            "ingest-engine: create out_dir {}: {e}",
+            out_dir.display()
+        ))
+    })?;
+    let staging = out_dir.join(".staging-ingest");
+    // Clear any leftover staging from a previously-crashed run before starting.
+    let _ = std::fs::remove_dir_all(&staging);
+    match run_into(spec, spec_path, &staging, cfg, stream_threshold) {
+        Ok(collection) => {
+            promote_staging(&staging, out_dir)?;
+            Ok(collection)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
+}
+
+/// Move every entry from the completed staging dir into `out_dir` (atomic per-file renames — same
+/// filesystem, since staging is a subdir of `out_dir`), then remove the now-empty staging dir. This
+/// is the commit point of the transactional [`run`]: before it, `out_dir` has no partial output.
+fn promote_staging(staging: &Path, out_dir: &Path) -> Result<()> {
+    let entries = std::fs::read_dir(staging).map_err(|e| {
+        Error::Invalid(format!(
+            "ingest-engine: read staging {}: {e}",
+            staging.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| Error::Invalid(format!("ingest-engine: staging entry: {e}")))?;
+        let dest = out_dir.join(entry.file_name());
+        std::fs::rename(entry.path(), &dest).map_err(|e| {
+            Error::Invalid(format!(
+                "ingest-engine: promote {} -> {}: {e}",
+                entry.path().display(),
+                dest.display()
+            ))
+        })?;
+    }
+    std::fs::remove_dir_all(staging).map_err(|e| {
+        Error::Invalid(format!(
+            "ingest-engine: remove staging {}: {e}",
+            staging.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Run a parsed spec into `out_dir` writing members + `collection.json` directly (no staging). The
+/// transactional [`run`] wraps this against a staging dir; call this only where partial output on
+/// failure is acceptable (it isn't, for a user-facing ingest — use [`run`]).
+fn run_into(
+    spec: &IngestSpec,
+    spec_path: &Path,
+    out_dir: &Path,
+    cfg: &tessera_io::WriteConfig,
+    stream_threshold: u64,
+) -> Result<tessera_core::Collection> {
     let order = validate(spec)?;
     let h = spec_hash(spec)?;
     let spec_ref = spec_path.display().to_string();
@@ -94,6 +163,10 @@ pub fn run(
 
     // (name → (id, manifest_hash)) — the resolver `derived_from` edges look parents up in.
     let mut built: BTreeMap<String, (String, String)> = BTreeMap::new();
+    // (name → sealed Manifest) — retained so a derived product can inherit schema-flagged identity
+    // from its parents at seal (ADR-0058 §5). Topo order (parents-first) guarantees a parent is
+    // present before any child that derives from it.
+    let mut manifests: BTreeMap<String, Manifest> = BTreeMap::new();
 
     // The collection's normalised timestamp IS the per-product timestamp — re-running the same
     // spec must produce byte-identical member ids, so this MUST go through the same
@@ -103,8 +176,22 @@ pub fn run(
     for &idx in &order {
         let p = &spec.products[idx];
         let extra = build_extra_sources(p, &built, &spec_ref, &h)?;
-        let (manifest, _payloads_written_in_dispatch) =
-            dispatch(p, &extra, out_dir, cfg, stream_threshold, &timestamp)?;
+        // Resolve this product's `derived_from` parents to their sealed manifests (topo order ⇒
+        // present) so the seal can inherit their schema-flagged identity (ADR-0058 §5).
+        let parents: Vec<&Manifest> = p
+            .derived_from
+            .iter()
+            .filter_map(|n| manifests.get(n))
+            .collect();
+        let (manifest, _payloads_written_in_dispatch) = dispatch(
+            p,
+            &extra,
+            out_dir,
+            cfg,
+            stream_threshold,
+            &timestamp,
+            &parents,
+        )?;
         // Honor the fd5 schema contract AT INGEST: a product that claims a known schema must satisfy
         // it now, not only on a later `tessera schema`. Open-world → unknown product names pass.
         let registry = tessera_core::SchemaRegistry::builtin();
@@ -158,6 +245,7 @@ pub fn run(
             ))
         })?;
         built.insert(p.name.clone(), (id, mh));
+        manifests.insert(p.name.clone(), manifest);
     }
 
     // Assemble the collection in DECLARED order (= TOML `[[product]]` order, not topo order — the
@@ -243,6 +331,7 @@ fn dispatch(
     cfg: &tessera_io::WriteConfig,
     stream_threshold: u64,
     timestamp: &str,
+    parents: &[&Manifest],
 ) -> Result<(Manifest, ())> {
     let name = p.name.as_str();
     // collection-level timestamp is the per-product timestamp too: the engine takes its identity
@@ -265,8 +354,13 @@ fn dispatch(
                 label,
                 extra_sources,
             )?;
-            let m =
-                seal_streaming_to_tsra(m, &[("data".to_string(), input.as_path())], out_dir, p)?;
+            let m = seal_streaming_to_tsra(
+                m,
+                &[("data".to_string(), input.as_path())],
+                out_dir,
+                p,
+                parents,
+            )?;
             Ok((m, ()))
         }
         FormatOptions::Dicom {
@@ -299,7 +393,7 @@ fn dispatch(
                 Some(&digest),
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             attach_identity_envelope(out_dir, &m, identity.as_ref(), &recips)?;
             Ok((m, ()))
         }
@@ -307,21 +401,33 @@ fn dispatch(
             inputs,
             deidentify,
             recipients,
+            rescale_mode,
         } => {
-            // PS3.15 de-id for a series is per-file on the raw object; we route to
-            // `read_series_deidentified`, which opens each slice, applies `deidentify` in memory,
-            // then decodes — so PHI never reaches the stacked volume. The pixels are identical to
-            // the non-de-id path (de-id only touches metadata). Crypto-shred (ADR-0047) additionally
-            // captures the identity for an encrypted `aux/identity` envelope.
+            // Three modes (ADR-0047 + #300): crypto-shred (recipients present) → de-id + recoverable
+            // encrypted identity; destructive de-id (`deidentify`) → PHI dropped; keep-PHI default →
+            // curated fields retained but the raw header is NOT embedded (#269 leak fix). All three
+            // respect `rescale_mode` — `bit-exact` (default) rejects differing per-slice
+            // `RescaleSlope`s; `global-int16` collapses a per-slice-rescaled series (GE quantitative
+            // PET) to one global int16 scale.
             let recips = parse_recipients(recipients)?;
             let (img, identity) = if !recips.is_empty() {
-                let (img, id) = crate::dicom::read_series_crypto_shred(inputs)?;
+                let (img, id) = crate::dicom::read_series_crypto_shred(inputs, *rescale_mode)?;
                 (img, Some(id))
             } else if *deidentify {
-                (crate::dicom::read_series_deidentified(inputs)?, None)
+                (
+                    crate::dicom::read_series_rescaled(inputs, true, *rescale_mode)?,
+                    None,
+                )
             } else {
                 warn_dicom_not_deidentified();
-                (without_raw_header(crate::dicom::read_series(inputs)?), None)
+                (
+                    without_raw_header(crate::dicom::read_series_rescaled(
+                        inputs,
+                        false,
+                        *rescale_mode,
+                    )?),
+                    None,
+                )
             };
             // With a `source_label`, recording N paths joined with commas is exactly what the label
             // exists to suppress (an 890-slice series would embed each path verbatim). When no label
@@ -345,7 +451,7 @@ fn dispatch(
                 Some(&digest),
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             attach_identity_envelope(out_dir, &m, identity.as_ref(), &recips)?;
             Ok((m, ()))
         }
@@ -363,7 +469,7 @@ fn dispatch(
                 Some(&digest),
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             Ok((m, ()))
         }
         FormatOptions::Raw {
@@ -380,7 +486,7 @@ fn dispatch(
                 label,
                 extra_sources,
             )?;
-            let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+            let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
             Ok((m, ()))
         }
         FormatOptions::HdfCompound {
@@ -390,14 +496,27 @@ fn dispatch(
             block_prefix,
             streaming,
             slab_rows,
+            quantize,
         } => {
-            let should_stream = resolve_streaming(*streaming, input, dataset, stream_threshold)?;
+            // The opt-in GEDDF quantize/annotate transform (#310) operates on the whole in-memory
+            // table, so it forces the batch path (the streaming slab writer has no transform seam yet).
+            let should_stream =
+                !*quantize && resolve_streaming(*streaming, input, dataset, stream_threshold)?;
             if should_stream {
                 // Stream straight to disk — the bounded-memory + multi-block path. The output path
                 // is computed BEFORE the seal because the streaming writer writes the .tsra
                 // directly; we then re-open the sealed manifest to record its id.
-                let stage = out_dir.join(format!("__stage_{}", sanitize_filename(name)));
-                let tmp_out = out_dir.join(format!("__pending_{}.tsra", sanitize_filename(name)));
+                let stage = out_dir.join(format!("__stage_{}", sanitize_reference(name)));
+                let tmp_out = out_dir.join(format!("__pending_{}.tsra", sanitize_reference(name)));
+                // ADR-0058 §5: inherit schema-flagged identity from parents up-front (the streaming
+                // writer applies metadata pre-seal on the WriteSession, so there is no post-build
+                // re-seal hook — and re-writing a multi-GB streamed .tsra just for metadata would
+                // defeat the bounded-memory path). The backend layers the three tiers in ascending
+                // priority (inherited < product-own default < spec), so `inherited` and `p.metadata`
+                // are passed SEPARATELY — never pre-merged — to keep an inherited value from ever
+                // clobbering a product-own default. `study` (first-class) inherits from the parent too.
+                let inherited = inherited_metadata(parents, "listmode");
+                let inherited_study = parents.iter().find_map(|m| m.study.as_deref());
                 // Build extra_sources with the canonical `ingested_from` flowing through the
                 // streaming session (it adds its own `ingested_from`); pass `extra_sources` as-is.
                 let m = crate::ge_hdf5::stream_to_listmode_product_2p_to_file(
@@ -413,11 +532,13 @@ fn dispatch(
                     row_index,
                     label,
                     extra_sources,
+                    &inherited,
+                    inherited_study,
                     &p.metadata,
                 )?;
                 // Rename the pending .tsra to its id-named final path. Same filesystem → rename is
                 // atomic, so a crash here leaves either the old or the new file in place.
-                let final_path = out_dir.join(format!("{}.tsra", sanitize_filename(&m.id)));
+                let final_path = out_dir.join(member_filename(&m.id, MemberKind::Product));
                 std::fs::rename(&tmp_out, &final_path).map_err(|e| {
                     Error::Invalid(format!(
                         "ingest-engine: rename {} -> {}: {e}",
@@ -435,20 +556,41 @@ fn dispatch(
                 Ok((m, ()))
             } else {
                 // Batch path: read the whole compound, build the in-memory product, pack.
-                let cols = crate::ge_hdf5::read_compound(input, dataset)?;
+                let mut cols = crate::ge_hdf5::read_compound(input, dataset)?;
                 let source = label
                     .map(str::to_string)
                     .unwrap_or_else(|| input.display().to_string());
-                let (m, payloads) = crate::ge_hdf5::to_listmode_product(
-                    &cols,
-                    name,
-                    &timestamp,
-                    &source,
-                    block_prefix,
-                    row_index,
-                    extra_sources,
-                )?;
-                let m = seal_to_tsra(m, &payloads, out_dir, p, timestamp.as_str())?;
+                let (m, payloads) = if *quantize {
+                    // Opt-in transform (#310): annotate + requantize float columns to int16 before
+                    // sealing, so both payload and manifest reflect the physical-resolution encoding.
+                    let schema = crate::ge_hdf5::apply_geddf_dictionary(dataset, &mut cols, true);
+                    crate::ge_hdf5::to_listmode_product_with_schema(
+                        &cols,
+                        name,
+                        &timestamp,
+                        &source,
+                        block_prefix,
+                        row_index,
+                        extra_sources,
+                        schema,
+                    )?
+                } else {
+                    // #343: annotate columns (unit/description/short_name) from the GEDDF dictionary
+                    // even without quantization, so batch tables (time-markers, coin-counters, …) are
+                    // self-describing. `quantize = false` leaves dtypes + values untouched.
+                    let schema = crate::ge_hdf5::apply_geddf_dictionary(dataset, &mut cols, false);
+                    crate::ge_hdf5::to_listmode_product_with_schema(
+                        &cols,
+                        name,
+                        &timestamp,
+                        &source,
+                        block_prefix,
+                        row_index,
+                        extra_sources,
+                        schema,
+                    )?
+                };
+                let m = seal_to_tsra(m, &payloads, out_dir, p, parents, timestamp.as_str())?;
                 Ok((m, ()))
             }
         }
@@ -509,10 +651,11 @@ fn seal_to_tsra(
     payloads: &[tessera_io::BlockPayload],
     out_dir: &Path,
     p: &crate::spec::ProductSpec,
+    parents: &[&Manifest],
     _timestamp: &str,
 ) -> Result<Manifest> {
-    let m = apply_spec_metadata(m, &p.metadata)?;
-    let path = out_dir.join(format!("{}.tsra", sanitize_filename(&m.id)));
+    let m = apply_spec_metadata(m, &p.metadata, parents, p)?;
+    let path = out_dir.join(member_filename(&m.id, MemberKind::Product));
     pack(&m, payloads, &path)?;
     // ADR-0042: stamp `aux/provenance.json` (wall-clock + producer + host) as a non-sealed aux
     // member. The sealed region is byte-identical afterwards (proven by container tests), so this
@@ -554,7 +697,7 @@ fn attach_identity_envelope(
 ) -> Result<()> {
     let Some(doc) = identity else { return Ok(()) };
     let envelope = crate::identity::encrypt_identity(doc, recipients)?;
-    let path = out_dir.join(format!("{}.tsra", sanitize_filename(&m.id)));
+    let path = out_dir.join(member_filename(&m.id, MemberKind::Product));
     tessera_io::add_aux_members(
         &path,
         &[tessera_io::AuxMember::new(
@@ -578,39 +721,81 @@ fn seal_streaming_to_tsra(
     sources: &[(String, &Path)],
     out_dir: &Path,
     p: &crate::spec::ProductSpec,
+    parents: &[&Manifest],
 ) -> Result<Manifest> {
-    let m = apply_spec_metadata(m, &p.metadata)?;
-    let path = out_dir.join(format!("{}.tsra", sanitize_filename(&m.id)));
+    let m = apply_spec_metadata(m, &p.metadata, parents, p)?;
+    let path = out_dir.join(member_filename(&m.id, MemberKind::Product));
     pack_streaming_verified(&m, sources, &path)?;
     // ADR-0042: aux/provenance.json stamp, matching seal_to_tsra above.
     stamp_ingest_provenance(&path, &ProvenanceOptions::default())?;
     Ok(m)
 }
 
-/// If the spec declared `[product.metadata]`, return a manifest re-sealed with those fields applied
-/// (overriding any builder default); else the manifest unchanged. Blocks are reused by digest
-/// (`from_manifest`), so `content_hash`/`id` are stable — only the metadata + `manifest_hash` change.
-/// The streaming path applies its overrides directly on the `WriteSession` (no post-seal re-build);
-/// this is the batch-path counterpart.
+/// The identity fields a `product`-schema'd child inherits from its `parents` (ADR-0058 §5), as a
+/// plain metadata map. The **streaming** ingest path applies metadata on the `WriteSession` before
+/// seal (not via [`apply_spec_metadata`]), so it needs the inherited fields up-front rather than a
+/// post-build `inherit_identity_from`. Schema-driven — the engine holds no field list; the first
+/// parent carrying a field wins. (`study` is a manifest field carried by the spec, not returned here.)
+fn inherited_metadata(parents: &[&Manifest], product: &str) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
+    let registry = tessera_core::SchemaRegistry::builtin();
+    let Some(schema) = registry.get(product) else {
+        return out;
+    };
+    for f in schema.inheritable_fields() {
+        for parent in parents {
+            if let Some(v) = parent.metadata.get(&f.id) {
+                out.entry(f.id.clone()).or_insert_with(|| v.clone());
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Re-seal a product with (1) **inherited identity** from its `derived_from` parents (ADR-0058 §5)
+/// and (2) the spec's `[product.metadata]` overrides, then the recorded `[generation]`/`[producer]`.
+/// Priority is spec metadata > the product's own value > inherited-from-parent, so an explicit value
+/// always wins. Blocks are reused by digest (`from_manifest`), so `content_hash`/`id` are stable —
+/// only the metadata/provenance + `manifest_hash` change. Returns `m` unchanged when there is nothing
+/// to apply (no parents, no spec metadata, no generation/producer) so the common path is untouched.
+///
+/// `parents` are the resolved parent manifests (the engine walks `derived_from` in declared order);
+/// inheritance is driven by the **child's** embedded/builtin schema (`inheritable_fields`) — the
+/// engine holds no field list. The streaming path (`WriteSession`) applies spec overrides directly;
+/// this is the batch-path counterpart, and inheritance rides both.
 fn apply_spec_metadata(
     m: Manifest,
     meta: &BTreeMap<String, serde_json::Value>,
+    parents: &[&Manifest],
+    p: &crate::spec::ProductSpec,
 ) -> Result<Manifest> {
-    if meta.is_empty() {
+    let has_generation = p.generation.is_some() || p.producer.is_some();
+    if meta.is_empty() && parents.is_empty() && !has_generation {
         return Ok(m);
     }
     let mut b = tessera_core::ProductBuilder::from_manifest(&m);
+    // (1) Inherit schema-flagged identity from each parent (fills only fields the child lacks).
+    if !parents.is_empty() {
+        let registry = tessera_core::SchemaRegistry::builtin();
+        if let Some(schema) = registry.get(&m.product) {
+            for parent in parents {
+                b.inherit_identity_from(parent, schema);
+            }
+        }
+    }
+    // (2) Spec `[product.metadata]` overrides inherited + builder-default values.
     for (k, v) in meta {
         b.with_field(k, v.clone());
     }
+    // (3) The sealed generation recipe + producer identity (ADR-0058 §1/§2).
+    if let Some(g) = &p.generation {
+        b.with_generation(g.clone());
+    }
+    if let Some(pr) = &p.producer {
+        b.with_producer(pr.clone());
+    }
     b.seal()
-}
-
-/// Strip filesystem-hostile chars (`:` / `/` from the blake3-prefixed id) so the member's id
-/// becomes a portable filename. The id is hex + a single `:`; replacing the `:` with `_` is
-/// lossless (the prefix is fixed: `blake3:`).
-fn sanitize_filename(s: &str) -> String {
-    s.replace([':', '/', '\\'], "_")
 }
 
 /// Public seam: re-export so a CLI caller can pre-parse + re-use the same spec without re-reading.
@@ -693,6 +878,74 @@ streaming = "batch"
     }
 
     #[test]
+    fn failed_member_leaves_no_orphans_or_partial_collection() {
+        // Atomicity (#302): a mid-run failure must leave `out_dir` with NO orphaned `.tsra`, NO
+        // partial `collection.json`, and no leftover staging dir.
+        let dir = tempfile::tempdir().unwrap();
+        let h5 = dir.path().join("a.h5");
+        write_synth_2p(&h5, 50, "events_2p");
+        // Product 1 valid; product 2 points at a dataset that doesn't exist → dispatch fails.
+        let spec_toml = format!(
+            r#"
+[collection]
+name = "atomic-test"
+timestamp = "{TS}"
+
+[[product]]
+name = "good"
+role = "raw"
+schema = "listmode"
+format = "hdf-compound"
+input = "{h5}"
+dataset = "events_2p"
+streaming = "batch"
+
+[[product]]
+name = "bad"
+role = "raw"
+schema = "listmode"
+format = "hdf-compound"
+input = "{h5}"
+dataset = "does_not_exist"
+streaming = "batch"
+"#,
+            h5 = h5.display()
+        );
+        let spec_path = dir.path().join("spec.toml");
+        std::fs::write(&spec_path, spec_toml).unwrap();
+        let out = dir.path().join("out");
+        let cfg = tessera_io::WriteConfig::for_system().workers(2);
+        let parsed = parse_spec(&spec_path).unwrap();
+
+        let result = run(
+            &parsed,
+            &spec_path,
+            &out,
+            &cfg,
+            DEFAULT_STREAM_THRESHOLD_BYTES,
+        );
+        assert!(result.is_err(), "the missing dataset should fail the run");
+
+        assert!(
+            !out.join("collection.json").exists(),
+            "partial collection.json left behind"
+        );
+        assert!(
+            !out.join(".staging-ingest").exists(),
+            "staging dir not cleaned up"
+        );
+        let orphans: Vec<_> = std::fs::read_dir(&out)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "tsra"))
+                    .map(|e| e.file_name())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(orphans.is_empty(), "orphaned .tsra files: {orphans:?}");
+    }
+
+    #[test]
     fn run_synthetic_spec_seals_a_collection_chain_verifies_and_is_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let h5_a = dir.path().join("a.h5");
@@ -721,7 +974,7 @@ streaming = "batch"
         // 2. members were written to disk + open.
         let mut by_name: BTreeMap<String, Manifest> = BTreeMap::new();
         for m in &coll.members {
-            let path = out.join(format!("{}.tsra", m.reference.replace([':', '/'], "_")));
+            let path = out.join(member_filename(&m.reference, MemberKind::Product));
             assert!(path.exists(), "missing {}", path.display());
             let r = tessera_io::Reader::open(&path).unwrap();
             by_name.insert(m.reference.clone(), r.manifest().clone());
@@ -816,9 +1069,9 @@ streaming = "auto"
         let cfg = tessera_io::WriteConfig::for_system().workers(2);
         let coll = run(&parsed, &PathBuf::from("inline-spec"), &out, &cfg, 1).unwrap();
         assert_eq!(coll.members.len(), 1);
-        let member_path = out.join(format!(
-            "{}.tsra",
-            coll.members[0].reference.replace([':', '/'], "_")
+        let member_path = out.join(member_filename(
+            &coll.members[0].reference,
+            MemberKind::Product,
         ));
         assert!(
             member_path.exists(),
@@ -881,10 +1134,7 @@ metadata = {{ coincidence_mode = "singles", site = "anvil" }}
         assert_eq!(coll.members.len(), 2);
 
         for member in &coll.members {
-            let p = out.join(format!(
-                "{}.tsra",
-                member.reference.replace([':', '/'], "_")
-            ));
+            let p = out.join(member_filename(&member.reference, MemberKind::Product));
             let mani = tessera_io::Reader::open(&p).unwrap().manifest().clone();
             if mani.metadata.contains_key("operator") {
                 // batch product: spec overrode the default + added a field
@@ -907,5 +1157,132 @@ metadata = {{ coincidence_mode = "singles", site = "anvil" }}
                 assert_eq!(mani.metadata.get("site"), Some(&serde_json::json!("anvil")));
             }
         }
+    }
+
+    /// ADR-0058 through-line (#342/#324): a derived product **inherits** schema-flagged identity
+    /// from its parent on BOTH the batch and streaming paths, an explicit child value wins, and the
+    /// raw records a **generation** recipe + external **producer** identity that ride the seal.
+    #[test]
+    fn derived_inherits_identity_and_raw_records_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("raw.h5");
+        let b = dir.path().join("der.h5");
+        write_synth_2p(&a, 40, "events_2p");
+        write_synth_2p(&b, 40, "events_2p");
+        let spec_text = format!(
+            r#"
+[collection]
+name = "inherit-test"
+timestamp = "{TS}"
+study = "DP06"
+
+[[product]]
+name = "raw"
+role = "raw"
+schema = "listmode"
+format = "hdf-compound"
+input = "{a}"
+dataset = "events_2p"
+streaming = "batch"
+[product.metadata]
+coincidence_mode = "singles"
+patient_id = "ANON1"
+exam = "9999"
+[product.generation.config]
+energy_window_keV = "425-650"
+coincidence_window_ns = "4.5"
+[product.producer]
+tool = "ge-listmode-daq"
+version = "3.2"
+
+[[product]]
+name = "derived-batch"
+role = "derived"
+schema = "listmode"
+derived_from = ["raw"]
+format = "hdf-compound"
+input = "{b}"
+dataset = "events_2p"
+streaming = "batch"
+[product.metadata]
+coincidence_mode = "prompt-coincidence"
+
+[[product]]
+name = "derived-stream"
+role = "derived"
+schema = "listmode"
+derived_from = ["raw"]
+format = "hdf-compound"
+input = "{b}"
+dataset = "events_2p"
+streaming = "stream"
+[product.metadata]
+coincidence_mode = "prompt-coincidence"
+patient_id = "OVERRIDE"
+"#,
+            a = a.display(),
+            b = b.display()
+        );
+        let parsed = crate::spec::parse_str(&spec_text).unwrap();
+        let out = dir.path().join("out");
+        let cfg = tessera_io::WriteConfig::for_system().workers(2);
+        // threshold = 1 so the explicit `streaming = "stream"` product really streams.
+        let coll = run(&parsed, &PathBuf::from("inline-spec"), &out, &cfg, 1).unwrap();
+        let mani = |i: usize| {
+            let path = out.join(format!(
+                "{}.tsra",
+                coll.members[i].reference.replace([':', '/'], "_")
+            ));
+            tessera_io::Reader::open(&path).unwrap().manifest().clone()
+        };
+        let raw = mani(0);
+        let der_batch = mani(1);
+        let der_stream = mani(2);
+
+        // The raw records the generation recipe + external producer (ADR-0058 §1/§2), sealed.
+        let g = raw
+            .generation
+            .as_ref()
+            .expect("raw must carry a generation record");
+        assert_eq!(
+            g.config.get("energy_window_keV"),
+            Some(&serde_json::json!("425-650"))
+        );
+        match raw.producer.as_ref().expect("raw producer") {
+            tessera_core::ProducerRef::Structured(p) => {
+                assert_eq!(p.tool, "ge-listmode-daq");
+                assert_eq!(p.version, "3.2");
+            }
+            other => panic!("expected a structured producer, got {other:?}"),
+        }
+
+        // Batch derived inherits patient_id + exam; keeps its own coincidence_mode; no recipe of its own.
+        assert_eq!(
+            der_batch.metadata.get("patient_id"),
+            Some(&serde_json::json!("ANON1")),
+            "batch path inherits identity from parent"
+        );
+        assert_eq!(
+            der_batch.metadata.get("exam"),
+            Some(&serde_json::json!("9999")),
+            "batch path inherits exam"
+        );
+        assert_eq!(
+            der_batch.metadata.get("coincidence_mode"),
+            Some(&serde_json::json!("prompt-coincidence")),
+            "the product's own per-level field is not inherited"
+        );
+
+        // Streaming derived inherits too (pre-seal metadata merge) — and an explicit child value wins.
+        assert_eq!(
+            der_stream.metadata.get("exam"),
+            Some(&serde_json::json!("9999")),
+            "streaming path inherits identity"
+        );
+        assert_eq!(
+            der_stream.metadata.get("patient_id"),
+            Some(&serde_json::json!("OVERRIDE")),
+            "an explicit child value wins over the inherited one"
+        );
     }
 }

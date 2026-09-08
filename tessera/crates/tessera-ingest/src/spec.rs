@@ -46,7 +46,7 @@ pub const DEFAULT_BLOCK_PREFIX: &str = "events";
 pub const DEFAULT_ROW_INDEX: &str = "ms";
 
 /// The default per-slab read unit for `hdf-compound` streaming — the GE-HDF5 reader uses the same
-/// constant. Spec-overrideable so wide-row datasets can shrink the per-slab RAM footprint.
+/// constant. Spec-overridable so wide-row datasets can shrink the per-slab RAM footprint.
 pub const DEFAULT_SLAB_ROWS: usize = crate::ge_hdf5::STREAM_SLAB_ROWS;
 
 /// One declarative ingest spec — typically loaded from `.toml` via [`parse`].
@@ -106,6 +106,17 @@ pub struct ProductSpec {
     /// Use this for the small handful of fd5 schema fields the engine doesn't compute itself.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, Value>,
+    /// Generation record (ADR-0058 §2) — *how* this product was made: the producing tool's config
+    /// as a generic bag. TOML: `[product.generation] config = { … }` or `config_ref = "blake3:…"`.
+    /// Sealed into `manifest_hash`; required at validate for schemas that set `requires_generation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<tessera_core::Generation>,
+    /// Producer identity (ADR-0058 §1) — the tool/build that generated this product. TOML:
+    /// `[product.producer] tool = "ge-listmode-daq" version = "…"`. Overrides the default `tessera`
+    /// stamp so an external DAQ/SIM records itself. Sealed. Always structured (a spec never writes a
+    /// legacy bare string), so `Producer` not `ProducerRef`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<tessera_core::Producer>,
     /// Format-tagged decoder options. The `format` discriminator picks the backend; the rest of
     /// the fields are backend-specific. Flattened via `#[serde(flatten)]` so a TOML
     /// `format = "hdf-compound"` reads sibling fields (`input`, `dataset`, …) directly off the
@@ -152,6 +163,10 @@ pub enum FormatOptions {
         /// Crypto-shred recipient `age` public keys (ADR-0047) — see [`FormatOptions::Dicom`].
         #[serde(default)]
         recipients: Vec<String>,
+        /// How to encode a per-slice-rescaled series (#300): `bit-exact` (default) rejects differing
+        /// `RescaleSlope`s; `global-int16` requantizes them to one int16 scale (GE quantitative PET).
+        #[serde(default)]
+        rescale_mode: crate::dicom::RescaleMode,
     },
     HdfCompound {
         input: PathBuf,
@@ -164,6 +179,11 @@ pub enum FormatOptions {
         streaming: StreamingMode,
         #[serde(default = "default_slab_rows")]
         slab_rows: usize,
+        /// Opt-in GEDDF transform (#310): annotate columns (unit/description/short_name) + requantize
+        /// float columns to int16 at the physical resolution (physical = raw × scale). Default off →
+        /// byte-identical output. Forces the batch path (the transform needs the whole table).
+        #[serde(default)]
+        quantize: bool,
     },
     Nifti {
         input: PathBuf,
