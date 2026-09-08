@@ -5,7 +5,7 @@
 ```
 $ tessera info
 tessera [..]
-backends:   blob · dicom [..] · dicom-series [..] · hdf-compound [..] · nifti · raw
+backends:   blob · blob-series · dicom [..] · dicom-series [..] · hdf-compound [..] · nifti · raw
 disabled:   (none)
 build:      static-hdf5=[..] · cloud=[..] · sql=[..]
 
@@ -27,6 +27,9 @@ $ tessera info --json
   "backends": [
     {
       "name": "blob"
+    },
+    {
+      "name": "blob-series"
     },
     {
       "name": "dicom",
